@@ -28,6 +28,8 @@ const PHOTO_MODE_SCRIPT := preload("res://scripts/photo_mode.gd")
 const CODEX_PANEL_SCRIPT := preload("res://scripts/codex_panel.gd")
 const COMMISSION_PANEL_SCRIPT := preload("res://scripts/commission_panel.gd")
 const SETTINGS_PANEL_SCRIPT := preload("res://scripts/settings_panel.gd")
+const COPLAY_NET_SCRIPT := preload("res://scripts/coplay_net.gd")
+const COPLAY_PANEL_SCRIPT := preload("res://scripts/coplay_panel.gd")
 
 ## Preferred loopback port for the live MCP/JSON-RPC control server.
 const CONTROL_PORT := 17731
@@ -75,6 +77,17 @@ var _photo_mode: CanvasLayer
 var _codex_panel: CanvasLayer
 var _commission_panel: CanvasLayer
 var _settings_panel: CanvasLayer
+var _coplay_net: Node3D
+var _coplay_panel: CanvasLayer
+var _coplay_marker_timer := 0.0
+var _coplay_heartbeat_timer := 0.0
+## Latest authoritative hashes seen in a scene payload, reused for the host's
+## periodic clock/hash heartbeat without rebuilding the layout.
+var _coplay_doc_hash := ""
+var _coplay_layout_hash := ""
+## True once the guest has applied its first host snapshot; later resyncs must
+## not reset the build clock or reframe the guest's camera.
+var _coplay_has_snapshot := false
 var _sky_material: PhysicalSkyMaterial
 var _environment: Environment
 var _cutaway_mode := 0
@@ -123,6 +136,7 @@ func _ready() -> void:
 	_setup_codex()
 	_setup_commission_panel()
 	_setup_settings_panel()
+	_setup_coplay()
 
 	if _bridge != null:
 		_start_control_server()
@@ -189,6 +203,8 @@ func _process(delta: float) -> void:
 				_tick_timer = randf_range(0.08, 0.18)
 
 	_poll_control()
+	_update_coplay_presence(delta)
+	_update_coplay_heartbeat(delta)
 
 
 func _make_materials() -> void:
@@ -483,6 +499,7 @@ func _setup_hud() -> void:
 	_hud.connect("codex_requested", Callable(self, "_on_hud_codex_requested"))
 	_hud.connect("commissions_requested", Callable(self, "_on_hud_commissions_requested"))
 	_hud.connect("settings_requested", Callable(self, "_on_hud_settings_requested"))
+	_hud.connect("coplay_requested", Callable(self, "_on_hud_coplay_requested"))
 
 
 func _setup_feel() -> void:
@@ -627,12 +644,398 @@ func _toggle_settings() -> void:
 			_set_photo_mode(false)
 		if _codex_panel != null and _codex_panel.visible:
 			_close_codex()
+		if _coplay_panel != null and _coplay_panel.visible:
+			_close_coplay()
 	_settings_panel.visible = not _settings_panel.visible
 
 
 func _close_settings() -> void:
 	if _settings_panel != null:
 		_settings_panel.visible = false
+
+
+# ---------------------------------------------------------------------------
+# M5 Release 2: co-play LAN transport, modal and presence markers
+# ---------------------------------------------------------------------------
+
+## Build the idle co-play transport and modal. Both stay completely inert until
+## the player presses Host LAN or Join LAN; single-player never opens a socket.
+func _setup_coplay() -> void:
+	_coplay_net = COPLAY_NET_SCRIPT.new()
+	_coplay_net.name = "CoplayNet"
+	add_child(_coplay_net)
+	_coplay_net.connect(
+		"session_state_changed", Callable(self, "_on_coplay_session_state_changed")
+	)
+	_coplay_net.connect("snapshot_received", Callable(self, "_on_coplay_snapshot_received"))
+	_coplay_net.connect(
+		"remote_batch_received", Callable(self, "_on_coplay_remote_batch_received")
+	)
+	_coplay_net.connect(
+		"remote_undo_received", Callable(self, "_on_coplay_remote_undo_received")
+	)
+	_coplay_net.connect("clock_sync_received", Callable(self, "_on_coplay_clock_received"))
+	_coplay_net.connect("hash_check_received", Callable(self, "_on_coplay_hash_check_received"))
+	_coplay_net.connect("presence_received", Callable(self, "_on_coplay_presence_received"))
+	_coplay_net.connect("peer_joined", Callable(self, "_on_coplay_peer_joined"))
+	_coplay_net.connect("peer_left", Callable(self, "_on_coplay_peer_left"))
+	_coplay_net.connect(
+		"guest_join_requested", Callable(self, "_on_coplay_guest_join_requested")
+	)
+	_coplay_net.connect(
+		"peer_left_player", Callable(self, "_on_coplay_peer_left_player")
+	)
+	_coplay_net.connect("status_message", Callable(self, "_on_coplay_status_message"))
+
+	_coplay_panel = COPLAY_PANEL_SCRIPT.new()
+	_coplay_panel.name = "CoplayPanel"
+	add_child(_coplay_panel)
+	_coplay_panel.connect("host_requested", Callable(self, "_on_coplay_host_requested"))
+	_coplay_panel.connect("join_requested", Callable(self, "_on_coplay_join_requested"))
+	_coplay_panel.connect(
+		"disconnect_requested", Callable(self, "_on_coplay_disconnect_requested")
+	)
+	_coplay_panel.connect("close_requested", Callable(self, "_close_coplay"))
+	_refresh_coplay_ui()
+
+
+func _on_hud_coplay_requested() -> void:
+	_toggle_coplay()
+
+
+func _toggle_coplay() -> void:
+	if _coplay_panel == null:
+		return
+	if not _coplay_panel.visible:
+		if _photo_mode != null and _photo_mode.visible:
+			_set_photo_mode(false)
+		if _codex_panel != null and _codex_panel.visible:
+			_close_codex()
+		if _settings_panel != null and _settings_panel.visible:
+			_close_settings()
+		if _commission_panel != null and _commission_panel.visible:
+			_commission_panel.visible = false
+	_coplay_panel.call("toggle")
+
+
+func _close_coplay() -> void:
+	if _coplay_panel != null:
+		_coplay_panel.visible = false
+
+
+func _on_coplay_host_requested(port: int, player_name: String, max_players: int) -> void:
+	if _coplay_net == null:
+		return
+	var result: Variant = _coplay_net.call("host_session", port, player_name, max_players)
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_report_coplay_error("Could not host LAN session", result)
+		return
+	if _bridge != null and _bridge.has_method("coplay_set_max_players"):
+		_bridge.call("coplay_set_max_players", max_players)
+		_bridge.call(
+			"coplay_register_player", "host", player_name, "#e8b04b", "host"
+		)
+	_coplay_marker_timer = 0.0
+	_refresh_coplay_ui()
+	_hud.call("set_tool_status", "Co-play: hosting LAN session as %s" % player_name)
+
+
+func _on_coplay_join_requested(address: String, port: int, player_name: String) -> void:
+	if _coplay_net == null:
+		return
+	var result: Variant = _coplay_net.call("join_session", address, port, player_name)
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_report_coplay_error("Could not join LAN session", result)
+		return
+	_refresh_coplay_ui()
+	_hud.call("set_tool_status", "Co-play: joining %s:%d as %s" % [address, port, player_name])
+
+
+func _on_coplay_disconnect_requested() -> void:
+	if _coplay_net != null:
+		var local_id := str(_coplay_net.call("get_local_player_id"))
+		_coplay_net.call("disconnect_session")
+		if _bridge != null and _bridge.has_method("coplay_remove_player"):
+			_bridge.call("coplay_remove_player", local_id)
+	_coplay_has_snapshot = false
+	_refresh_coplay_ui()
+	_hud.call("set_tool_status", "Co-play: disconnected")
+
+
+func _on_coplay_session_state_changed(_state: Dictionary) -> void:
+	_refresh_coplay_ui()
+
+
+## Host side: a peer finished the ENet handshake. Wait for its join request
+## before sending any authoritative state; the host assigns the player id there.
+func _on_coplay_peer_joined(peer_id: int) -> void:
+	if _bridge == null or _coplay_net == null:
+		return
+	if not _coplay_net.call("is_hosting"):
+		return
+	_hud.call("set_tool_status", "Co-play: peer %d connected, awaiting join" % peer_id)
+
+
+func _on_coplay_peer_left(peer_id: int) -> void:
+	_hud.call("set_tool_status", "Co-play: peer %d disconnected" % peer_id)
+
+
+## Host side: a guest asked to join. Register it with the host-assigned id and
+## send the fresh authoritative snapshot (H1).
+func _on_coplay_guest_join_requested(
+	peer_id: int, player_id: String, player_name: String
+) -> void:
+	if _bridge == null or _coplay_net == null:
+		return
+	if not _coplay_net.call("is_hosting"):
+		return
+	if not _bridge.has_method("coplay_register_player"):
+		return
+	var registered: Variant = _bridge.call(
+		"coplay_register_player", player_id, player_name, "#4b9be8", "builder"
+	)
+	if not (registered is Dictionary) or not bool((registered as Dictionary).get("ok", false)):
+		_report_coplay_error("Co-play join rejected", registered)
+		_coplay_net.call("reject_peer", peer_id)
+		return
+	if not _bridge.has_method("coplay_snapshot_json"):
+		return
+	var snapshot_json := str(_bridge.call("coplay_snapshot_json"))
+	if snapshot_json.is_empty():
+		_hud.call("show_error", "Co-play: could not serialise the host snapshot.")
+		return
+	_coplay_net.call("send_snapshot", peer_id, snapshot_json)
+	# Bring earlier guests up to date with the new player list.
+	_coplay_net.call("broadcast_snapshot_to_all", snapshot_json)
+	_refresh_coplay_markers()
+	_refresh_coplay_ui()
+	_hud.call(
+		"set_tool_status",
+		"Co-play: %s joined as %s" % [player_name, player_id]
+	)
+
+
+## Host side: a registered peer left, so drop its player and claims and tell
+## the remaining guests (M4).
+func _on_coplay_peer_left_player(_peer_id: int, player_id: String) -> void:
+	if _bridge == null or player_id.is_empty():
+		return
+	if _bridge.has_method("coplay_remove_player"):
+		_bridge.call("coplay_remove_player", player_id)
+	_refresh_coplay_markers()
+	_refresh_coplay_ui()
+	if _coplay_net != null and _coplay_net.call("is_hosting"):
+		if _bridge.has_method("coplay_snapshot_json"):
+			var snapshot_json := str(_bridge.call("coplay_snapshot_json"))
+			if not snapshot_json.is_empty():
+				_coplay_net.call("broadcast_snapshot_to_all", snapshot_json)
+	_broadcast_coplay_clock_and_hash()
+	_hud.call("set_tool_status", "Co-play: player %s left" % player_id)
+
+
+func _on_coplay_snapshot_received(snapshot_json: String) -> void:
+	# Only a guest applies host snapshots; the host's castle is authoritative
+	# and must never be overwritten by a packet (H2).
+	if _coplay_net == null or not _coplay_net.call("is_guest"):
+		return
+	if _bridge == null or not _bridge.has_method("coplay_apply_snapshot_json"):
+		return
+	var result: Variant = _bridge.call("coplay_apply_snapshot_json", snapshot_json)
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_report_coplay_error("Co-play snapshot rejected", result)
+		return
+	var first_snapshot := not _coplay_has_snapshot
+	_coplay_has_snapshot = true
+	_apply_scene(result as Dictionary, first_snapshot, first_snapshot, false)
+	var local_name := "Guest"
+	var local_id := "guest"
+	if _coplay_net != null:
+		var status: Dictionary = _coplay_net.call("get_status")
+		local_name = str(status.get("player_name", local_name))
+		local_id = str(status.get("player_id", local_id))
+	_bridge.call(
+		"coplay_register_player", local_id, local_name, "#4b9be8", "builder"
+	)
+	_hud.call("set_mode_label", "Co-Play — Guest")
+	_hud.call("clear_error")
+	_hud.call("set_tool_status", "Co-play: joined the host session")
+	_refresh_coplay_ui()
+
+
+func _on_coplay_remote_batch_received(author_id: String, ops_json: String) -> void:
+	if _bridge == null or not _bridge.has_method("coplay_apply_remote_batch_json"):
+		return
+	var result: Variant = _bridge.call(
+		"coplay_apply_remote_batch_json", author_id, ops_json
+	)
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_report_coplay_error("Co-play batch rejected", result)
+		return
+	_apply_scene(result as Dictionary, false, false)
+	_hud.call("clear_error")
+	_refresh_coplay_ui()
+
+
+func _on_coplay_remote_undo_received(author_id: String) -> void:
+	if _bridge == null or not _bridge.has_method("coplay_apply_remote_undo"):
+		return
+	var result: Variant = _bridge.call("coplay_apply_remote_undo", author_id)
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_report_coplay_error("Co-play undo rejected", result)
+		return
+	_apply_scene(result as Dictionary, false, false)
+	_hud.call("clear_error")
+	_refresh_coplay_ui()
+
+
+## The host owns the simulation clock; guests follow it without streaming any
+## build events or meshes.
+func _on_coplay_clock_received(build_front: float, playing: bool, speed: float) -> void:
+	if _coplay_net == null or not _coplay_net.call("is_guest"):
+		return
+	_speed_multiplier = speed
+	_playing = playing
+	_hud.call("set_speed", speed)
+	_hud.call("set_playing", playing)
+	_hud.call("set_build_front", build_front)
+	_apply_build_front(build_front)
+
+
+func _on_coplay_presence_received(
+	player_id: String, cam_pos: Vector3, cam_target: Vector3, status: String
+) -> void:
+	if _bridge != null and _bridge.has_method("coplay_update_presence"):
+		_bridge.call("coplay_update_presence", player_id, cam_pos, cam_target, status)
+		_refresh_coplay_markers()
+
+
+func _on_coplay_hash_check_received(doc_hash: String, layout_hash: String) -> void:
+	if _bridge == null or not _bridge.has_method("coplay_verify_hashes"):
+		return
+	var result: Variant = _bridge.call("coplay_verify_hashes", doc_hash, layout_hash)
+	if not (result is Dictionary):
+		return
+	var kind := str((result as Dictionary).get("kind", ""))
+	match kind:
+		"match":
+			_hud.call("set_tool_status", "Co-play: document and layout hashes match")
+		"document_mismatch":
+			_hud.call(
+				"show_error",
+				"Co-play divergence: document hashes differ — a command was missed or corrupted. The host will resend state."
+			)
+		"generator_divergence":
+			_hud.call(
+				"show_error",
+				"Co-play generator divergence: documents match but layout hashes differ. This is a generator bug; resending state cannot fix it."
+			)
+		_:
+			_hud.call("show_error", "Co-play hash check returned '%s'." % kind)
+
+
+func _on_coplay_status_message(text: String) -> void:
+	if _coplay_panel != null:
+		_refresh_coplay_ui()
+	if _hud != null and not text.is_empty():
+		_hud.call("set_tool_status", "Co-play: %s" % text)
+
+
+func _report_coplay_error(context: String, result: Variant) -> void:
+	var detail := _dictionary_error(result)
+	_hud.call("show_error", "%s: %s" % [context, detail])
+	_hud.call("set_tool_status", "Co-play error: %s" % detail)
+
+
+## Send the local camera beacon at ~10 Hz and refresh remote markers.
+func _update_coplay_presence(delta: float) -> void:
+	if _coplay_net == null or _bridge == null:
+		return
+	if not _coplay_net.call("is_connected_session"):
+		return
+	if _camera != null:
+		var view_dir := -_camera.global_transform.basis.z
+		var status := "sculpting" if _terrain_tool != "" else "surveying"
+		_coplay_net.call(
+			"send_presence",
+			_camera.global_position,
+			_camera.global_position + view_dir * 12.0,
+			status
+		)
+	_coplay_marker_timer -= delta
+	if _coplay_marker_timer <= 0.0:
+		_coplay_marker_timer = 0.25
+		_refresh_coplay_markers()
+
+
+func _refresh_coplay_markers() -> void:
+	if _coplay_net == null or _bridge == null:
+		return
+	if not _bridge.has_method("coplay_state"):
+		return
+	var state: Variant = _bridge.call("coplay_state")
+	if not (state is Dictionary):
+		return
+	var players: Variant = (state as Dictionary).get("players", [])
+	if players is Array:
+		_coplay_net.call("update_remote_markers", players)
+
+
+## Merge transport status with the authoritative player list for the modal.
+func _refresh_coplay_ui() -> void:
+	if _coplay_panel == null or _coplay_net == null:
+		return
+	var status: Dictionary = _coplay_net.call("get_status")
+	if _bridge != null and _bridge.has_method("coplay_state"):
+		var state: Variant = _bridge.call("coplay_state")
+		if state is Dictionary:
+			status["players"] = (state as Dictionary).get("players", [])
+	_coplay_panel.call("set_session_state", status)
+
+
+## Push the authoritative castle plus clock/hash to every guest after a host
+## edit. Never called from a guest, so host state cannot be echoed back.
+func _broadcast_coplay_state() -> void:
+	if _bridge == null or _coplay_net == null:
+		return
+	if not _coplay_net.call("is_hosting"):
+		return
+	if _bridge.has_method("coplay_snapshot_json"):
+		var snapshot_json := str(_bridge.call("coplay_snapshot_json"))
+		if not snapshot_json.is_empty():
+			_update_coplay_hashes_from_snapshot(snapshot_json)
+			_coplay_net.call("broadcast_snapshot_to_all", snapshot_json)
+	_broadcast_coplay_clock_and_hash()
+
+
+func _broadcast_coplay_clock_and_hash() -> void:
+	if _coplay_net == null or not _coplay_net.call("is_hosting"):
+		return
+	_coplay_net.call("broadcast_clock", _build_front, _playing, _speed_multiplier)
+	if not _coplay_layout_hash.is_empty():
+		_coplay_net.call(
+			"broadcast_hash_check", _coplay_doc_hash, _coplay_layout_hash
+		)
+
+
+func _update_coplay_hashes_from_snapshot(snapshot_json: String) -> void:
+	var parsed: Variant = JSON.parse_string(snapshot_json)
+	if not (parsed is Dictionary):
+		return
+	_coplay_doc_hash = str((parsed as Dictionary).get("document_hash", ""))
+	_coplay_layout_hash = str((parsed as Dictionary).get("layout_hash", ""))
+
+
+## Host heartbeat: guests get the shared clock and a periodic divergence check
+## even when nobody is editing (~2.5 s).
+func _update_coplay_heartbeat(delta: float) -> void:
+	if _coplay_net == null or not _coplay_net.call("is_hosting"):
+		return
+	_coplay_heartbeat_timer -= delta
+	if _coplay_heartbeat_timer > 0.0:
+		return
+	_coplay_heartbeat_timer = 2.5
+	_broadcast_coplay_clock_and_hash()
+
 
 
 ## UI scale is applied through the window so every CanvasLayer and 3D viewport
@@ -831,6 +1234,7 @@ func _fulfill_render_view(request_id: int, state: Dictionary) -> void:
 	var codex_was_visible := false
 	var commission_was_visible := false
 	var settings_was_visible := false
+	var coplay_was_visible := false
 	var prev_fov := _default_fov
 	var prev_cutaway_mode := _cutaway_mode
 	if _hud != null:
@@ -851,6 +1255,9 @@ func _fulfill_render_view(request_id: int, state: Dictionary) -> void:
 	if _settings_panel != null:
 		settings_was_visible = _settings_panel.visible
 		_settings_panel.visible = false
+	if _coplay_panel != null:
+		coplay_was_visible = _coplay_panel.visible
+		_coplay_panel.visible = false
 	# Capture the raw architectural form: no dollhouse cut and the default lens
 	# (M7). Both are restored after the frame is read.
 	if _cutaway_mode != 0:
@@ -887,6 +1294,8 @@ func _fulfill_render_view(request_id: int, state: Dictionary) -> void:
 		_commission_panel.visible = commission_was_visible
 	if _settings_panel != null:
 		_settings_panel.visible = settings_was_visible
+	if _coplay_panel != null:
+		_coplay_panel.visible = coplay_was_visible
 
 	if image == null or image.is_empty():
 		_render_view_busy = false
@@ -1171,7 +1580,9 @@ func _rebuild(mode: String) -> void:
 ## Apply a scene dictionary from any KeepBridge command (build or interactive
 ## edit). `reset_play` restarts the construction front; `reframe` recentres the
 ## orbit camera, which is desirable for a mode switch but not for every edit.
-func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
+func _apply_scene(
+	data: Dictionary, reset_play: bool, reframe: bool, propagate: bool = true
+) -> void:
 	if _timelapse_active:
 		_stop_timelapse(false)
 	_clear_world_meshes()
@@ -1192,6 +1603,8 @@ func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 	var triangle_count := int(data.get("triangle_count", 0))
 	var layout_hash := str(data.get("layout_hash", ""))
 	var document_hash := str(data.get("document_hash", ""))
+	_coplay_doc_hash = document_hash
+	_coplay_layout_hash = layout_hash
 
 	_hud.call(
 		"set_scene_stats", block_count, chunk_count, layout_hash, triangle_count, document_hash
@@ -1273,6 +1686,12 @@ func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 	# bridge state and never calls back into _apply_scene (no recursion).
 	if _commission_panel != null:
 		_refresh_commission_panel()
+
+	# Host-authoritative propagation: after any local or agent edit, guests get
+	# the new snapshot and the shared clock/hash. Guests pass `propagate=false`
+	# when applying a host snapshot, and are never hosting anyway.
+	if propagate and _coplay_net != null and _coplay_net.call("is_hosting"):
+		_broadcast_coplay_state()
 
 
 func _spawn_terrain(mesh: Variant) -> void:
@@ -1732,6 +2151,8 @@ func _set_photo_mode(enabled: bool) -> void:
 			_codex_panel.visible = false
 		if _settings_panel != null:
 			_settings_panel.visible = false
+		if _coplay_panel != null:
+			_coplay_panel.visible = false
 		if _commission_panel != null:
 			_commission_was_visible = _commission_panel.visible
 			_commission_panel.visible = false
@@ -1781,6 +2202,8 @@ func _toggle_codex() -> void:
 			_set_photo_mode(false)
 		if _settings_panel != null and _settings_panel.visible:
 			_close_settings()
+		if _coplay_panel != null and _coplay_panel.visible:
+			_close_coplay()
 	_codex_panel.visible = not _codex_panel.visible
 
 
@@ -2294,7 +2717,10 @@ func _unhandled_input(event: InputEvent) -> void:
 				_toggle_settings()
 				get_viewport().set_input_as_handled()
 		KEY_ESCAPE:
-			if _settings_panel != null and _settings_panel.visible:
+			if _coplay_panel != null and _coplay_panel.visible:
+				_close_coplay()
+				get_viewport().set_input_as_handled()
+			elif _settings_panel != null and _settings_panel.visible:
 				_close_settings()
 				get_viewport().set_input_as_handled()
 			elif _photo_mode != null and _photo_mode.visible:

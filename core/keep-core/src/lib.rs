@@ -11,6 +11,7 @@
 pub mod codex;
 pub mod command;
 pub mod commission;
+pub mod coplay;
 pub mod document;
 pub mod fixtures;
 pub mod historian;

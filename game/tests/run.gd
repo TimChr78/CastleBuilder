@@ -108,6 +108,13 @@ func _initialize() -> void:
 		quit(1)
 		return
 
+	_check_m5(failures)
+
+	if not failures.is_empty():
+		_for_each_failure(failures)
+		quit(1)
+		return
+
 	_check_feel_scripts(failures)
 
 	if not failures.is_empty():
@@ -1327,6 +1334,280 @@ func _check_m4(failures: Array[String]) -> void:
 
 	if failures.is_empty():
 		print("M4b accessibility OK: early-Z cutaway split, settings modal, persistence")
+
+
+## M5 Release 2: two independent bridges prove snapshot totality and hash
+## agreement, then the LAN transport and modal prove a clean idle state.
+func _check_m5(failures: Array[String]) -> void:
+	var bridge_methods := [
+		"coplay_state",
+		"coplay_set_max_players",
+		"coplay_register_player",
+		"coplay_remove_player",
+		"coplay_set_player_role",
+		"coplay_update_presence",
+		"coplay_claim_element",
+		"coplay_release_claim",
+		"coplay_snapshot_json",
+		"coplay_apply_snapshot_json",
+		"coplay_apply_remote_batch_json",
+		"coplay_apply_remote_undo",
+		"coplay_verify_hashes",
+	]
+	if not ClassDB.class_exists("KeepBridge"):
+		failures.append("KeepBridge is not registered for M5 checks.")
+		return
+
+	var host: Object = ClassDB.instantiate("KeepBridge")
+	var guest: Object = ClassDB.instantiate("KeepBridge")
+	if host == null or guest == null:
+		failures.append("Could not instantiate two independent KeepBridge sessions.")
+		return
+	root.add_child(host as Node)
+	root.add_child(guest as Node)
+
+	for method in bridge_methods:
+		if not host.has_method(method):
+			failures.append("KeepBridge has no %s() method." % method)
+	if not failures.is_empty():
+		(host as Node).free()
+		(guest as Node).free()
+		return
+
+	# --- Host builds the M1 showcase and registers both players ---------
+	var built: Variant = host.call("build_m1_edwardian")
+	if not (built is Dictionary) or str((built as Dictionary).get("document_hash", "")).is_empty():
+		failures.append("M5 host build_m1_edwardian() returned no document_hash.")
+		(host as Node).free()
+		(guest as Node).free()
+		return
+	var cap: Variant = host.call("coplay_set_max_players", 2)
+	if int(cap) != 2:
+		failures.append("coplay_set_max_players(2) returned %s, expected 2." % str(cap))
+
+	var host_reg: Variant = host.call(
+		"coplay_register_player", "alex", "Alex", "#e8b04b", "host"
+	)
+	_require_ok(host_reg, "host registration", failures)
+	var guest_reg: Variant = host.call(
+		"coplay_register_player", "sam", "Sam", "#4b9be8", "builder"
+	)
+	_require_ok(guest_reg, "guest registration", failures)
+	var claim: Variant = host.call("coplay_claim_element", 1, "sam", "north wall")
+	_require_ok(claim, "soft claim", failures)
+
+	var host_state_result: Variant = host.call("coplay_state")
+	if not (host_state_result is Dictionary):
+		failures.append("coplay_state() did not return a Dictionary.")
+		(host as Node).free()
+		(guest as Node).free()
+		return
+	var host_state: Dictionary = host_state_result
+	if int(host_state.get("max_players", 0)) != 2:
+		failures.append("coplay_state() max_players is not 2.")
+	if (host_state.get("players", []) as Array).size() != 2:
+		failures.append("coplay_state() did not list both players.")
+	if (host_state.get("claims", []) as Array).size() != 1:
+		failures.append("coplay_state() did not list the soft claim.")
+	if int(host_state.get("generator_version", 0)) != 1:
+		failures.append("coplay_state() generator_version is not 1.")
+	var host_doc_hash := str(host_state.get("document_hash", ""))
+	if host_doc_hash.is_empty():
+		failures.append("coplay_state() returned an empty document_hash.")
+
+	# --- Guest rebuilds from the snapshot and agrees on both hashes -----
+	var snapshot_json := str(host.call("coplay_snapshot_json"))
+	if snapshot_json.is_empty():
+		failures.append("coplay_snapshot_json() returned an empty string.")
+		(host as Node).free()
+		(guest as Node).free()
+		return
+	var snapshot: Variant = JSON.parse_string(snapshot_json)
+	if not (snapshot is Dictionary):
+		failures.append("coplay_snapshot_json() did not emit valid JSON.")
+		(host as Node).free()
+		(guest as Node).free()
+		return
+	var host_layout_hash := str((snapshot as Dictionary).get("layout_hash", ""))
+	if host_layout_hash.is_empty():
+		failures.append("Snapshot has an empty layout_hash.")
+
+	var applied: Variant = guest.call("coplay_apply_snapshot_json", snapshot_json)
+	_require_ok(applied, "snapshot apply", failures)
+	var guest_state: Variant = guest.call("coplay_state")
+	if guest_state is Dictionary:
+		if str((guest_state as Dictionary).get("document_hash", "")) != host_doc_hash:
+			failures.append("Guest document_hash differs from the host after applying the snapshot.")
+		if (guest_state as Dictionary).get("players", []).size() != 2:
+			failures.append("Guest did not restore both players from the snapshot.")
+		if (guest_state as Dictionary).get("claims", []).size() != 1:
+			failures.append("Guest did not restore the soft claim from the snapshot.")
+
+	var verify: Variant = guest.call("coplay_verify_hashes", host_doc_hash, host_layout_hash)
+	if not (verify is Dictionary) or str((verify as Dictionary).get("kind", "")) != "match":
+		failures.append(
+			"Guest coplay_verify_hashes() did not report 'match' after the snapshot."
+		)
+
+	# --- The same ordered wall batch inside both sessions ----------------
+	var ops := [
+		{
+			"op": "create_wall_run",
+			"name": "Remote East",
+			"start_mm": [60000, 60000],
+			"end_mm": [66000, 60000],
+			"height_mm": 6000,
+			"thickness_mm": 1800,
+		}
+	]
+	var ops_json := JSON.stringify(ops)
+	var host_batch: Variant = host.call("coplay_apply_remote_batch_json", "sam", ops_json)
+	_require_ok(host_batch, "host remote batch", failures)
+	var guest_batch: Variant = guest.call("coplay_apply_remote_batch_json", "sam", ops_json)
+	_require_ok(guest_batch, "guest remote batch", failures)
+	if host_batch is Dictionary and guest_batch is Dictionary:
+		var host_batch_doc := str((host_batch as Dictionary).get("document_hash", ""))
+		var guest_batch_doc := str((guest_batch as Dictionary).get("document_hash", ""))
+		var host_batch_layout := str((host_batch as Dictionary).get("layout_hash", ""))
+		var guest_batch_layout := str((guest_batch as Dictionary).get("layout_hash", ""))
+		if host_batch_doc != guest_batch_doc:
+			failures.append("Host and guest document hashes diverged after the shared batch.")
+		if host_batch_layout != guest_batch_layout:
+			failures.append("Host and guest layout hashes diverged after the shared batch.")
+		var verify_after: Variant = guest.call(
+			"coplay_verify_hashes", host_batch_doc, host_batch_layout
+		)
+		if not (verify_after is Dictionary) or str((verify_after as Dictionary).get("kind", "")) != "match":
+			failures.append("Hashes no longer match after the shared remote batch.")
+
+	# --- A viewer cannot send commands -----------------------------------
+	guest.call("coplay_set_max_players", 3)
+	var viewer_reg: Variant = guest.call(
+		"coplay_register_player", "val", "Val", "#8be84b", "viewer"
+	)
+	_require_ok(viewer_reg, "viewer registration", failures)
+	var refused: Variant = guest.call("coplay_apply_remote_batch_json", "val", ops_json)
+	if not (refused is Dictionary) or bool((refused as Dictionary).get("ok", true)):
+		failures.append("coplay_apply_remote_batch_json() accepted a viewer-authored batch.")
+
+	# --- Transport and modal instantiate and stay idle -------------------
+	var net_script: Variant = load("res://scripts/coplay_net.gd")
+	if not (net_script is GDScript):
+		failures.append("coplay_net.gd did not load as a GDScript.")
+	else:
+		var net: Variant = (net_script as GDScript).new()
+		if net == null or not (net is Node3D):
+			failures.append("CoplayNet is not a Node3D.")
+		else:
+			root.add_child(net as Node3D)
+			for method in [
+				"host_session",
+				"join_session",
+				"disconnect_session",
+				"is_hosting",
+				"is_guest",
+				"is_connected_session",
+				"get_status",
+				"send_snapshot",
+				"broadcast_snapshot_to_all",
+				"broadcast_batch",
+				"broadcast_undo",
+				"broadcast_clock",
+				"broadcast_hash_check",
+				"send_presence",
+				"update_remote_markers",
+			]:
+				if not net.has_method(method):
+					failures.append("CoplayNet has no %s() method." % method)
+			for signal_name in [
+				"session_state_changed",
+				"snapshot_received",
+				"remote_batch_received",
+				"remote_undo_received",
+				"clock_sync_received",
+				"hash_check_received",
+				"guest_join_requested",
+				"status_message",
+			]:
+				if not net.has_signal(signal_name):
+					failures.append("CoplayNet has no %s signal." % signal_name)
+			var net_status: Variant = net.call("get_status")
+			if not (net_status is Dictionary):
+				failures.append("CoplayNet.get_status() did not return a Dictionary.")
+			else:
+				if bool((net_status as Dictionary).get("connected", true)):
+					failures.append("CoplayNet reports a live session before host/join.")
+				if bool((net_status as Dictionary).get("hosting", true)):
+					failures.append("CoplayNet reports hosting before host_session().")
+				if not ((net_status as Dictionary).get("players", null) is Array):
+					failures.append("CoplayNet.get_status() has no players array.")
+			if bool(net.call("is_hosting")):
+				failures.append("CoplayNet.is_hosting() is true in idle single player.")
+			if bool(net.call("is_connected_session")):
+				failures.append("CoplayNet.is_connected_session() is true in idle single player.")
+			net.call("disconnect_session")
+			(net as Node).free()
+
+	var panel_script: Variant = load("res://scripts/coplay_panel.gd")
+	if not (panel_script is GDScript):
+		failures.append("coplay_panel.gd did not load as a GDScript.")
+	else:
+		var panel: Variant = (panel_script as GDScript).new()
+		if panel == null or not (panel is CanvasLayer):
+			failures.append("CoplayPanel is not a CanvasLayer.")
+		else:
+			root.add_child(panel as CanvasLayer)
+			if int(panel.layer) != 37:
+				failures.append("CoplayPanel layer is not 37.")
+			if bool(panel.visible):
+				failures.append("CoplayPanel is visible by default.")
+			for signal_name in [
+				"host_requested",
+				"join_requested",
+				"disconnect_requested",
+				"close_requested",
+			]:
+				if not panel.has_signal(signal_name):
+					failures.append("CoplayPanel has no %s signal." % signal_name)
+			for method in [
+				"open",
+				"close",
+				"is_open",
+				"toggle",
+				"set_session_state",
+				"set_players",
+				"get_player_name",
+				"get_port",
+				"get_address",
+				"get_max_players",
+			]:
+				if not panel.has_method(method):
+					failures.append("CoplayPanel has no %s() method." % method)
+			if bool(panel.call("is_open")):
+				failures.append("CoplayPanel.is_open() is true by default.")
+			if int(panel.call("get_max_players")) != 2:
+				failures.append("CoplayPanel does not default to 2 players.")
+			if int(panel.call("get_port")) != 24565:
+				failures.append("CoplayPanel does not default to port 24565.")
+			panel.call(
+				"set_session_state",
+				{
+					"connected": false,
+					"hosting": false,
+					"port": 24565,
+					"players": [],
+					"status": "Not connected",
+				}
+			)
+			(panel as Node).free()
+
+	(host as Node).free()
+	(guest as Node).free()
+
+	if failures.is_empty():
+		print(
+			"M5 co-play OK: snapshot hash match, shared batch determinism, viewer gate, idle transport"
+		)
 
 
 func _read_text(path: String, failures: Array[String]) -> String:

@@ -25,6 +25,7 @@ signal photo_requested()
 signal codex_requested()
 signal commissions_requested()
 signal settings_requested()
+signal coplay_requested()
 
 const REFRESH_INTERVAL := 0.25
 const MAX_ASSESSMENT_FINDINGS := 3
@@ -287,6 +288,12 @@ func _build_ui() -> void:
 	settings_button.focus_mode = Control.FOCUS_NONE
 	settings_button.pressed.connect(func() -> void: settings_requested.emit())
 	file_row.add_child(settings_button)
+
+	var coplay_button := Button.new()
+	coplay_button.text = "Co-Play"
+	coplay_button.focus_mode = Control.FOCUS_NONE
+	coplay_button.pressed.connect(func() -> void: coplay_requested.emit())
+	file_row.add_child(coplay_button)
 
 	# Dollhouse cutaway: a plane sweep with a floor-height slider (M3.1).
 	var cutaway_row := HBoxContainer.new()

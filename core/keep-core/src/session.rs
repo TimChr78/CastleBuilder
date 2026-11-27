@@ -22,6 +22,11 @@ use crate::commission::{
     deterministic_seasonal_event, estimate_castle_cost_silver, evaluate_commission_goals,
     find_commission, CommissionState, Season, STARTING_PATIENCE,
 };
+use crate::coplay::{
+    compare_hashes, document_hash_hex, layout_hash_hex, style_pack_hash, CoplayError,
+    CoplaySnapshot, HashCheckResult, JoinHandshake, PlayerParticipant, PlayerRole, SoftClaim,
+    DEFAULT_MAX_PLAYERS, GENERATOR_VERSION, MAX_PLAYERS_LIMIT,
+};
 use crate::document::{CastleDocument, Element, ElementId, Opening};
 use crate::historian::assess_historian;
 use crate::junction::junction_partners;
@@ -151,6 +156,12 @@ pub struct Session {
     pub(crate) next_activity_seq: u64,
     /// Active curated commission, or `None` in free-build sandbox mode.
     pub(crate) commission: Option<CommissionState>,
+    /// Connected co-play players, in stable id order (architecture section 15).
+    pub(crate) players: BTreeMap<String, PlayerParticipant>,
+    /// Soft claims on elements, keyed by element id.
+    pub(crate) claims: BTreeMap<ElementId, SoftClaim>,
+    /// Host player limit, clamped to `1..=MAX_PLAYERS_LIMIT`.
+    pub(crate) max_players: usize,
 }
 
 impl Session {
@@ -190,6 +201,9 @@ impl Session {
             activity: Vec::new(),
             next_activity_seq: 1,
             commission: None,
+            players: BTreeMap::new(),
+            claims: BTreeMap::new(),
+            max_players: DEFAULT_MAX_PLAYERS,
         }
     }
 
@@ -263,6 +277,9 @@ impl Session {
         self.next_proposal_seq = 1;
         self.requests.clear();
         self.next_request_seq = 1;
+        // The castle is replaced, so claims on its elements no longer refer to
+        // anything. Players stay connected across the transition.
+        self.claims.clear();
 
         let style = self.active_style();
         let goals = evaluate_commission_goals(&brief, &self.document, &self.terrain, &style);
@@ -848,6 +865,303 @@ impl Session {
     }
 
     // -----------------------------------------------------------------------
+    // Co-play: players, presence, roles and soft claims (M5, section 15)
+    // -----------------------------------------------------------------------
+
+    /// Maximum number of connected players. Agents are not counted.
+    pub fn max_players(&self) -> usize {
+        self.max_players
+    }
+
+    /// Set the host player limit, clamped to `1..=MAX_PLAYERS_LIMIT`. Lowering
+    /// it below the current player count does not disconnect anyone; it only
+    /// refuses new joins.
+    pub fn set_max_players(&mut self, max: usize) {
+        self.max_players = max.clamp(1, MAX_PLAYERS_LIMIT);
+    }
+
+    /// Register or refresh a player. Ids are sanitised with the same rules as
+    /// an [`AuthorId`]; names are trimmed and length-limited; malformed colours
+    /// fall back to neutral grey. Presence and status survive re-registration.
+    pub fn register_player(
+        &mut self,
+        id: &str,
+        name: &str,
+        color_hex: &str,
+        role: PlayerRole,
+    ) -> Result<&PlayerParticipant, CoplayError> {
+        let author = AuthorId::player(id)?;
+        let player_id = author.id;
+        let name = sanitize_name(name)?;
+        let color_hex = sanitize_color_hex(color_hex);
+
+        if !self.players.contains_key(&player_id) && self.players.len() >= self.max_players {
+            return Err(CoplayError::SessionFull {
+                max_players: self.max_players,
+            });
+        }
+
+        let participant = match self.players.get_mut(&player_id) {
+            Some(existing) => {
+                existing.name = name;
+                existing.color_hex = color_hex;
+                existing.role = role;
+                existing.clone()
+            }
+            None => PlayerParticipant {
+                id: player_id.clone(),
+                name,
+                color_hex,
+                role,
+                camera_pos_mm: [0, 0, 0],
+                camera_target_mm: [0, 0, 0],
+                status: String::new(),
+            },
+        };
+        let detail = format!("{} ({role:?})", participant.name);
+        self.players.insert(player_id.clone(), participant);
+        self.record_activity(&player_id, "player_registered", detail);
+        Ok(self
+            .players
+            .get(&player_id)
+            .expect("player was inserted immediately above"))
+    }
+
+    /// Disconnect a player and drop every soft claim they own. Returns `true`
+    /// when a player was present.
+    pub fn remove_player(&mut self, id: &str) -> bool {
+        let Some(player) = self.players.remove(id) else {
+            return false;
+        };
+        let owner = AuthorId {
+            kind: AuthorKind::Player,
+            id: player.id.clone(),
+        };
+        self.claims.retain(|_, claim| claim.owner != owner);
+        self.record_activity(&player.id, "player_disconnected", &player.name);
+        true
+    }
+
+    /// Change a registered player's role. Unknown ids are refused rather than
+    /// silently created.
+    pub fn set_player_role(&mut self, id: &str, role: PlayerRole) -> Result<(), CoplayError> {
+        let player = self
+            .players
+            .get_mut(id)
+            .ok_or_else(|| CoplayError::UnknownPlayer(id.to_string()))?;
+        player.role = role;
+        let player_id = player.id.clone();
+        self.record_activity(&player_id, "player_role_changed", format!("{role:?}"));
+        Ok(())
+    }
+
+    /// Update a player's camera marker and status line. A no-op for unknown
+    /// ids so throttled presence traffic stays infallible. Invalid status text
+    /// is replaced with an empty string rather than passed through.
+    pub fn update_player_presence(
+        &mut self,
+        id: &str,
+        camera_pos_mm: [i64; 3],
+        camera_target_mm: [i64; 3],
+        status: &str,
+    ) -> bool {
+        let safe_status = sanitize_summary(status).unwrap_or_default();
+        let Some(player) = self.players.get_mut(id) else {
+            return false;
+        };
+        player.camera_pos_mm = camera_pos_mm;
+        player.camera_target_mm = camera_target_mm;
+        player.status = safe_status;
+        true
+    }
+
+    /// Connected players in stable id order.
+    pub fn players(&self) -> impl Iterator<Item = &PlayerParticipant> {
+        self.players.values()
+    }
+
+    /// One player by sanitised id.
+    pub fn player(&self, id: &str) -> Option<&PlayerParticipant> {
+        self.players.get(id)
+    }
+
+    /// Shared edit gate: a registered player with the [`PlayerRole::Viewer`]
+    /// role may not edit. Agents are governed by [`Session::ensure_agent_active`]
+    /// instead, and player/system authors otherwise pass.
+    pub fn ensure_player_can_edit(&self, author: &AuthorId) -> Result<(), CoplayError> {
+        if author.kind != AuthorKind::Player {
+            return Ok(());
+        }
+        match self.players.get(&author.id) {
+            Some(player) if player.role == PlayerRole::Viewer => Err(CoplayError::PermissionDenied),
+            _ => Ok(()),
+        }
+    }
+
+    /// Claim an element. Claims are advisory: other builders are warned, never
+    /// blocked (section 15.2). Claiming the same element again replaces the
+    /// previous claim in place.
+    pub fn claim_element(
+        &mut self,
+        element_id: ElementId,
+        owner: AuthorId,
+        note: &str,
+    ) -> Result<SoftClaim, CoplayError> {
+        if self.document.get(element_id).is_none() {
+            return Err(CommandError::UnknownElementId(element_id).into());
+        }
+        let note = sanitize_summary(note)?;
+        let claim = SoftClaim {
+            element_id,
+            owner: owner.clone(),
+            note,
+        };
+        self.claims.insert(element_id, claim.clone());
+        self.record_activity(
+            owner.to_string(),
+            "claim_placed",
+            format!("element {element_id}: {}", claim.note),
+        );
+        Ok(claim)
+    }
+
+    /// Release a soft claim. The owner may always release their own claim; a
+    /// player with the [`PlayerRole::Host`] role may release anyone's.
+    pub fn release_claim(&mut self, element_id: ElementId, owner: &AuthorId) -> bool {
+        let Some(claim) = self.claims.get(&element_id) else {
+            return false;
+        };
+        let is_host = owner.kind == AuthorKind::Player
+            && self
+                .players
+                .get(&owner.id)
+                .is_some_and(|player| player.role == PlayerRole::Host);
+        if claim.owner != *owner && !is_host {
+            return false;
+        }
+        self.claims.remove(&element_id);
+        self.record_activity(
+            owner.to_string(),
+            "claim_released",
+            format!("element {element_id}"),
+        );
+        true
+    }
+
+    /// Every soft claim, in stable element-id order.
+    pub fn claims(&self) -> impl Iterator<Item = &SoftClaim> {
+        self.claims.values()
+    }
+
+    /// The soft claim on one element, if any.
+    pub fn claim_for(&self, element_id: ElementId) -> Option<&SoftClaim> {
+        self.claims.get(&element_id)
+    }
+
+    /// Capture everything a joining client needs to rebuild this session.
+    pub fn build_coplay_snapshot(&self) -> CoplaySnapshot {
+        let style = StylePack::find(&self.active_style_id).unwrap_or_default();
+        CoplaySnapshot {
+            handshake: JoinHandshake {
+                generator_version: GENERATOR_VERSION,
+                site_id: self.site_id.clone(),
+                style_id: style.id.clone(),
+                style_pack_hash: style_pack_hash(&style),
+                max_players: self.max_players,
+            },
+            document: self.document.clone(),
+            next_element_id: self.next_element_id,
+            next_seq: self.next_seq,
+            players: self.players.values().cloned().collect(),
+            claims: self.claims.values().cloned().collect(),
+            document_hash: document_hash_hex(&self.document),
+            layout_hash: layout_hash_hex(self.build_scene().layout_hash),
+        }
+    }
+
+    /// Rebuild a session from an untrusted snapshot. The version, site, style
+    /// pack hash and document are all validated before any state is trusted.
+    pub fn from_coplay_snapshot(snapshot: CoplaySnapshot) -> Result<Session, CoplayError> {
+        if snapshot.handshake.generator_version != GENERATOR_VERSION {
+            return Err(CoplayError::VersionMismatch {
+                expected: GENERATOR_VERSION,
+                got: snapshot.handshake.generator_version,
+            });
+        }
+        let terrain = SiteTerrain::for_site(&snapshot.handshake.site_id)
+            .ok_or_else(|| CoplayError::UnknownSite(snapshot.handshake.site_id.clone()))?;
+        let style = StylePack::find(&snapshot.handshake.style_id)
+            .ok_or_else(|| CoplayError::UnknownStyle(snapshot.handshake.style_id.clone()))?;
+        if style_pack_hash(&style) != snapshot.handshake.style_pack_hash {
+            return Err(CoplayError::StylePackHashMismatch);
+        }
+        snapshot
+            .document
+            .validate()
+            .map_err(|error| CoplayError::InvalidDocument(error.to_string()))?;
+
+        // The snapshot is untrusted input: the claimed document hash must match
+        // the document we actually received, otherwise a tampered snapshot
+        // could silently desync the guest from the host (M5).
+        let document_hash = format!("{:016x}", snapshot.document.document_hash());
+        if document_hash != snapshot.document_hash {
+            return Err(CoplayError::InvalidDocument(
+                "snapshot document hash mismatch".into(),
+            ));
+        }
+
+        let mut session =
+            Session::from_document(snapshot.handshake.site_id, terrain, snapshot.document);
+        session.active_style_id = style.id;
+        // The allocator must never fall below the highest id already present in
+        // the document, or the guest would mint duplicate element ids (M2).
+        session.next_element_id = session.next_element_id.max(snapshot.next_element_id);
+        session.next_seq = snapshot.next_seq.max(1);
+        session.max_players = snapshot.handshake.max_players.clamp(1, MAX_PLAYERS_LIMIT);
+
+        // Re-register every player through the normal validation path so a
+        // malformed id, unsafe name/colour or over-cap player list is dropped or
+        // sanitised exactly as it would be for a live join (M1).
+        for player in snapshot.players {
+            if session
+                .register_player(&player.id, &player.name, &player.color_hex, player.role)
+                .is_err()
+            {
+                continue;
+            }
+            session.update_player_presence(
+                &player.id,
+                player.camera_pos_mm,
+                player.camera_target_mm,
+                &player.status,
+            );
+        }
+
+        // Claims are replayed through `claim_element` so claims on elements that
+        // do not exist, or with unsafe notes, are silently dropped (M1).
+        for claim in snapshot.claims {
+            let _ = session.claim_element(claim.element_id, claim.owner, &claim.note);
+        }
+        Ok(session)
+    }
+
+    /// Compare the host's reported hashes against this session's live state.
+    pub fn verify_coplay_hashes(
+        &self,
+        host_doc_hash: &str,
+        host_layout_hash: &str,
+    ) -> HashCheckResult {
+        let client_doc_hash = document_hash_hex(&self.document);
+        let client_layout_hash = layout_hash_hex(self.build_scene().layout_hash);
+        compare_hashes(
+            host_doc_hash,
+            host_layout_hash,
+            &client_doc_hash,
+            &client_layout_hash,
+        )
+    }
+
+    // -----------------------------------------------------------------------
     // Proposals: forked overlays, human-approved (architecture section 4.2)
     // -----------------------------------------------------------------------
 
@@ -1318,11 +1632,6 @@ impl Session {
     }
 }
 
-/// Hex document hash used for proposal base checks.
-fn document_hash_hex(document: &CastleDocument) -> String {
-    format!("{:016x}", document.document_hash())
-}
-
 /// Clamp a signed value into an unsigned range without panicking on overflow.
 fn clamp_u32(value: i64, min: u32, max: u32) -> u32 {
     value.clamp(i64::from(min), i64::from(max)) as u32
@@ -1350,7 +1659,7 @@ fn update_commission_completion(state: &mut CommissionState) {
 }
 
 /// Keep a colour readable by the UI and free of control characters.
-fn sanitize_color_hex(value: &str) -> String {
+pub(crate) fn sanitize_color_hex(value: &str) -> String {
     let trimmed = value.trim();
     let valid = !trimmed.is_empty()
         && trimmed.len() <= 16

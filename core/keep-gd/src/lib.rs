@@ -29,6 +29,7 @@ use keep_core::command::{
     MIN_WALL_THICKNESS_MM,
 };
 use keep_core::commission::{list_commissions, CommissionState, Season};
+use keep_core::coplay::{CoplaySnapshot, HashCheckResult, PlayerRole, GENERATOR_VERSION};
 use keep_core::document::{CastleDocument, Element, RangeKind, TerrainBrushKind, TowerPlan};
 use keep_core::historian::{assess_historian, HistorianCategory, HistorianReport};
 use keep_core::interior::{build_interior_props, SectionPlane};
@@ -714,6 +715,257 @@ impl KeepBridge {
             }
             Err(error) => error_dictionary(&error),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // M5 Release 2: co-play players, presence, claims and wire messages
+    // -----------------------------------------------------------------------
+
+    /// Describe the live co-play session: player limit, participants, soft
+    /// claims, the document hash and the protocol version.
+    #[func]
+    fn coplay_state(&self) -> VarDictionary {
+        let mut result = VarDictionary::new();
+        result.set("max_players", self.session.max_players() as i64);
+
+        let mut players: Array<VarDictionary> = Array::new();
+        for player in self.session.players() {
+            players.push(&player_dictionary(player));
+        }
+        result.set("players", &players);
+
+        let mut claims: Array<VarDictionary> = Array::new();
+        for claim in self.session.claims() {
+            claims.push(&claim_dictionary(claim));
+        }
+        result.set("claims", &claims);
+
+        result.set(
+            "document_hash",
+            &GString::from(&format!("{:016x}", self.session.document().document_hash())),
+        );
+        result.set("generator_version", i64::from(GENERATOR_VERSION));
+        result
+    }
+
+    /// Set the host player limit (clamped by the core to `1..=4`) and return
+    /// the resulting cap.
+    #[func]
+    fn coplay_set_max_players(&mut self, max_players: i64) -> i64 {
+        self.session.set_max_players(max_players.max(1) as usize);
+        self.session.max_players() as i64
+    }
+
+    /// Register or refresh a player. Roles are `"host"`, `"builder"` or
+    /// `"viewer"`.
+    #[func]
+    fn coplay_register_player(
+        &mut self,
+        id: GString,
+        name: GString,
+        color_hex: GString,
+        role: GString,
+    ) -> VarDictionary {
+        let role = match parse_player_role(&role.to_string()) {
+            Ok(role) => role,
+            Err(message) => return error_dictionary(&message),
+        };
+        match self.session.register_player(
+            &id.to_string(),
+            &name.to_string(),
+            &color_hex.to_string(),
+            role,
+        ) {
+            Ok(player) => {
+                let mut result = VarDictionary::new();
+                result.set("ok", true);
+                result.set("player", &player_dictionary(player));
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Disconnect a player and drop every soft claim they own.
+    #[func]
+    fn coplay_remove_player(&mut self, id: GString) -> bool {
+        self.session.remove_player(&id.to_string())
+    }
+
+    /// Change a registered player's role.
+    #[func]
+    fn coplay_set_player_role(&mut self, id: GString, role: GString) -> VarDictionary {
+        let role = match parse_player_role(&role.to_string()) {
+            Ok(role) => role,
+            Err(message) => return error_dictionary(&message),
+        };
+        match self.session.set_player_role(&id.to_string(), role) {
+            Ok(()) => {
+                let mut result = VarDictionary::new();
+                result.set("ok", true);
+                match self.session.player(&id.to_string()) {
+                    Some(player) => result.set("player", &player_dictionary(player)),
+                    None => result.set("player", &VarDictionary::new()),
+                }
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Update a player's camera marker and status. Metres are converted to the
+    /// quantized integer millimetres the core stores.
+    #[func]
+    fn coplay_update_presence(
+        &mut self,
+        id: GString,
+        cam_pos: Vector3,
+        cam_target: Vector3,
+        status: GString,
+    ) -> bool {
+        self.session.update_player_presence(
+            &id.to_string(),
+            metres_to_mm(cam_pos),
+            metres_to_mm(cam_target),
+            &status.to_string(),
+        )
+    }
+
+    /// Place a non-blocking soft claim on an element.
+    #[func]
+    fn coplay_claim_element(
+        &mut self,
+        element_id: i64,
+        player_id: GString,
+        note: GString,
+    ) -> VarDictionary {
+        let author = match AuthorId::player(player_id.to_string()) {
+            Ok(author) => author,
+            Err(error) => return error_dictionary(&error),
+        };
+        match self
+            .session
+            .claim_element(element_id.max(0) as u64, author, &note.to_string())
+        {
+            Ok(claim) => {
+                let mut result = VarDictionary::new();
+                result.set("ok", true);
+                result.set("claim", &claim_dictionary(&claim));
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Release a soft claim. The owner or the host may release.
+    #[func]
+    fn coplay_release_claim(&mut self, element_id: i64, player_id: GString) -> bool {
+        let Ok(author) = AuthorId::player(player_id.to_string()) else {
+            return false;
+        };
+        self.session
+            .release_claim(element_id.max(0) as u64, &author)
+    }
+
+    /// Serialise the full co-play snapshot as JSON, or an empty string when it
+    /// cannot be encoded.
+    #[func]
+    fn coplay_snapshot_json(&self) -> GString {
+        match serde_json::to_string(&self.session.build_coplay_snapshot()) {
+            Ok(json) => GString::from(&json),
+            Err(_) => GString::new(),
+        }
+    }
+
+    /// Replace the live session from a host snapshot, validating version, site,
+    /// style pack and document first.
+    #[func]
+    fn coplay_apply_snapshot_json(&mut self, json: GString) -> VarDictionary {
+        let snapshot: CoplaySnapshot = match serde_json::from_str(&json.to_string()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error_dictionary(&format!("invalid snapshot JSON: {error}")),
+        };
+        match Session::from_coplay_snapshot(snapshot) {
+            Ok(session) => {
+                self.style_id = session.style_id().to_string();
+                self.replace_session(session);
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Apply an ordered remote batch after the shared edit gate. Returns the
+    /// rebuilt scene plus the assigned sequence number and document hash.
+    #[func]
+    fn coplay_apply_remote_batch_json(
+        &mut self,
+        author_id: GString,
+        ops_json: GString,
+    ) -> VarDictionary {
+        let author = match AuthorId::player(author_id.to_string()) {
+            Ok(author) => author,
+            Err(error) => return error_dictionary(&error),
+        };
+        let ops: Vec<CommandOp> = match serde_json::from_str(&ops_json.to_string()) {
+            Ok(ops) => ops,
+            Err(error) => return error_dictionary(&format!("invalid operations JSON: {error}")),
+        };
+        if let Err(error) = self.session.ensure_player_can_edit(&author) {
+            return error_dictionary(&error);
+        }
+        match self.session.apply_batch(author, ops) {
+            Ok(outcome) => {
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result.set("seq", outcome.seq as i64);
+                result.set(
+                    "document_hash",
+                    &GString::from(&format!("{:016x}", outcome.document_hash)),
+                );
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Apply a remote undo through the shared edit gate.
+    #[func]
+    fn coplay_apply_remote_undo(&mut self, author_id: GString) -> VarDictionary {
+        let author = match AuthorId::player(author_id.to_string()) {
+            Ok(author) => author,
+            Err(error) => return error_dictionary(&error),
+        };
+        if let Err(error) = self.session.ensure_player_can_edit(&author) {
+            return error_dictionary(&error);
+        }
+        match self.session.undo_last(&author) {
+            Ok(undo) => {
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result.set("undone", true);
+                result.set("target_seq", undo.target_seq as i64);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Compare the host's document and layout hashes against the live session
+    /// and classify the outcome.
+    #[func]
+    fn coplay_verify_hashes(
+        &self,
+        host_doc_hash: GString,
+        host_layout_hash: GString,
+    ) -> VarDictionary {
+        hash_check_dictionary(
+            &self
+                .session
+                .verify_coplay_hashes(&host_doc_hash.to_string(), &host_layout_hash.to_string()),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1596,6 +1848,96 @@ fn error_dictionary(message: &impl std::fmt::Display) -> VarDictionary {
     result.set("ok", false);
     result.set("error", &GString::from(&message.to_string()));
     result
+}
+
+// ---------------------------------------------------------------------------
+// Co-play helpers
+// ---------------------------------------------------------------------------
+
+fn parse_player_role(role: &str) -> Result<PlayerRole, String> {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "host" => Ok(PlayerRole::Host),
+        "builder" => Ok(PlayerRole::Builder),
+        "viewer" => Ok(PlayerRole::Viewer),
+        other => Err(format!(
+            "unknown player role '{other}' (expected host, builder or viewer)"
+        )),
+    }
+}
+
+fn player_role_name(role: PlayerRole) -> &'static str {
+    match role {
+        PlayerRole::Host => "host",
+        PlayerRole::Builder => "builder",
+        PlayerRole::Viewer => "viewer",
+    }
+}
+
+fn millimetre_triple(value: [i64; 3]) -> Array<i64> {
+    let mut array: Array<i64> = Array::new();
+    for component in value {
+        array.push(component);
+    }
+    array
+}
+
+fn player_dictionary(player: &keep_core::coplay::PlayerParticipant) -> VarDictionary {
+    let mut result = VarDictionary::new();
+    result.set("id", &GString::from(&player.id));
+    result.set("name", &GString::from(&player.name));
+    result.set("color_hex", &GString::from(&player.color_hex));
+    result.set("role", &GString::from(player_role_name(player.role)));
+    result.set("camera_pos_mm", &millimetre_triple(player.camera_pos_mm));
+    result.set(
+        "camera_target_mm",
+        &millimetre_triple(player.camera_target_mm),
+    );
+    result.set("status", &GString::from(&player.status));
+    result
+}
+
+fn claim_dictionary(claim: &keep_core::coplay::SoftClaim) -> VarDictionary {
+    let mut result = VarDictionary::new();
+    result.set("element_id", claim.element_id as i64);
+    result.set("owner", &GString::from(&claim.owner.to_string()));
+    result.set("note", &GString::from(&claim.note));
+    result
+}
+
+fn hash_check_dictionary(result: &HashCheckResult) -> VarDictionary {
+    let mut dictionary = VarDictionary::new();
+    match result {
+        HashCheckResult::Match => {
+            dictionary.set("kind", &GString::from("match"));
+        }
+        HashCheckResult::DocumentMismatch {
+            host_doc_hash,
+            client_doc_hash,
+        } => {
+            dictionary.set("kind", &GString::from("document_mismatch"));
+            dictionary.set("host_doc_hash", &GString::from(host_doc_hash));
+            dictionary.set("client_doc_hash", &GString::from(client_doc_hash));
+        }
+        HashCheckResult::GeneratorDivergence {
+            doc_hash,
+            host_layout_hash,
+            client_layout_hash,
+        } => {
+            dictionary.set("kind", &GString::from("generator_divergence"));
+            dictionary.set("doc_hash", &GString::from(doc_hash));
+            dictionary.set("host_layout_hash", &GString::from(host_layout_hash));
+            dictionary.set("client_layout_hash", &GString::from(client_layout_hash));
+        }
+    }
+    dictionary
+}
+
+fn metres_to_mm(value: Vector3) -> [i64; 3] {
+    [
+        (value.x * 1000.0).round() as i64,
+        (value.y * 1000.0).round() as i64,
+        (value.z * 1000.0).round() as i64,
+    ]
 }
 
 // ---------------------------------------------------------------------------
