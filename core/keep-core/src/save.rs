@@ -32,7 +32,7 @@ pub const MAX_SITE_ID_CHARS: usize = 64;
 
 /// Site ids this build can reconstruct terrain for. Unknown sites are rejected
 /// rather than silently falling back to a different landscape.
-pub const KNOWN_SITE_IDS: &[&str] = &[DEFAULT_SITE_ID];
+pub const KNOWN_SITE_IDS: &[&str] = &[DEFAULT_SITE_ID, "coastal_headland", "lake_island"];
 
 /// The JSON shape of `castle.keep.json`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -308,8 +308,7 @@ impl Session {
 /// must validate the id with [`validate_site_id`] first; unknown sites are
 /// rejected rather than silently mapped onto a different landscape.
 pub fn terrain_for_site(site_id: &str) -> SiteTerrain {
-    let _ = site_id;
-    SiteTerrain::m0a_promontory()
+    SiteTerrain::for_site(site_id).unwrap_or_else(SiteTerrain::m0a_promontory)
 }
 
 /// Reject unknown or oversized site ids.
@@ -706,5 +705,21 @@ mod tests {
             matches!(error, SaveError::UnknownSiteId { .. }),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn all_three_curated_sites_round_trip_through_save() {
+        assert_eq!(KNOWN_SITE_IDS.len(), 3);
+        for site_id in KNOWN_SITE_IDS {
+            let terrain = SiteTerrain::for_site(site_id).expect("known site");
+            let session = Session::from_document(*site_id, terrain, CastleDocument::new());
+            let json = session.to_save_json().unwrap();
+            let loaded = Session::from_save_json(&json).unwrap();
+            assert_eq!(loaded.site_id(), *site_id);
+            assert_eq!(
+                loaded.terrain().height_mm(0, 0),
+                session.terrain().height_mm(0, 0)
+            );
+        }
     }
 }

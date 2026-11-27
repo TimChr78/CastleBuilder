@@ -61,7 +61,7 @@ func _ready() -> void:
 	_setup_bridge()
 
 	if _bridge != null:
-		_rebuild("m0b")
+		_rebuild("m1")
 
 
 func _process(delta: float) -> void:
@@ -204,7 +204,9 @@ func _setup_hud() -> void:
 	_hud.connect("build_front_changed", Callable(self, "_on_hud_build_front_changed"))
 	_hud.connect("playing_changed", Callable(self, "_on_hud_playing_changed"))
 	_hud.connect("mode_requested", Callable(self, "_on_hud_mode_requested"))
+	_hud.connect("site_requested", Callable(self, "_on_hud_site_requested"))
 	_hud.connect("tool_requested", Callable(self, "_on_hud_tool_requested"))
+	_hud.connect("fix_requested", Callable(self, "_on_hud_fix_requested"))
 	_hud.connect("undo_requested", Callable(self, "_on_undo_requested"))
 	_hud.connect("save_requested", Callable(self, "_on_save_requested"))
 	_hud.connect("load_requested", Callable(self, "_on_load_requested"))
@@ -224,6 +226,11 @@ func _setup_feel() -> void:
 	add_child(_design_tool)
 	_design_tool.connect("wall_committed", Callable(self, "_on_wall_committed"))
 	_design_tool.connect("tower_committed", Callable(self, "_on_tower_committed"))
+	_design_tool.connect(
+		"tower_shaped_committed", Callable(self, "_on_tower_shaped_committed")
+	)
+	_design_tool.connect("gatehouse_committed", Callable(self, "_on_gatehouse_committed"))
+	_design_tool.connect("ditch_committed", Callable(self, "_on_ditch_committed"))
 	_design_tool.connect("snap_feedback", Callable(self, "_on_snap_feedback"))
 	_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.NONE)
 
@@ -263,18 +270,21 @@ func _rebuild(mode: String) -> void:
 	if _mode_busy:
 		return
 
-	var method := "build_m0b_showcase"
-	var label := "M0b Showcase"
+	var method := "build_m1_edwardian"
+	var label := "M1 Edwardian"
 	match mode:
 		"showcase":
 			method = "build_m0a_showcase"
 			label = "M0a Showcase"
+		"m0b":
+			method = "build_m0b_showcase"
+			label = "M0b Showcase"
 		"stress":
 			method = "build_stress_200k"
 			label = "200k Stress Test"
 		_:
-			method = "build_m0b_showcase"
-			label = "M0b Showcase"
+			method = "build_m1_edwardian"
+			label = "M1 Edwardian"
 
 	if not _bridge.has_method(method):
 		_hud.call("show_error", "KeepBridge has no %s() method." % method)
@@ -325,6 +335,9 @@ func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 	_hud.call(
 		"set_scene_stats", block_count, chunk_count, layout_hash, triangle_count, document_hash
 	)
+	var assessment: Variant = data.get("assessment", {})
+	if assessment is Dictionary:
+		_hud.call("set_assessment", assessment as Dictionary)
 
 	if reset_play:
 		_hud.call("clear_error")
@@ -535,13 +548,60 @@ func _on_hud_tool_requested(tool: String) -> void:
 	match tool:
 		"wall":
 			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.WALL)
-			_hud.call("set_tool_status", "Tool: Draw Wall — drag LMB across the promontory")
+			_hud.call("set_tool_status", "Tool: Wall — drag LMB between two points")
 		"tower":
 			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.TOWER)
-			_hud.call("set_tool_status", "Tool: Place Tower — click LMB to place")
+			_hud.call("set_tool_status", "Tool: Round Tower — click LMB to place")
+		"tower_d":
+			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.TOWER_D)
+			_hud.call("set_tool_status", "Tool: D-Tower — click LMB to place")
+		"tower_square":
+			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.TOWER_SQUARE)
+			_hud.call("set_tool_status", "Tool: Square Tower — click LMB to place")
+		"gatehouse":
+			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.GATEHOUSE)
+			_hud.call("set_tool_status", "Tool: Gatehouse — click LMB to place")
+		"ditch":
+			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.DITCH)
+			_hud.call("set_tool_status", "Tool: Ditch — drag LMB across the approach")
 		_:
 			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.NONE)
 			_hud.call("set_tool_status", "Tool: View — orbit around the site")
+
+
+func _on_hud_site_requested(site_id: String) -> void:
+	if _bridge == null or not _bridge.has_method("load_site"):
+		_hud.call("show_error", "Cannot switch sites: KeepBridge.load_site() is unavailable.")
+		return
+	var result: Variant = _bridge.call("load_site", site_id)
+	if not (result is Dictionary):
+		_hud.call("show_error", "KeepBridge.load_site() did not return a Dictionary.")
+		return
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		_hud.call("show_error", "Site rejected: %s" % str(data.get("error", "unknown error")))
+		return
+	_apply_scene(data, true, true)
+	_hud.call("set_mode_label", "Empty site — %s" % site_id)
+	_hud.call("clear_error")
+	_hud.call("set_tool_status", "Loaded empty site %s" % site_id)
+
+
+func _on_hud_fix_requested(fix_json: String) -> void:
+	if _bridge == null or not _bridge.has_method("apply_fix_json"):
+		_hud.call("show_error", "Cannot fix: KeepBridge.apply_fix_json() is unavailable.")
+		return
+	var result: Variant = _bridge.call("apply_fix_json", fix_json)
+	if not (result is Dictionary):
+		_hud.call("show_error", "KeepBridge.apply_fix_json() did not return a Dictionary.")
+		return
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		_hud.call("show_error", "Fix rejected: %s" % str(data.get("error", "unknown error")))
+		return
+	_apply_scene(data, false, false)
+	_hud.call("clear_error")
+	_hud.call("set_tool_status", "Structural fix applied — Ctrl+Z to undo")
 
 
 func _on_snap_feedback() -> void:
@@ -610,6 +670,83 @@ func _on_tower_committed(center_m: Vector2, radius_m: float, height_m: float) ->
 		"set_tool_status",
 		"Tower added: r %.1f m · H %.1f m — Ctrl+Z to undo" % [radius_m, height_m]
 	)
+
+
+func _on_tower_shaped_committed(
+	center_m: Vector2,
+	radius_m: float,
+	height_m: float,
+	plan: String,
+	orientation_deg: int
+) -> void:
+	if _audio != null:
+		_audio.call("play_place_thud", 0.82)
+	print(
+		"Keepwright: %s tower committed — centre %s, radius %.1f m, height %.1f m"
+		% [plan, str(center_m), radius_m, height_m]
+	)
+	if _bridge == null or not _bridge.has_method("add_tower_shaped"):
+		_hud.call("set_tool_status", "%s tower committed: r %.1f m" % [plan, radius_m])
+		return
+	var result: Variant = _bridge.call(
+		"add_tower_shaped", center_m, radius_m, height_m, plan, orientation_deg
+	)
+	if not (result is Dictionary):
+		_hud.call("show_error", "KeepBridge.add_tower_shaped() did not return a Dictionary.")
+		return
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		_hud.call("show_error", "Tower rejected: %s" % str(data.get("error", "unknown error")))
+		return
+	_apply_scene(data, false, false)
+	_hud.call("set_tool_status", "%s tower added — Ctrl+Z to undo" % plan)
+
+
+func _on_gatehouse_committed(center_m: Vector2, orientation_deg: int) -> void:
+	if _audio != null:
+		_audio.call("play_place_thud", 0.95)
+	print(
+		"Keepwright: gatehouse committed — centre %s, orientation %d°"
+		% [str(center_m), orientation_deg]
+	)
+	if _bridge == null or not _bridge.has_method("add_gatehouse"):
+		_hud.call("set_tool_status", "Gatehouse committed at %s" % str(center_m))
+		return
+	var result: Variant = _bridge.call("add_gatehouse", center_m, orientation_deg)
+	if not (result is Dictionary):
+		_hud.call("show_error", "KeepBridge.add_gatehouse() did not return a Dictionary.")
+		return
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		_hud.call(
+			"show_error", "Gatehouse rejected: %s" % str(data.get("error", "unknown error"))
+		)
+		return
+	_apply_scene(data, false, false)
+	_hud.call("set_tool_status", "Gatehouse added — Ctrl+Z to undo")
+
+
+func _on_ditch_committed(start_m: Vector2, end_m: Vector2, width_m: float, depth_m: float) -> void:
+	if _audio != null:
+		_audio.call("play_place_thud", 0.70)
+	var length := start_m.distance_to(end_m)
+	print(
+		"Keepwright: ditch committed — %.1f m long, %.1f m wide, %.1f m deep"
+		% [length, width_m, depth_m]
+	)
+	if _bridge == null or not _bridge.has_method("add_ditch"):
+		_hud.call("set_tool_status", "Ditch committed: %.1f m" % length)
+		return
+	var result: Variant = _bridge.call("add_ditch", start_m, end_m, width_m, depth_m)
+	if not (result is Dictionary):
+		_hud.call("show_error", "KeepBridge.add_ditch() did not return a Dictionary.")
+		return
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		_hud.call("show_error", "Ditch rejected: %s" % str(data.get("error", "unknown error")))
+		return
+	_apply_scene(data, false, false)
+	_hud.call("set_tool_status", "Ditch added: %.1f m — Ctrl+Z to undo" % length)
 
 
 func _on_undo_requested() -> void:

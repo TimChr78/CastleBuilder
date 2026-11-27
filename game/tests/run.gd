@@ -1,5 +1,5 @@
 extends SceneTree
-## Headless M0a contract test.
+## Headless M1 contract test.
 ##
 ##   godot --headless --path game --script res://tests/run.gd
 ##
@@ -12,7 +12,7 @@ extends SceneTree
 const MAX_LOD0_CENTER_OFFSET := 20.0
 
 func _initialize() -> void:
-	print("Keepwright M0b headless test")
+	print("Keepwright M1 headless test")
 	var failures: Array[String] = []
 	var bridge: Object = null
 
@@ -47,6 +47,14 @@ func _initialize() -> void:
 
 	if bridge != null:
 		_check_wave2b(bridge, failures)
+
+	if not failures.is_empty():
+		_for_each_failure(failures)
+		quit(1)
+		return
+
+	if bridge != null:
+		_check_m1(bridge, failures)
 
 	if not failures.is_empty():
 		_for_each_failure(failures)
@@ -388,8 +396,274 @@ func _check_wave2b(bridge: Object, failures: Array[String]) -> void:
 		)
 
 
-## M0b smoke checks: the FX/audio/design-tool scripts must load, instantiate and
-## honour their documented public API even in --headless mode.
+## M1.2 Wave 2b: default Edwardian showcase, site switching, shaped towers,
+## gatehouses, ditches and the structural assessment one-click fix.
+func _check_m1(bridge: Object, failures: Array[String]) -> void:
+	for method in [
+		"build_m1_edwardian",
+		"load_site",
+		"list_sites",
+		"add_tower_shaped",
+		"add_gatehouse",
+		"add_ditch",
+		"get_assessment",
+		"apply_fix_json",
+	]:
+		if not bridge.has_method(method):
+			failures.append("KeepBridge has no %s() method." % method)
+	if not failures.is_empty():
+		return
+
+	# 1. The default M1 Edwardian showcase builds, validates and meshes.
+	var m1_started := Time.get_ticks_msec()
+	var m1_result: Variant = bridge.call("build_m1_edwardian")
+	var m1_elapsed := Time.get_ticks_msec() - m1_started
+	_check_result(m1_result, m1_elapsed, failures, "M1 Edwardian showcase")
+	if not (m1_result is Dictionary):
+		return
+	var m1: Dictionary = m1_result
+	print("M1 Edwardian build_ms=%d" % m1_elapsed)
+
+	if str(m1.get("site_id", "")) != "coastal_headland":
+		failures.append(
+			"build_m1_edwardian() reported site_id %s, expected coastal_headland."
+			% str(m1.get("site_id", ""))
+		)
+	var report: Variant = m1.get("assessment", null)
+	if not (report is Dictionary):
+		failures.append("build_m1_edwardian() is missing an assessment Dictionary.")
+	else:
+		var assessment: Dictionary = report
+		if not bool(assessment.get("passed", false)):
+			failures.append(
+				"build_m1_edwardian() assessment did not pass: %s"
+				% str(assessment.get("findings", []))
+			)
+		if int(assessment.get("score", -1)) != 100:
+			failures.append(
+				"build_m1_edwardian() assessment score is %d, expected 100."
+				% int(assessment.get("score", -1))
+			)
+	if int(m1.get("block_count", 0)) <= 0:
+		failures.append("build_m1_edwardian() produced no masonry blocks.")
+	if int(m1.get("chunk_count", 0)) <= 0:
+		failures.append("build_m1_edwardian() produced no chunks.")
+	_check_lod_chunks(m1, failures)
+
+	# The gatehouse must contribute scaffolding footprints.
+	var element_kinds := {}
+	var elements: Variant = m1.get("elements", [])
+	if elements is Array:
+		for entry in (elements as Array):
+			if entry is Dictionary:
+				element_kinds[str((entry as Dictionary).get("kind", ""))] = true
+	if not element_kinds.has("tower"):
+		failures.append("M1 elements export no tower/gatehouse footprints.")
+	if not element_kinds.has("wall"):
+		failures.append("M1 elements export no wall footprints.")
+
+	# 2. Site listing and switching.
+	var sites: Variant = bridge.call("list_sites")
+	if not (sites is Array) or (sites as Array).size() != 3:
+		failures.append("list_sites() did not return three curated sites.")
+	else:
+		for index in 3:
+			var site: Variant = (sites as Array)[index]
+			if not (site is Dictionary):
+				failures.append("list_sites()[%d] is not a Dictionary." % index)
+				continue
+			for key in ["id", "name", "description"]:
+				if str((site as Dictionary).get(key, "")).is_empty():
+					failures.append("list_sites()[%d] is missing \"%s\"." % [index, key])
+
+	var lake_data := _require_ok(
+		bridge.call("load_site", "lake_island"), "load_site(lake_island)", failures
+	)
+	if lake_data.is_empty():
+		return
+	if str(lake_data.get("site_id", "")) != "lake_island":
+		failures.append(
+			"load_site(lake_island) reported site_id %s." % str(lake_data.get("site_id", ""))
+		)
+	if int(lake_data.get("block_count", -1)) != 0:
+		failures.append("load_site(lake_island) did not start from an empty castle.")
+
+	var unknown: Variant = bridge.call("load_site", "atlantis")
+	if not (unknown is Dictionary):
+		failures.append("load_site() did not return a Dictionary for an unknown site.")
+	elif bool((unknown as Dictionary).get("ok", true)):
+		failures.append("load_site() accepted an unknown site id.")
+	elif str((unknown as Dictionary).get("error", "")).is_empty():
+		failures.append("load_site() returned an empty error for an unknown site.")
+
+	# Save/load round trip on lake_island: build a wall, save, reset elsewhere,
+	# restore, and require identical document/layout hashes and site id.
+	_require_ok(bridge.call("load_site", "lake_island"), "load_site(lake_island) round trip", failures)
+	var lake_wall := _require_ok(
+		bridge.call("add_wall", Vector2(-8.0, 0.0), Vector2(8.0, 0.0), 8.0, 2.0),
+		"add_wall(lake_island save/load)",
+		failures
+	)
+	var lake_saved_hash := str(lake_wall.get("document_hash", ""))
+	var lake_saved_layout := str(lake_wall.get("layout_hash", ""))
+	var lake_save := _require_ok(
+		bridge.call("save_castle_json"), "save_castle_json(lake_island)", failures
+	)
+	var lake_json := str(lake_save.get("json", ""))
+	if lake_json.is_empty():
+		failures.append("save_castle_json(lake_island) returned an empty json payload.")
+	var reset_result: Variant = bridge.call("build_m0b_showcase")
+	if not (reset_result is Dictionary) or str(
+		(reset_result as Dictionary).get("document_hash", "")
+	) == lake_saved_hash:
+		failures.append("build_m0b_showcase() did not reset before the lake_island load.")
+	var lake_loaded := _require_ok(
+		bridge.call("load_castle_json", lake_json), "load_castle_json(lake_island)", failures
+	)
+	if not lake_loaded.is_empty():
+		if str(lake_loaded.get("site_id", "")) != "lake_island":
+			failures.append(
+				"load_castle_json(lake_island) restored site_id %s."
+				% str(lake_loaded.get("site_id", ""))
+			)
+		if str(lake_loaded.get("document_hash", "")) != lake_saved_hash:
+			failures.append("load_castle_json(lake_island) did not restore document_hash.")
+		if str(lake_loaded.get("layout_hash", "")) != lake_saved_layout:
+			failures.append("load_castle_json(lake_island) did not restore layout_hash.")
+
+	# 3. Gatehouse, ditch and square tower commands each change the document.
+	var gatehouse_data := _require_ok(
+		bridge.call("add_gatehouse", Vector2(0.0, 0.0), 0), "add_gatehouse()", failures
+	)
+	var gatehouse_hash := str(gatehouse_data.get("document_hash", ""))
+	if gatehouse_hash.is_empty():
+		failures.append("add_gatehouse() did not change the document_hash.")
+
+	var ditch_data := _require_ok(
+		bridge.call(
+			"add_ditch", Vector2(-20.0, -10.0), Vector2(-20.0, 10.0), 5.0, 2.0
+		),
+		"add_ditch()",
+		failures
+	)
+	var ditch_hash := str(ditch_data.get("document_hash", ""))
+	if ditch_hash.is_empty() or ditch_hash == gatehouse_hash:
+		failures.append("add_ditch() did not change the document_hash.")
+
+	# Undo the ditch through KeepBridge: it must restore the pre-ditch document
+	# while appending to the append-only history.
+	var undo_ditch: Variant = bridge.call("undo_last")
+	if not (undo_ditch is Dictionary):
+		failures.append("undo_last() did not return a Dictionary for the ditch.")
+	elif not bool((undo_ditch as Dictionary).get("undone", false)):
+		failures.append("undo_last() refused to undo the ditch.")
+	elif str((undo_ditch as Dictionary).get("document_hash", "")) != gatehouse_hash:
+		failures.append("undo_last() did not restore the document_hash after undoing the ditch.")
+
+	# Re-create the ditch so the remaining checks keep one in the document.
+	ditch_data = _require_ok(
+		bridge.call(
+			"add_ditch", Vector2(-20.0, -10.0), Vector2(-20.0, 10.0), 5.0, 2.0
+		),
+		"add_ditch() re-create",
+		failures
+	)
+	ditch_hash = str(ditch_data.get("document_hash", ""))
+
+	var square_data := _require_ok(
+		bridge.call(
+			"add_tower_shaped", Vector2(14.0, 4.0), 3.0, 12.0, "square", 0
+		),
+		"add_tower_shaped(square)",
+		failures
+	)
+	var square_hash := str(square_data.get("document_hash", ""))
+	if square_hash.is_empty() or square_hash == ditch_hash:
+		failures.append("add_tower_shaped() did not change the document_hash.")
+
+	# A D-shaped tower rotated 90 degrees around +X.
+	var d_shaped_data := _require_ok(
+		bridge.call(
+			"add_tower_shaped", Vector2(20.0, -4.0), 3.0, 12.0, "d_shaped", 90
+		),
+		"add_tower_shaped(d_shaped)",
+		failures
+	)
+	var d_shaped_hash := str(d_shaped_data.get("document_hash", ""))
+	if d_shaped_hash.is_empty() or d_shaped_hash == square_hash:
+		failures.append("add_tower_shaped(d_shaped) did not change the document_hash.")
+
+	# 4. Structural assessment + one-click fix on a thin 12 m x 1.0 m wall.
+	_require_ok(bridge.call("load_site", "lake_island"), "load_site(lake_island) reset", failures)
+	var thin_data := _require_ok(
+		bridge.call("add_wall", Vector2(-6.0, 0.0), Vector2(6.0, 0.0), 12.0, 1.0),
+		"add_wall(thin)",
+		failures
+	)
+	if thin_data.is_empty():
+		return
+
+	var broken: Variant = bridge.call("get_assessment")
+	if not (broken is Dictionary):
+		failures.append("get_assessment() did not return a Dictionary.")
+		return
+	var broken_report: Dictionary = broken
+	if bool(broken_report.get("passed", true)):
+		failures.append("A 12 m x 1.0 m wall unexpectedly passed the assessment.")
+	var fix_json := ""
+	var findings: Variant = broken_report.get("findings", [])
+	if findings is Array:
+		for entry in (findings as Array):
+			if not (entry is Dictionary):
+				continue
+			var finding: Dictionary = entry
+			if bool(finding.get("has_fix", false)):
+				var candidate := str(finding.get("fix_json", ""))
+				if not candidate.is_empty():
+					fix_json = candidate
+					break
+	if fix_json.is_empty():
+		failures.append("The slender-wall finding carried no fix_json.")
+		return
+
+	var fixed_data := _require_ok(
+		bridge.call("apply_fix_json", fix_json), "apply_fix_json()", failures
+	)
+	if fixed_data.is_empty():
+		return
+	var fixed_report: Variant = fixed_data.get("assessment", null)
+	if not (fixed_report is Dictionary):
+		fixed_report = bridge.call("get_assessment")
+	if not (fixed_report is Dictionary):
+		failures.append("No assessment available after applying the fix.")
+		return
+	if not bool((fixed_report as Dictionary).get("passed", false)):
+		failures.append(
+			"Assessment still fails after apply_fix_json(): %s"
+			% str((fixed_report as Dictionary).get("findings", []))
+		)
+	if int((fixed_report as Dictionary).get("score", -1)) != 100:
+		failures.append(
+			"Assessment score after the fix is %d, expected 100."
+			% int((fixed_report as Dictionary).get("score", -1))
+		)
+
+	if failures.is_empty():
+		print(
+			"M1.2 bridge OK: blocks=%d chunks=%d sites=3 fix=ok"
+			% [int(m1.get("block_count", 0)), int(m1.get("chunk_count", 0))]
+		)
+
+
+func _require_ok(result: Variant, label: String, failures: Array[String]) -> Dictionary:
+	if not (result is Dictionary):
+		failures.append("%s did not return a Dictionary." % label)
+		return {}
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		failures.append("%s was rejected: %s" % [label, str(data.get("error", "unknown error"))])
+		return {}
+	return data
 func _check_feel_scripts(failures: Array[String]) -> void:
 	var fx_script: Variant = load("res://scripts/construction_fx.gd")
 	if not (fx_script is GDScript):
@@ -484,16 +758,21 @@ func _check_feel_scripts(failures: Array[String]) -> void:
 			for method in ["set_mode", "get_mode", "set_ground_height", "set_defaults"]:
 				if not tool.has_method(method):
 					failures.append("DesignTool has no %s()." % method)
-			for signal_name in ["wall_committed", "tower_committed", "snap_feedback"]:
+			for signal_name in [
+				"wall_committed",
+				"tower_committed",
+				"tower_shaped_committed",
+				"gatehouse_committed",
+				"ditch_committed",
+				"snap_feedback",
+			]:
 				if not tool.has_signal(signal_name):
 					failures.append("DesignTool has no %s signal." % signal_name)
 			tool.call("set_ground_height", 4.0)
-			tool.call("set_mode", 1)
-			if int(tool.call("get_mode")) != 1:
-				failures.append("DesignTool.set_mode(1) did not stick.")
-			tool.call("set_mode", 2)
-			if int(tool.call("get_mode")) != 2:
-				failures.append("DesignTool.set_mode(2) did not stick.")
+			for mode in [1, 2, 3, 4, 5, 6]:
+				tool.call("set_mode", mode)
+				if int(tool.call("get_mode")) != mode:
+					failures.append("DesignTool.set_mode(%d) did not stick." % mode)
 			tool.call("set_mode", 0)
 			(tool as Node).free()
 

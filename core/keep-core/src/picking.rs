@@ -206,6 +206,16 @@ pub fn snap_point(
                     consider(perimeter, SnapKind::TowerPerimeter, tower.id);
                 }
             }
+            Element::Gatehouse(gatehouse) => {
+                consider(gatehouse.centre_mm, SnapKind::TowerCentre, gatehouse.id);
+                for tower in gatehouse.flank_towers() {
+                    consider(tower.centre_mm, SnapKind::TowerCentre, gatehouse.id);
+                }
+            }
+            Element::Ditch(ditch) => {
+                consider(ditch.start_mm, SnapKind::WallEndpoint, ditch.id);
+                consider(ditch.end_mm, SnapKind::WallEndpoint, ditch.id);
+            }
             Element::BatteredWall(wall) => {
                 consider(wall.start_mm, SnapKind::WallEndpoint, wall.id);
                 consider(wall.end_mm, SnapKind::WallEndpoint, wall.id);

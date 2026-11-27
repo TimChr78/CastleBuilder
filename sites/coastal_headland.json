@@ -1,0 +1,12 @@
+{
+  "id": "coastal_headland",
+  "name": "Coastal Headland",
+  "description": "A steep coastal rock headland dropping sharply on two sides, with a broad fortified upper shelf.",
+  "latitude_deg": 53.2,
+  "landforms": [
+    "upper shelf",
+    "sea cliff east",
+    "sea cliff south",
+    "landward approach"
+  ]
+}

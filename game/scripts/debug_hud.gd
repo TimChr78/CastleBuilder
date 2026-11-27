@@ -8,12 +8,15 @@ extends CanvasLayer
 signal build_front_changed(value: float)
 signal playing_changed(playing: bool)
 signal mode_requested(mode: String)
+signal site_requested(site_id: String)
 signal tool_requested(tool: String)
+signal fix_requested(fix_json: String)
 signal undo_requested()
 signal save_requested()
 signal load_requested()
 
 const REFRESH_INTERVAL := 0.25
+const MAX_ASSESSMENT_FINDINGS := 3
 
 var _fps_label: Label
 var _render_label: Label
@@ -26,6 +29,7 @@ var _warning_label: Label
 var _error_label: Label
 var _slider: HSlider
 var _play_button: Button
+var _m1_button: Button
 var _showcase_button: Button
 var _m0b_button: Button
 var _stress_button: Button
@@ -34,6 +38,8 @@ var _save_button: Button
 var _load_button: Button
 var _tool_status: Label
 var _tool_buttons: Dictionary = {}
+var _assessment_label: Label
+var _assessment_findings: VBoxContainer
 
 var _playing := false
 var _refresh_timer := 0.0
@@ -77,13 +83,13 @@ func _build_ui() -> void:
 	margin.add_child(column)
 
 	var title := Label.new()
-	title.text = "KEEPWRIGHT  ·  M0b"
+	title.text = "KEEPWRIGHT  ·  M1"
 	title.add_theme_font_size_override("font_size", 17)
 	title.add_theme_color_override("font_color", Color(0.96, 0.89, 0.72))
 	column.add_child(title)
 
 	_mode_label = Label.new()
-	_mode_label.text = "M0b Showcase"
+	_mode_label.text = "M1 Edwardian"
 	_mode_label.add_theme_font_size_override("font_size", 12)
 	_mode_label.add_theme_color_override("font_color", Color(0.72, 0.74, 0.66))
 	column.add_child(_mode_label)
@@ -108,19 +114,25 @@ func _build_ui() -> void:
 	column.add_child(mode_row)
 
 	_showcase_button = Button.new()
-	_showcase_button.text = "M0a Showcase"
+	_showcase_button.text = "M0a"
 	_showcase_button.focus_mode = Control.FOCUS_NONE
 	_showcase_button.pressed.connect(_on_showcase_pressed)
 	mode_row.add_child(_showcase_button)
 
+	_m1_button = Button.new()
+	_m1_button.text = "M1 Edwardian"
+	_m1_button.focus_mode = Control.FOCUS_NONE
+	_m1_button.pressed.connect(_on_m1_pressed)
+	mode_row.add_child(_m1_button)
+
 	_m0b_button = Button.new()
-	_m0b_button.text = "M0b Showcase"
+	_m0b_button.text = "M0b"
 	_m0b_button.focus_mode = Control.FOCUS_NONE
 	_m0b_button.pressed.connect(_on_m0b_pressed)
 	mode_row.add_child(_m0b_button)
 
 	_stress_button = Button.new()
-	_stress_button.text = "200k Stress Test"
+	_stress_button.text = "200k"
 	_stress_button.focus_mode = Control.FOCUS_NONE
 	_stress_button.pressed.connect(_on_stress_pressed)
 	mode_row.add_child(_stress_button)
@@ -130,6 +142,27 @@ func _build_ui() -> void:
 	_undo_button.focus_mode = Control.FOCUS_NONE
 	_undo_button.pressed.connect(_on_undo_pressed)
 	mode_row.add_child(_undo_button)
+
+	var site_row := HBoxContainer.new()
+	site_row.add_theme_constant_override("separation", 6)
+	column.add_child(site_row)
+
+	var site_label := Label.new()
+	site_label.text = "Site"
+	site_label.add_theme_font_size_override("font_size", 11)
+	site_label.add_theme_color_override("font_color", Color(0.62, 0.64, 0.58))
+	site_row.add_child(site_label)
+
+	for site_entry in [
+		["m0a_promontory", "Promontory"],
+		["coastal_headland", "Headland"],
+		["lake_island", "Lake Island"],
+	]:
+		var site_button := Button.new()
+		site_button.text = site_entry[1]
+		site_button.focus_mode = Control.FOCUS_NONE
+		site_button.pressed.connect(_on_site_pressed.bind(site_entry[0]))
+		site_row.add_child(site_button)
 
 	var file_row := HBoxContainer.new()
 	file_row.add_theme_constant_override("separation", 6)
@@ -175,16 +208,22 @@ func _build_ui() -> void:
 
 	column.add_child(HSeparator.new())
 
-	var tool_row := HBoxContainer.new()
-	tool_row.add_theme_constant_override("separation", 6)
+	var tool_row := GridContainer.new()
+	tool_row.columns = 4
+	tool_row.add_theme_constant_override("h_separation", 6)
+	tool_row.add_theme_constant_override("v_separation", 4)
 	column.add_child(tool_row)
 
 	var tool_group := ButtonGroup.new()
 	tool_group.allow_unpress = false
 	var tool_entries := [
 		["view", "View"],
-		["wall", "Draw Wall"],
-		["tower", "Place Tower"],
+		["wall", "Wall"],
+		["tower", "Round Tower"],
+		["tower_d", "D-Tower"],
+		["tower_square", "Square Tower"],
+		["gatehouse", "Gatehouse"],
+		["ditch", "Ditch"],
 	]
 	for entry in tool_entries:
 		var tool_id: String = entry[0]
@@ -202,8 +241,23 @@ func _build_ui() -> void:
 	_tool_status.add_theme_color_override("font_color", Color(0.90, 0.82, 0.60))
 	column.add_child(_tool_status)
 
+	column.add_child(HSeparator.new())
+
+	_assessment_label = Label.new()
+	_assessment_label.text = "Structure: —"
+	_assessment_label.add_theme_font_size_override("font_size", 13)
+	_assessment_label.add_theme_color_override("font_color", Color(0.86, 0.87, 0.80))
+	column.add_child(_assessment_label)
+
+	_assessment_findings = VBoxContainer.new()
+	_assessment_findings.add_theme_constant_override("separation", 3)
+	column.add_child(_assessment_findings)
+
 	var hint := Label.new()
-	hint.text = "RMB / MMB orbit · Shift+drag pan · Wheel zoom · WASD pan\nLMB drag to draw a wall · LMB to place a tower · Ctrl+Z undo"
+	hint.text = (
+		"RMB / MMB orbit · Shift+drag pan · Wheel zoom · WASD pan\n"
+		+ "LMB drag: wall/ditch · LMB click: tower/gatehouse · Ctrl+Z undo"
+	)
 	hint.add_theme_font_size_override("font_size", 11)
 	hint.add_theme_color_override("font_color", Color(0.62, 0.64, 0.58))
 	column.add_child(hint)
@@ -265,6 +319,80 @@ func set_mode_label(mode_name: String) -> void:
 	_mode_label.text = mode_name
 
 
+## Compact structural assessment readout. Passing shows the score line (plus a
+## warning count when informational findings remain); findings are listed up to
+## three, each fixable one with a one-click Fix button.
+func set_assessment(data: Dictionary) -> void:
+	if _assessment_label == null or _assessment_findings == null:
+		return
+	for child in _assessment_findings.get_children():
+		child.queue_free()
+
+	var score := int(data.get("score", 100))
+	var passed := bool(data.get("passed", true))
+	var findings: Variant = data.get("findings", [])
+	var has_findings := findings is Array and not (findings as Array).is_empty()
+
+	if passed:
+		if has_findings:
+			_assessment_label.text = "Structure: %d/100 ✓ (%d warnings)" % [
+				score, (findings as Array).size(),
+			]
+		else:
+			_assessment_label.text = "Structure: %d/100 ✓" % score
+		_assessment_label.add_theme_color_override("font_color", Color(0.62, 0.88, 0.54))
+		if not has_findings:
+			return
+	else:
+		_assessment_label.text = "Structure: %d/100 ✗" % score
+		_assessment_label.add_theme_color_override("font_color", Color(1.0, 0.55, 0.42))
+
+	if not (findings is Array):
+		return
+	var shown := 0
+	for entry in (findings as Array):
+		if shown >= MAX_ASSESSMENT_FINDINGS:
+			break
+		if not (entry is Dictionary):
+			continue
+		var finding: Dictionary = entry
+		shown += 1
+
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 6)
+
+		var message := Label.new()
+		var severity_name := str(finding.get("severity", "info"))
+		message.text = "%s  %s" % [
+			severity_name.to_upper(),
+			str(finding.get("message", finding.get("code", ""))),
+		]
+		message.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		message.custom_minimum_size = Vector2(240.0, 0.0)
+		message.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		message.add_theme_font_size_override("font_size", 11)
+		match severity_name:
+			"error":
+				message.add_theme_color_override("font_color", Color(1.0, 0.55, 0.42))
+			"warning":
+				message.add_theme_color_override("font_color", Color(0.96, 0.78, 0.36))
+			_:
+				message.add_theme_color_override("font_color", Color(0.78, 0.80, 0.72))
+		row.add_child(message)
+
+		if bool(finding.get("has_fix", false)):
+			var fix_button := Button.new()
+			fix_button.text = "Fix"
+			fix_button.focus_mode = Control.FOCUS_NONE
+			fix_button.custom_minimum_size = Vector2(42.0, 0.0)
+			fix_button.pressed.connect(
+				_on_fix_pressed.bind(str(finding.get("fix_json", "")))
+			)
+			row.add_child(fix_button)
+
+		_assessment_findings.add_child(row)
+
+
 func set_build_front(value: float) -> void:
 	var clamped := clampf(value, 0.0, 1.0)
 	_slider.set_value_no_signal(clamped)
@@ -317,6 +445,19 @@ func _on_play_toggled(pressed: bool) -> void:
 
 func _on_showcase_pressed() -> void:
 	mode_requested.emit("showcase")
+
+
+func _on_m1_pressed() -> void:
+	mode_requested.emit("m1")
+
+
+func _on_site_pressed(site_id: String) -> void:
+	site_requested.emit(site_id)
+
+
+func _on_fix_pressed(fix_json: String) -> void:
+	if not fix_json.is_empty():
+		fix_requested.emit(fix_json)
 
 
 func _on_m0b_pressed() -> void:

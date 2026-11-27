@@ -1,0 +1,20 @@
+{
+  "id": "edwardian_welsh",
+  "name": "Edwardian Welsh (1277–1300)",
+  "period": "1277–1300",
+  "region": "North Wales",
+  "course_height_mm": 450,
+  "min_wall_thickness_mm": 1800,
+  "default_wall_thickness_mm": 2400,
+  "max_slenderness_ratio": 4.5,
+  "default_batter_mm": 900,
+  "default_plinth_height_mm": 900,
+  "flanking_spacing_min_m": 25.0,
+  "flanking_spacing_max_m": 42.0,
+  "source_notes": [
+    "Caernarfon Castle (begun 1283): great polygonal towers, banded stonework and a strongly battered plinth; the curtain walls are roughly 2.4 m thick and 9–12 m high.",
+    "Conwy Castle (1283–1287): eight projecting round towers on a narrow rock ridge; walls and towers share a pronounced batter and a deep foundation plinth.",
+    "Harlech Castle (1283–1289): concentric curtain with tall round corner towers, a 2.4–3.0 m wall thickness and a gatehouse whose flanking towers command the approach.",
+    "Beaumaris Castle (begun 1295): the most regular Edwardian concentric plan, with a wide moat, low-battered curtain walls and evenly spaced flanking towers (roughly 25–42 m apart)."
+  ]
+}

@@ -16,7 +16,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::document::{
-    BatteredWall, CastleDocument, Element, ElementId, Opening, OpeningKind, RoundTower,
+    validate_element, BatteredWall, CastleDocument, Ditch, Element, ElementId, Gatehouse, Opening,
+    OpeningKind, RoundTower, TowerPlan,
 };
 
 // ---------------------------------------------------------------------------
@@ -96,6 +97,44 @@ pub const MAX_OUTER_SLIT_MM: i64 = 600;
 pub const MIN_INNER_SPLAY_WIDTH_MM: i64 = 300;
 /// See [`MIN_INNER_SPLAY_WIDTH_MM`].
 pub const MAX_INNER_SPLAY_WIDTH_MM: i64 = 3_000;
+
+/// Gatehouse passage width bounds, in millimetres.
+pub const MIN_PASSAGE_WIDTH_MM: i64 = 1_200;
+/// See [`MIN_PASSAGE_WIDTH_MM`].
+pub const MAX_PASSAGE_WIDTH_MM: i64 = 12_000;
+/// Gatehouse passage height bounds, in millimetres.
+pub const MIN_PASSAGE_HEIGHT_MM: i64 = 2_000;
+/// See [`MIN_PASSAGE_HEIGHT_MM`].
+pub const MAX_PASSAGE_HEIGHT_MM: i64 = 12_000;
+/// Gatehouse depth bounds, in millimetres.
+pub const MIN_GATEHOUSE_DEPTH_MM: i64 = 2_000;
+/// See [`MIN_GATEHOUSE_DEPTH_MM`].
+pub const MAX_GATEHOUSE_DEPTH_MM: i64 = 30_000;
+/// Gatehouse height bounds, in millimetres.
+pub const MIN_GATEHOUSE_HEIGHT_MM: i64 = 4_000;
+/// See [`MIN_GATEHOUSE_HEIGHT_MM`].
+pub const MAX_GATEHOUSE_HEIGHT_MM: i64 = 40_000;
+/// Gatehouse flanking-tower radius bounds, in millimetres.
+pub const MIN_GATEHOUSE_TOWER_RADIUS_MM: i64 = 1_500;
+/// See [`MIN_GATEHOUSE_TOWER_RADIUS_MM`].
+pub const MAX_GATEHOUSE_TOWER_RADIUS_MM: i64 = 10_000;
+/// Plan-orientation bounds, in degrees.
+pub const MIN_ORIENTATION_DEG: i64 = -360;
+/// See [`MIN_ORIENTATION_DEG`].
+pub const MAX_ORIENTATION_DEG: i64 = 360;
+
+/// Ditch width bounds, in millimetres.
+pub const MIN_DITCH_WIDTH_MM: i64 = 500;
+/// See [`MIN_DITCH_WIDTH_MM`].
+pub const MAX_DITCH_WIDTH_MM: i64 = 30_000;
+/// Ditch depth bounds, in millimetres.
+pub const MIN_DITCH_DEPTH_MM: i64 = 100;
+/// See [`MIN_DITCH_DEPTH_MM`].
+pub const MAX_DITCH_DEPTH_MM: i64 = 10_000;
+/// Shortest accepted ditch centreline, in millimetres.
+pub const MIN_DITCH_LENGTH_MM: i64 = 500;
+/// Longest accepted ditch centreline, in millimetres.
+pub const MAX_DITCH_LENGTH_MM: i64 = 500_000;
 
 // ---------------------------------------------------------------------------
 // Authors
@@ -207,6 +246,47 @@ pub enum CommandOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         batter_mm: Option<i64>,
     },
+    /// Create a simple gatehouse with two flanking towers and a clear passage.
+    CreateGatehouse {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        name: String,
+        centre_mm: [i64; 2],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orientation_deg: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        passage_width_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tower_radius_mm: Option<i64>,
+    },
+    /// Carve a linear ditch earthwork across the terrain.
+    CreateDitch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        name: String,
+        start_mm: [i64; 2],
+        end_mm: [i64; 2],
+        width_mm: i64,
+        depth_mm: i64,
+    },
+    /// Modify one existing element. Only the fields that are `Some` change.
+    ModifyElement {
+        id: ElementId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thickness_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batter_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plinth_height_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<TowerPlan>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orientation_deg: Option<i32>,
+    },
     /// Cut a splayed arrow loop through an existing wall.
     AddArrowLoop {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,6 +374,125 @@ impl CommandOp {
                 )?;
                 if let Some(batter_mm) = batter_mm {
                     check_dimension("batter_mm", *batter_mm, 0, MAX_BATTER_MM)?;
+                }
+            }
+            Self::CreateGatehouse {
+                ref_id,
+                name,
+                centre_mm,
+                orientation_deg,
+                passage_width_mm,
+                height_mm,
+                tower_radius_mm,
+            } => {
+                *name = sanitize_name(name)?;
+                validate_optional_ref_id(ref_id)?;
+                for value in centre_mm.iter() {
+                    check_coordinate("centre_mm", *value)?;
+                }
+                let orientation = orientation_deg.unwrap_or(0);
+                check_dimension(
+                    "orientation_deg",
+                    i64::from(orientation),
+                    MIN_ORIENTATION_DEG,
+                    MAX_ORIENTATION_DEG,
+                )?;
+                check_dimension(
+                    "passage_width_mm",
+                    passage_width_mm.unwrap_or(3_200),
+                    MIN_PASSAGE_WIDTH_MM,
+                    MAX_PASSAGE_WIDTH_MM,
+                )?;
+                check_dimension(
+                    "height_mm",
+                    height_mm.unwrap_or(14_000),
+                    MIN_GATEHOUSE_HEIGHT_MM,
+                    MAX_GATEHOUSE_HEIGHT_MM,
+                )?;
+                check_dimension(
+                    "tower_radius_mm",
+                    tower_radius_mm.unwrap_or(3_400),
+                    MIN_GATEHOUSE_TOWER_RADIUS_MM,
+                    MAX_GATEHOUSE_TOWER_RADIUS_MM,
+                )?;
+            }
+            Self::CreateDitch {
+                ref_id,
+                name,
+                start_mm,
+                end_mm,
+                width_mm,
+                depth_mm,
+            } => {
+                *name = sanitize_name(name)?;
+                validate_optional_ref_id(ref_id)?;
+                for value in start_mm.iter() {
+                    check_coordinate("start_mm", *value)?;
+                }
+                for value in end_mm.iter() {
+                    check_coordinate("end_mm", *value)?;
+                }
+                check_dimension(
+                    "width_mm",
+                    *width_mm,
+                    MIN_DITCH_WIDTH_MM,
+                    MAX_DITCH_WIDTH_MM,
+                )?;
+                check_dimension(
+                    "depth_mm",
+                    *depth_mm,
+                    MIN_DITCH_DEPTH_MM,
+                    MAX_DITCH_DEPTH_MM,
+                )?;
+                let dx = i128::from(end_mm[0]) - i128::from(start_mm[0]);
+                let dz = i128::from(end_mm[1]) - i128::from(start_mm[1]);
+                let length_sq = dx * dx + dz * dz;
+                let min_sq = i128::from(MIN_DITCH_LENGTH_MM) * i128::from(MIN_DITCH_LENGTH_MM);
+                let max_sq = i128::from(MAX_DITCH_LENGTH_MM) * i128::from(MAX_DITCH_LENGTH_MM);
+                if length_sq < min_sq || length_sq > max_sq {
+                    return Err(CommandError::WallLengthOutOfRange {
+                        min_mm: i128::from(MIN_DITCH_LENGTH_MM),
+                        max_mm: i128::from(MAX_DITCH_LENGTH_MM),
+                    });
+                }
+            }
+            Self::ModifyElement {
+                height_mm,
+                thickness_mm,
+                batter_mm,
+                plinth_height_mm,
+                orientation_deg,
+                ..
+            } => {
+                if let Some(height_mm) = height_mm {
+                    check_dimension(
+                        "height_mm",
+                        *height_mm,
+                        MIN_WALL_HEIGHT_MM,
+                        MAX_WALL_HEIGHT_MM,
+                    )?;
+                }
+                if let Some(thickness_mm) = thickness_mm {
+                    check_dimension(
+                        "thickness_mm",
+                        *thickness_mm,
+                        MIN_WALL_THICKNESS_MM,
+                        MAX_WALL_THICKNESS_MM,
+                    )?;
+                }
+                if let Some(batter_mm) = batter_mm {
+                    check_dimension("batter_mm", *batter_mm, 0, MAX_BATTER_MM)?;
+                }
+                if let Some(plinth_height_mm) = plinth_height_mm {
+                    check_dimension("plinth_height_mm", *plinth_height_mm, 0, MAX_WALL_HEIGHT_MM)?;
+                }
+                if let Some(orientation_deg) = orientation_deg {
+                    check_dimension(
+                        "orientation_deg",
+                        i64::from(*orientation_deg),
+                        MIN_ORIENTATION_DEG,
+                        MAX_ORIENTATION_DEG,
+                    )?;
                 }
             }
             Self::AddArrowLoop {
@@ -528,6 +727,11 @@ pub enum CommandError {
     UnknownWallId(ElementId),
     NotAWallRun(ElementId),
     UnknownElementId(ElementId),
+    /// A field was supplied that does not apply to the target element's kind.
+    InvalidField {
+        field: &'static str,
+        kind: &'static str,
+    },
     DuplicateRefId(String),
     UnknownTargetSeq(u64),
     IdOverflow,
@@ -606,6 +810,9 @@ impl fmt::Display for CommandError {
             Self::UnknownWallId(id) => write!(f, "unknown wall_id {id}"),
             Self::NotAWallRun(id) => write!(f, "element {id} is not a wall run"),
             Self::UnknownElementId(id) => write!(f, "unknown element id {id}"),
+            Self::InvalidField { field, kind } => {
+                write!(f, "{field} does not apply to a {kind}")
+            }
             Self::DuplicateRefId(reference) => {
                 write!(f, "duplicate ref_id '{reference}' in batch")
             }
@@ -795,7 +1002,10 @@ pub(crate) fn execute_batch(
     let mut touched: std::collections::BTreeSet<ElementId> = std::collections::BTreeSet::new();
     let mut created_walls = 0usize;
     let mut created_towers = 0usize;
+    let mut created_gatehouses = 0usize;
+    let mut created_ditches = 0usize;
     let mut created_openings = 0usize;
+    let mut modified = 0usize;
     let mut deleted = 0usize;
 
     for op in ops {
@@ -858,6 +1068,196 @@ pub(crate) fn execute_batch(
                     .ok_or(CommandError::IdOverflow)?;
                 created_towers += 1;
             }
+            CommandOp::CreateGatehouse {
+                ref_id,
+                name,
+                centre_mm,
+                orientation_deg,
+                passage_width_mm,
+                height_mm,
+                tower_radius_mm,
+            } => {
+                let mut gatehouse = Gatehouse::new(
+                    next_element_id,
+                    name,
+                    centre_mm,
+                    orientation_deg.unwrap_or(0),
+                );
+                if let Some(passage_width_mm) = passage_width_mm {
+                    gatehouse.passage_width_mm = passage_width_mm;
+                }
+                if let Some(height_mm) = height_mm {
+                    gatehouse.height_mm = height_mm;
+                }
+                if let Some(tower_radius_mm) = tower_radius_mm {
+                    gatehouse.tower_radius_mm = tower_radius_mm;
+                }
+                let id = gatehouse.id;
+                inverse
+                    .created_elements
+                    .push(Element::Gatehouse(gatehouse.clone()));
+                document.add_gatehouse(gatehouse);
+                register_ref(&mut created_ids, ref_id, id)?;
+                touched.insert(id);
+                next_element_id = next_element_id
+                    .checked_add(1)
+                    .ok_or(CommandError::IdOverflow)?;
+                created_gatehouses += 1;
+            }
+            CommandOp::CreateDitch {
+                ref_id,
+                name,
+                start_mm,
+                end_mm,
+                width_mm,
+                depth_mm,
+            } => {
+                let ditch = Ditch::new(next_element_id, name, start_mm, end_mm, width_mm, depth_mm);
+                let id = ditch.id;
+                inverse.created_elements.push(Element::Ditch(ditch.clone()));
+                document.add_ditch(ditch);
+                register_ref(&mut created_ids, ref_id, id)?;
+                touched.insert(id);
+                next_element_id = next_element_id
+                    .checked_add(1)
+                    .ok_or(CommandError::IdOverflow)?;
+                created_ditches += 1;
+            }
+            CommandOp::ModifyElement {
+                id,
+                height_mm,
+                thickness_mm,
+                batter_mm,
+                plinth_height_mm,
+                plan,
+                orientation_deg,
+            } => {
+                let previous = document
+                    .get(id)
+                    .cloned()
+                    .ok_or(CommandError::UnknownElementId(id))?;
+                let invalid = |field: &'static str| CommandError::InvalidField {
+                    field,
+                    kind: match &previous {
+                        Element::BatteredWall(_) => "wall",
+                        Element::RoundTower(_) => "tower",
+                        Element::Gatehouse(_) => "gatehouse",
+                        Element::Ditch(_) => "ditch",
+                    },
+                };
+                match &previous {
+                    Element::BatteredWall(_) => {
+                        if plan.is_some() {
+                            return Err(invalid("plan"));
+                        }
+                        if orientation_deg.is_some() {
+                            return Err(invalid("orientation_deg"));
+                        }
+                    }
+                    Element::RoundTower(_) => {}
+                    Element::Gatehouse(_) => {
+                        if thickness_mm.is_some() {
+                            return Err(invalid("thickness_mm"));
+                        }
+                        if batter_mm.is_some() {
+                            return Err(invalid("batter_mm"));
+                        }
+                        if plinth_height_mm.is_some() {
+                            return Err(invalid("plinth_height_mm"));
+                        }
+                        if plan.is_some() {
+                            return Err(invalid("plan"));
+                        }
+                    }
+                    Element::Ditch(_) => {
+                        if height_mm.is_some() {
+                            return Err(invalid("height_mm"));
+                        }
+                        if thickness_mm.is_some() {
+                            return Err(invalid("thickness_mm"));
+                        }
+                        if batter_mm.is_some() {
+                            return Err(invalid("batter_mm"));
+                        }
+                        if plinth_height_mm.is_some() {
+                            return Err(invalid("plinth_height_mm"));
+                        }
+                        if plan.is_some() {
+                            return Err(invalid("plan"));
+                        }
+                        if orientation_deg.is_some() {
+                            return Err(invalid("orientation_deg"));
+                        }
+                    }
+                }
+                let mut updated = previous.clone();
+                match &mut updated {
+                    Element::BatteredWall(wall) => {
+                        if let Some(height_mm) = height_mm {
+                            wall.height_mm = height_mm;
+                        }
+                        if let Some(thickness_mm) = thickness_mm {
+                            wall.thickness_mm = thickness_mm;
+                        }
+                        if let Some(batter_mm) = batter_mm {
+                            wall.batter_mm = batter_mm;
+                        }
+                        if let Some(plinth_height_mm) = plinth_height_mm {
+                            wall.plinth_height_mm = plinth_height_mm;
+                        }
+                    }
+                    Element::RoundTower(tower) => {
+                        if let Some(height_mm) = height_mm {
+                            tower.height_mm = height_mm;
+                        }
+                        if let Some(thickness_mm) = thickness_mm {
+                            tower.thickness_mm = thickness_mm;
+                        }
+                        if let Some(batter_mm) = batter_mm {
+                            tower.batter_mm = batter_mm;
+                        }
+                        if let Some(plinth_height_mm) = plinth_height_mm {
+                            tower.plinth_height_mm = plinth_height_mm;
+                        }
+                        if let Some(plan) = plan {
+                            tower.plan = plan;
+                        }
+                        if let Some(orientation_deg) = orientation_deg {
+                            tower.orientation_deg = orientation_deg;
+                        }
+                    }
+                    Element::Gatehouse(gatehouse) => {
+                        if let Some(height_mm) = height_mm {
+                            gatehouse.height_mm = height_mm;
+                        }
+                        if let Some(orientation_deg) = orientation_deg {
+                            gatehouse.orientation_deg = orientation_deg;
+                        }
+                    }
+                    Element::Ditch(_) => {}
+                }
+                // Re-validate the resulting element against the same bounds a
+                // create command would enforce, including cross-field invariants
+                // such as tower thickness versus radius and plinth versus height,
+                // so a modify cannot smuggle in an invalid state.
+                validate_element(&updated)?;
+                document.insert(updated);
+                if let Some(index) = inverse
+                    .created_elements
+                    .iter()
+                    .position(|created| created.id() == id)
+                {
+                    inverse.created_elements[index] = previous;
+                } else if !inverse
+                    .deleted_elements
+                    .iter()
+                    .any(|deleted| deleted.id() == id)
+                {
+                    inverse.deleted_elements.push(previous);
+                }
+                touched.insert(id);
+                modified += 1;
+            }
             CommandOp::AddArrowLoop {
                 wall_id,
                 wall_ref,
@@ -915,7 +1315,15 @@ pub(crate) fn execute_batch(
 
     validate_element_budget(document.len(), document.opening_count())?;
     let touched_elements: Vec<ElementId> = touched.into_iter().collect();
-    let summary = batch_summary(created_walls, created_towers, created_openings, deleted);
+    let summary = batch_summary(
+        created_walls,
+        created_towers,
+        created_gatehouses,
+        created_ditches,
+        created_openings,
+        modified,
+        deleted,
+    );
 
     Ok(BatchApplication {
         document,
@@ -967,7 +1375,13 @@ fn delete_id(
                 .position(|created| created.id() == id)
             {
                 inverse.created_elements.remove(index);
-            } else {
+            } else if !inverse
+                .deleted_elements
+                .iter()
+                .any(|deleted| deleted.id() == id)
+            {
+                // A modify earlier in the batch already recorded the original
+                // element; keep that snapshot rather than the modified state.
                 inverse.deleted_elements.push(element);
             }
             removed_openings.extend(openings);
@@ -993,7 +1407,15 @@ fn delete_id(
     Ok(())
 }
 
-fn batch_summary(walls: usize, towers: usize, openings: usize, deleted: usize) -> String {
+fn batch_summary(
+    walls: usize,
+    towers: usize,
+    gatehouses: usize,
+    ditches: usize,
+    openings: usize,
+    modified: usize,
+    deleted: usize,
+) -> String {
     let mut parts = Vec::new();
     if walls > 0 {
         parts.push(format!("+{walls} wall{}", plural(walls)));
@@ -1001,8 +1423,17 @@ fn batch_summary(walls: usize, towers: usize, openings: usize, deleted: usize) -
     if towers > 0 {
         parts.push(format!("+{towers} tower{}", plural(towers)));
     }
+    if gatehouses > 0 {
+        parts.push(format!("+{gatehouses} gatehouse{}", plural(gatehouses)));
+    }
+    if ditches > 0 {
+        parts.push(format!("+{ditches} ditch{}", plural(ditches)));
+    }
     if openings > 0 {
         parts.push(format!("+{openings} arrow loop{}", plural(openings)));
+    }
+    if modified > 0 {
+        parts.push(format!("~{modified} element{}", plural(modified)));
     }
     if deleted > 0 {
         parts.push(format!("-{deleted} element{}", plural(deleted)));
@@ -1125,6 +1556,183 @@ mod tests {
             tall.validated(),
             Err(CommandError::DimensionOutOfRange {
                 field: "height_mm",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn gatehouse_ditch_and_modify_ops_validate_and_round_trip() {
+        let gatehouse = CommandOp::CreateGatehouse {
+            ref_id: Some("gate".into()),
+            name: "Great gate".into(),
+            centre_mm: [0, 0],
+            orientation_deg: Some(90),
+            passage_width_mm: None,
+            height_mm: None,
+            tower_radius_mm: None,
+        };
+        let value = serde_json::to_value(&gatehouse).unwrap();
+        assert_eq!(value["op"], "create_gatehouse");
+        let parsed: CommandOp = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.validated().unwrap(), gatehouse);
+
+        let mut tiny_gate = gatehouse.clone();
+        if let CommandOp::CreateGatehouse {
+            tower_radius_mm, ..
+        } = &mut tiny_gate
+        {
+            *tower_radius_mm = Some(10);
+        }
+        assert!(matches!(
+            tiny_gate.validated(),
+            Err(CommandError::DimensionOutOfRange {
+                field: "tower_radius_mm",
+                ..
+            })
+        ));
+
+        let ditch = CommandOp::CreateDitch {
+            ref_id: None,
+            name: "Ditch".into(),
+            start_mm: [0, 0],
+            end_mm: [20_000, 0],
+            width_mm: 4_000,
+            depth_mm: 2_000,
+        };
+        assert!(ditch.validated().is_ok());
+
+        let modify = CommandOp::ModifyElement {
+            id: 1,
+            height_mm: Some(10_000),
+            thickness_mm: Some(2_400),
+            batter_mm: Some(900),
+            plinth_height_mm: Some(900),
+            plan: Some(TowerPlan::DShaped),
+            orientation_deg: Some(180),
+        };
+        assert!(modify.validated().is_ok());
+        let mut bad_orientation = modify.clone();
+        if let CommandOp::ModifyElement {
+            orientation_deg, ..
+        } = &mut bad_orientation
+        {
+            *orientation_deg = Some(9_999);
+        }
+        assert!(matches!(
+            bad_orientation.validated(),
+            Err(CommandError::DimensionOutOfRange {
+                field: "orientation_deg",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn modify_element_rejects_foreign_fields_and_invalid_cross_field_state() {
+        use crate::document::{BatteredWall, Ditch, Gatehouse, RoundTower, TowerPlan};
+
+        let mut document = CastleDocument::new();
+        document.add_wall(BatteredWall::new(
+            1,
+            "Wall",
+            [0, 0],
+            [10_000, 0],
+            8_000,
+            2_400,
+        ));
+        let mut tower = RoundTower::new(2, "Slim tower", [20_000, 0], 1_000, 12_000);
+        tower.thickness_mm = 900;
+        document.add_tower(tower);
+        document.add_gatehouse(Gatehouse::new(3, "Gate", [40_000, 0], 0));
+        document.add_ditch(Ditch::new(
+            4,
+            "Ditch",
+            [60_000, -10_000],
+            [60_000, 10_000],
+            4_000,
+            2_000,
+        ));
+
+        let apply = |op: CommandOp| execute_batch(&document, 10, &[op]);
+
+        assert!(matches!(
+            apply(CommandOp::ModifyElement {
+                id: 1,
+                height_mm: None,
+                thickness_mm: None,
+                batter_mm: None,
+                plinth_height_mm: None,
+                plan: Some(TowerPlan::Square),
+                orientation_deg: None,
+            }),
+            Err(CommandError::InvalidField {
+                field: "plan",
+                kind: "wall"
+            })
+        ));
+
+        assert!(matches!(
+            apply(CommandOp::ModifyElement {
+                id: 4,
+                height_mm: Some(9_000),
+                thickness_mm: None,
+                batter_mm: None,
+                plinth_height_mm: None,
+                plan: None,
+                orientation_deg: None,
+            }),
+            Err(CommandError::InvalidField {
+                field: "height_mm",
+                kind: "ditch"
+            })
+        ));
+
+        assert!(matches!(
+            apply(CommandOp::ModifyElement {
+                id: 3,
+                height_mm: Some(1_000),
+                thickness_mm: None,
+                batter_mm: None,
+                plinth_height_mm: None,
+                plan: None,
+                orientation_deg: None,
+            }),
+            Err(CommandError::DimensionOutOfRange {
+                field: "height_mm",
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            apply(CommandOp::ModifyElement {
+                id: 2,
+                height_mm: None,
+                thickness_mm: Some(8_000),
+                batter_mm: None,
+                plinth_height_mm: None,
+                plan: None,
+                orientation_deg: None,
+            }),
+            Err(CommandError::DimensionOutOfRange {
+                field: "thickness_mm",
+                ..
+            })
+        ));
+
+        // A 4 m gatehouse cannot keep a 4.2 m passage plus 1 m of masonry.
+        assert!(matches!(
+            apply(CommandOp::ModifyElement {
+                id: 3,
+                height_mm: Some(4_000),
+                thickness_mm: None,
+                batter_mm: None,
+                plinth_height_mm: None,
+                plan: None,
+                orientation_deg: None,
+            }),
+            Err(CommandError::DimensionOutOfRange {
+                field: "passage_height_mm",
                 ..
             })
         ));

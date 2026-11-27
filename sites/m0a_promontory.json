@@ -1,0 +1,12 @@
+{
+  "id": "m0a_promontory",
+  "name": "River Promontory",
+  "description": "A broad rock plateau above a river, with a steep cliff falling to a low shelf.",
+  "latitude_deg": 52.9,
+  "landforms": [
+    "plateau",
+    "river cliff",
+    "river shelf",
+    "western approach"
+  ]
+}

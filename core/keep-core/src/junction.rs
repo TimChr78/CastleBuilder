@@ -40,8 +40,10 @@ pub const TOWER_BURY_MM: i64 = 40;
 /// Relative priority of an element kind. Higher wins.
 fn kind_priority(element: &Element) -> i32 {
     match element {
-        Element::RoundTower(_) => 2,
+        Element::RoundTower(_) => 3,
+        Element::Gatehouse(_) => 2,
         Element::BatteredWall(_) => 1,
+        Element::Ditch(_) => 0,
     }
 }
 
@@ -265,20 +267,40 @@ pub fn wall_course_intervals(
         if !element_outranks(element, 1, wall.id) {
             continue;
         }
-        let blocked = match element {
-            Element::RoundTower(tower) => blocked_by_tower(
-                wall, dir, right, d0_bot, d1_bot, d0_top, d1_top, run_start, run_end, y0, y1,
-                tower, terrain,
-            ),
-            Element::BatteredWall(other) => blocked_by_wall(
-                document, wall, dir, right, d0_bot, d1_bot, run_start, run_end, y0, y1, other,
-                terrain,
-            ),
-        };
-        if let Some((lo, hi)) = blocked {
-            if hi > lo {
-                allowed = subtract_interval(&allowed, lo, hi);
+        match element {
+            Element::RoundTower(tower) => {
+                if let Some((lo, hi)) = blocked_by_tower(
+                    wall, dir, right, d0_bot, d1_bot, d0_top, d1_top, run_start, run_end, y0, y1,
+                    tower, terrain,
+                ) {
+                    if hi > lo {
+                        allowed = subtract_interval(&allowed, lo, hi);
+                    }
+                }
             }
+            Element::Gatehouse(gatehouse) => {
+                for tower in gatehouse.flank_towers() {
+                    if let Some((lo, hi)) = blocked_by_tower(
+                        wall, dir, right, d0_bot, d1_bot, d0_top, d1_top, run_start, run_end, y0,
+                        y1, &tower, terrain,
+                    ) {
+                        if hi > lo {
+                            allowed = subtract_interval(&allowed, lo, hi);
+                        }
+                    }
+                }
+            }
+            Element::BatteredWall(other) => {
+                if let Some((lo, hi)) = blocked_by_wall(
+                    document, wall, dir, right, d0_bot, d1_bot, run_start, run_end, y0, y1, other,
+                    terrain,
+                ) {
+                    if hi > lo {
+                        allowed = subtract_interval(&allowed, lo, hi);
+                    }
+                }
+            }
+            Element::Ditch(_) => {}
         }
     }
     allowed
@@ -739,7 +761,30 @@ fn elements_form_junction(terrain: &SiteTerrain, a: &Element, b: &Element) -> bo
             let reach = i128::from(a.radius_mm) + i128::from(b.radius_mm);
             dx * dx + dz * dz <= reach * reach
         }
+        (Element::Gatehouse(gatehouse), Element::BatteredWall(wall))
+        | (Element::BatteredWall(wall), Element::Gatehouse(gatehouse)) => gatehouse
+            .flank_towers()
+            .iter()
+            .any(|tower| tower_and_wall_form_junction(terrain, tower, wall)),
+        (Element::Gatehouse(a), Element::Gatehouse(b)) => a.flank_towers().iter().any(|left| {
+            b.flank_towers()
+                .iter()
+                .any(|right| towers_touch(left, right))
+        }),
+        (Element::Gatehouse(gatehouse), Element::RoundTower(tower))
+        | (Element::RoundTower(tower), Element::Gatehouse(gatehouse)) => gatehouse
+            .flank_towers()
+            .iter()
+            .any(|flank| towers_touch(flank, tower)),
+        (Element::Ditch(_), _) | (_, Element::Ditch(_)) => false,
     }
+}
+
+fn towers_touch(a: &RoundTower, b: &RoundTower) -> bool {
+    let dx = a.centre_mm[0] as i128 - b.centre_mm[0] as i128;
+    let dz = a.centre_mm[1] as i128 - b.centre_mm[1] as i128;
+    let reach = i128::from(a.radius_mm) + i128::from(b.radius_mm);
+    dx * dx + dz * dz <= reach * reach
 }
 
 fn walls_form_junction(a: &BatteredWall, b: &BatteredWall) -> bool {

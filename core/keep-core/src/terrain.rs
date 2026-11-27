@@ -6,8 +6,9 @@
 //! every consumer (masonry, mesh AO, picking later) sees exactly the same
 //! ground, and so sampling is cheap enough to bake vertex AO at 200k blocks.
 
-use crate::document::CASTLE_SEED;
+use crate::document::{Ditch, CASTLE_SEED};
 use libm::{cos, floor, round, sin, sqrt};
+use serde::{Deserialize, Serialize};
 
 /// Default spacing of the cached height grid.
 pub const DEFAULT_CELL_MM: i64 = 1_000;
@@ -15,6 +16,29 @@ pub const DEFAULT_CELL_MM: i64 = 1_000;
 pub const DEFAULT_RESOLUTION: usize = 241;
 /// Default south-west origin of the height grid.
 pub const DEFAULT_ORIGIN_MM: i64 = -120_000;
+
+/// Curated site metadata is authored as data under `sites/` and compiled in.
+const M0A_PROMONTORY_SITE_JSON: &str = include_str!("../../../sites/m0a_promontory.json");
+const COASTAL_HEADLAND_SITE_JSON: &str = include_str!("../../../sites/coastal_headland.json");
+const LAKE_ISLAND_SITE_JSON: &str = include_str!("../../../sites/lake_island.json");
+
+/// Public description of one curated site.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SiteInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub latitude_deg: f64,
+    pub landforms: Vec<String>,
+}
+
+/// Which analytical site profile a terrain grid was built from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SiteKind {
+    Promontory,
+    CoastalHeadland,
+    LakeIsland,
+}
 
 /// Mesh data for the terrain heightfield, in metres and Godot-friendly arrays.
 #[derive(Clone, Debug, Default)]
@@ -44,6 +68,40 @@ impl SiteTerrain {
         Self::new(CASTLE_SEED)
     }
 
+    /// Build a curated site by id, or `None` for an unknown id.
+    pub fn for_site(site_id: &str) -> Option<Self> {
+        match site_id {
+            "m0a_promontory" => Some(Self::new(CASTLE_SEED)),
+            "coastal_headland" => Some(Self::with_grid_kind(
+                SiteKind::CoastalHeadland,
+                CASTLE_SEED ^ 0x00C0_057A_1DEA_D000,
+                DEFAULT_ORIGIN_MM,
+                DEFAULT_CELL_MM,
+                DEFAULT_RESOLUTION,
+            )),
+            "lake_island" => Some(Self::with_grid_kind(
+                SiteKind::LakeIsland,
+                CASTLE_SEED ^ 0x0000_1A4E_15A0_0000,
+                DEFAULT_ORIGIN_MM,
+                DEFAULT_CELL_MM,
+                DEFAULT_RESOLUTION,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Metadata for every curated site, in stable id order.
+    pub fn list_sites() -> Vec<SiteInfo> {
+        [
+            M0A_PROMONTORY_SITE_JSON,
+            COASTAL_HEADLAND_SITE_JSON,
+            LAKE_ISLAND_SITE_JSON,
+        ]
+        .into_iter()
+        .map(|json| serde_json::from_str(json).expect("curated site metadata must parse cleanly"))
+        .collect()
+    }
+
     /// Build a terrain grid for `seed` at the default extent.
     pub fn new(seed: u64) -> Self {
         Self::with_grid(seed, DEFAULT_ORIGIN_MM, DEFAULT_CELL_MM, DEFAULT_RESOLUTION)
@@ -51,6 +109,10 @@ impl SiteTerrain {
 
     /// Build a terrain grid with explicit dimensions (useful for tests).
     pub fn with_grid(seed: u64, origin_mm: i64, cell_mm: i64, res: usize) -> Self {
+        Self::with_grid_kind(SiteKind::Promontory, seed, origin_mm, cell_mm, res)
+    }
+
+    fn with_grid_kind(kind: SiteKind, seed: u64, origin_mm: i64, cell_mm: i64, res: usize) -> Self {
         assert!(
             res >= 2,
             "terrain grid must have at least two samples per axis"
@@ -62,7 +124,7 @@ impl SiteTerrain {
             let z = origin_mm + iz as i64 * cell_mm;
             for ix in 0..res {
                 let x = origin_mm + ix as i64 * cell_mm;
-                let (height, rock) = analytic_sample(seed, x, z);
+                let (height, rock) = analytic_sample(kind, seed, x, z);
                 heights_mm.push(height);
                 bedrock.push(rock);
             }
@@ -152,6 +214,37 @@ impl SiteTerrain {
         }
     }
 
+    /// Return a copy of this terrain with the given ditches carved into it.
+    ///
+    /// Each ditch lowers the ground along its centreline with a trapezoidal
+    /// profile (a flat bottom, then sloping sides) and turns the carved cells
+    /// to soil, so freshly cut earth reads differently from bedrock. The
+    /// original terrain is never mutated, which makes ditches trivially
+    /// reversible when the document undoes the earthwork.
+    pub fn with_ditches(&self, ditches: &[&Ditch]) -> SiteTerrain {
+        if ditches.is_empty() {
+            return self.clone();
+        }
+        let mut carved = self.clone();
+        for iz in 0..self.res {
+            let z_mm = self.origin_mm + iz as i64 * self.cell_mm;
+            for ix in 0..self.res {
+                let x_mm = self.origin_mm + ix as i64 * self.cell_mm;
+                let mut cut = 0i64;
+                for ditch in ditches {
+                    cut = cut.max(ditch_cut_mm(ditch, x_mm, z_mm));
+                }
+                if cut > 0 {
+                    let index = iz * self.res + ix;
+                    carved.heights_mm[index] -= cut;
+                    // A ditch exposes soil and scree, not the bedrock face.
+                    carved.bedrock[index] = 0;
+                }
+            }
+        }
+        carved
+    }
+
     /// Build a regular-grid heightfield mesh. One shared vertex per grid point
     /// keeps the 240 m site at a modest triangle count.
     pub fn terrain_mesh(&self) -> TerrainMeshData {
@@ -213,8 +306,18 @@ impl Default for SiteTerrain {
     }
 }
 
-/// Analytical promontory height sample in millimetres, plus bedrock mask.
-fn analytic_sample(seed: u64, x_mm: i64, z_mm: i64) -> (i64, u8) {
+/// Analytical terrain sample in millimetres, plus bedrock mask.
+fn analytic_sample(kind: SiteKind, seed: u64, x_mm: i64, z_mm: i64) -> (i64, u8) {
+    match kind {
+        SiteKind::Promontory => promontory_sample(seed, x_mm, z_mm),
+        SiteKind::CoastalHeadland => coastal_headland_sample(seed, x_mm, z_mm),
+        SiteKind::LakeIsland => lake_island_sample(seed, x_mm, z_mm),
+    }
+}
+
+/// The original M0a promontory, byte-for-byte unchanged so existing layout and
+/// terrain hash tests keep passing.
+fn promontory_sample(seed: u64, x_mm: i64, z_mm: i64) -> (i64, u8) {
     let x = x_mm as f64 / 1000.0;
     let z = z_mm as f64 / 1000.0;
     let phase = (seed % 9973) as f64 * 0.000_731;
@@ -233,6 +336,87 @@ fn analytic_sample(seed: u64, x_mm: i64, z_mm: i64) -> (i64, u8) {
 
     let bedrock = if s < 0.62 { 255u8 } else { 0u8 };
     (round(h) as i64, bedrock)
+}
+
+/// A steep coastal headland: a broad upper shelf with sharp cliffs on the east
+/// and south sides and a gentler landward approach to the west and north.
+fn coastal_headland_sample(seed: u64, x_mm: i64, z_mm: i64) -> (i64, u8) {
+    let x = x_mm as f64 / 1000.0;
+    let z = z_mm as f64 / 1000.0;
+    let phase = (seed % 7919) as f64 * 0.000_433;
+    let phase2 = (seed % 6151) as f64 * 0.000_271;
+
+    let east = smoothstep((x - 34.0) / 22.0);
+    let south = smoothstep((-z - 30.0) / 24.0);
+    let cliff = east.max(south);
+    let shelf = 17_500.0 - 31_000.0 * cliff;
+    let undulation = 180.0 * sin(x * 0.18 + phase) * cos(z * 0.15 - phase2) * (1.0 - cliff);
+    let cliff_detail = 520.0 * sin(x * 0.47 - z * 0.39 + phase2) * cliff * (1.0 - cliff);
+    let sea_shelf = -2_500.0 * cliff * cliff;
+    let h = shelf + undulation + cliff_detail + sea_shelf;
+
+    let bedrock = if cliff < 0.35 { 255u8 } else { 0u8 };
+    (round(h) as i64, bedrock)
+}
+
+/// A low limestone island plateau surrounded by a flat shallow lake basin.
+fn lake_island_sample(seed: u64, x_mm: i64, z_mm: i64) -> (i64, u8) {
+    let x = x_mm as f64 / 1000.0;
+    let z = z_mm as f64 / 1000.0;
+    let phase = (seed % 6007) as f64 * 0.000_577;
+    let phase2 = (seed % 5003) as f64 * 0.000_811;
+
+    let r = sqrt(x * x + z * z);
+    let shore = smoothstep((r - 26.0) / 26.0);
+    let plateau = 4_200.0 - 7_600.0 * shore;
+    let undulation = 120.0 * sin(x * 0.26 + phase) * cos(z * 0.22 - phase2) * (1.0 - shore);
+    let lake_ripple = 45.0 * sin(x * 0.9 + z * 0.7 + phase) * shore;
+    let h = plateau + undulation + lake_ripple;
+
+    // The limestone island is rock; the shallow lake bed is soft sediment.
+    let bedrock = if shore < 0.55 { 255u8 } else { 40u8 };
+    (round(h) as i64, bedrock)
+}
+
+fn smoothstep(value: f64) -> f64 {
+    let t = value.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// How far the ditch lowers the ground at a plan point, in millimetres.
+fn ditch_cut_mm(ditch: &Ditch, x_mm: i64, z_mm: i64) -> i64 {
+    let ax = ditch.start_mm[0] as f64;
+    let az = ditch.start_mm[1] as f64;
+    let bx = ditch.end_mm[0] as f64;
+    let bz = ditch.end_mm[1] as f64;
+    let px = x_mm as f64;
+    let pz = z_mm as f64;
+    let abx = bx - ax;
+    let abz = bz - az;
+    let denom = abx * abx + abz * abz;
+    let t = if denom <= f64::EPSILON {
+        0.0
+    } else {
+        (((px - ax) * abx + (pz - az) * abz) / denom).clamp(0.0, 1.0)
+    };
+    let dx = ax + abx * t - px;
+    let dz = az + abz * t - pz;
+    let distance = sqrt(dx * dx + dz * dz);
+
+    let half = ditch.width_mm.max(1) as f64 * 0.5;
+    if distance >= half {
+        return 0;
+    }
+    // Trapezoidal profile: a flat floor over the inner quarter, then a
+    // straight scree slope out to the original ground.
+    let flat = (half * 0.25).max(1.0);
+    let depth = ditch.depth_mm.max(0) as f64;
+    let cut = if distance <= flat {
+        depth
+    } else {
+        depth * (half - distance) / (half - flat)
+    };
+    round(cut.max(0.0)) as i64
 }
 
 #[cfg(test)]
@@ -279,5 +463,65 @@ mod tests {
         for index in mesh.indices {
             assert!(index >= 0 && (index as usize) < mesh.positions.len());
         }
+    }
+
+    #[test]
+    fn all_three_curated_sites_are_deterministic_and_finite() {
+        let sites = SiteTerrain::list_sites();
+        assert_eq!(sites.len(), 3);
+        let ids: Vec<&str> = sites.iter().map(|site| site.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["m0a_promontory", "coastal_headland", "lake_island"]
+        );
+        for info in &sites {
+            assert!(!info.name.is_empty());
+            assert!(!info.description.is_empty());
+            assert!(info.latitude_deg.is_finite());
+            assert!(!info.landforms.is_empty());
+            let a = SiteTerrain::for_site(&info.id).expect("known site");
+            let b = SiteTerrain::for_site(&info.id).expect("known site");
+            assert_eq!(a.heights_mm, b.heights_mm);
+            assert_eq!(a.bedrock, b.bedrock);
+            let mesh = a.terrain_mesh();
+            for position in &mesh.positions {
+                assert!(
+                    position[0].is_finite() && position[1].is_finite() && position[2].is_finite()
+                );
+            }
+        }
+        assert!(SiteTerrain::for_site("not_a_site").is_none());
+    }
+
+    #[test]
+    fn coastal_headland_drops_on_two_sides_and_lake_is_flat() {
+        let headland = SiteTerrain::for_site("coastal_headland").unwrap();
+        let shelf = headland.height_mm(0, 0);
+        assert!(headland.height_mm(90_000, 0) < shelf - 10_000);
+        assert!(headland.height_mm(0, -90_000) < shelf - 10_000);
+        assert!(headland.height_mm(-60_000, 60_000) > shelf - 4_000);
+
+        let lake = SiteTerrain::for_site("lake_island").unwrap();
+        let island = lake.height_mm(0, 0);
+        let basin = lake.height_mm(80_000, 0);
+        assert!(island > basin + 4_000);
+        assert!((lake.height_mm(80_000, 0) - lake.height_mm(75_000, 20_000)).abs() < 1_500);
+    }
+
+    #[test]
+    fn ditches_lower_the_ground_and_leave_the_original_terrain_untouched() {
+        let terrain = SiteTerrain::m0a_promontory();
+        let before = terrain.height_mm(0, 5_000);
+        let ditch = Ditch::new(1, "Test ditch", [0, 0], [0, 10_000], 4_000, 2_000);
+        let carved = terrain.with_ditches(&[&ditch]);
+        assert_eq!(terrain.height_mm(0, 5_000), before);
+        let after = carved.height_mm(0, 5_000);
+        assert_eq!(after, before - 2_000);
+        assert_eq!(
+            carved.height_mm(20_000, 5_000),
+            terrain.height_mm(20_000, 5_000)
+        );
+        assert!(!carved.bedrock_mask(0, 5_000));
+        assert_eq!(carved.with_ditches(&[]).heights_mm, carved.heights_mm);
     }
 }

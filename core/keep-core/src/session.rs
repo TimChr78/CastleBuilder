@@ -795,4 +795,98 @@ mod tests {
         session.undo_last(&player()).unwrap();
         assert_eq!(session.document().document_hash(), before);
     }
+
+    #[test]
+    fn modify_element_changes_and_undoes_wall_and_tower_plan() {
+        let mut session = Session::new_empty();
+        session
+            .apply_batch(player(), vec![wall("North", [0, 0], [10_000, 0])])
+            .unwrap();
+        session
+            .apply_batch(player(), vec![tower("Drum", [20_000, 0])])
+            .unwrap();
+        let before_hash = session.document().document_hash();
+        let before_layout = session.build_scene().layout_hash;
+
+        session
+            .apply_batch(
+                player(),
+                vec![
+                    CommandOp::ModifyElement {
+                        id: 1,
+                        height_mm: Some(11_000),
+                        thickness_mm: Some(3_200),
+                        batter_mm: Some(1_100),
+                        plinth_height_mm: Some(1_000),
+                        plan: None,
+                        orientation_deg: None,
+                    },
+                    CommandOp::ModifyElement {
+                        id: 2,
+                        height_mm: Some(16_000),
+                        thickness_mm: Some(1_500),
+                        batter_mm: None,
+                        plinth_height_mm: None,
+                        plan: Some(crate::document::TowerPlan::Square),
+                        orientation_deg: Some(45),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let Some(Element::BatteredWall(wall)) = session.document().get(1) else {
+            panic!("wall missing");
+        };
+        assert_eq!(wall.height_mm, 11_000);
+        assert_eq!(wall.thickness_mm, 3_200);
+        let Some(Element::RoundTower(tower)) = session.document().get(2) else {
+            panic!("tower missing");
+        };
+        assert_eq!(tower.plan, crate::document::TowerPlan::Square);
+        assert_eq!(tower.orientation_deg, 45);
+        assert_ne!(session.build_scene().layout_hash, before_layout);
+
+        session.undo_last(&player()).unwrap();
+        assert_eq!(session.document().document_hash(), before_hash);
+        assert_eq!(session.build_scene().layout_hash, before_layout);
+        let Some(Element::RoundTower(tower)) = session.document().get(2) else {
+            panic!("tower missing");
+        };
+        assert_eq!(tower.plan, crate::document::TowerPlan::Round);
+    }
+
+    #[test]
+    fn ditch_lowers_the_built_terrain_and_undo_restores_it() {
+        let mut session = Session::new_empty();
+        let before = session.build_scene();
+        let ground = session.terrain().height_mm(0, 0);
+        session
+            .apply_batch(
+                player(),
+                vec![CommandOp::CreateDitch {
+                    ref_id: Some("approach".into()),
+                    name: "Approach ditch".into(),
+                    start_mm: [0, -8_000],
+                    end_mm: [0, 8_000],
+                    width_mm: 4_000,
+                    depth_mm: 2_000,
+                }],
+            )
+            .unwrap();
+        let carved = session.build_scene();
+        assert!(carved.terrain_mesh.positions.iter().any(|position| {
+            position[0].abs() < 0.01
+                && position[2].abs() < 0.01
+                && (position[1] - (ground - 2_000) as f32 / 1000.0).abs() < 0.2
+        }));
+
+        session.undo_last(&player()).unwrap();
+        let restored = session.build_scene();
+        assert_eq!(restored.layout_hash, before.layout_hash);
+        assert_eq!(
+            restored.terrain_mesh.positions,
+            before.terrain_mesh.positions
+        );
+        assert!(session.document().ditches().next().is_none());
+    }
 }

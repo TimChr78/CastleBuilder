@@ -1,0 +1,12 @@
+{
+  "id": "lake_island",
+  "name": "Lake Island",
+  "description": "A low limestone island plateau surrounded by a flat shallow lake and moat basin.",
+  "latitude_deg": 52.6,
+  "landforms": [
+    "limestone plateau",
+    "lake shore",
+    "shallow lake basin",
+    "causeway approach"
+  ]
+}

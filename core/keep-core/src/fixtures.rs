@@ -9,7 +9,9 @@
 //!   kill criterion. It produces just over 200k blocks, with realistic 24–28 m
 //!   curtain walls and 24–28 m drum towers.
 
-use crate::document::{BatteredWall, CastleDocument, Opening, RoundTower};
+use crate::document::{
+    BatteredWall, CastleDocument, Ditch, Gatehouse, Opening, RoundTower, TowerPlan,
+};
 use crate::mesh::{build_scene, SceneData};
 use crate::terrain::SiteTerrain;
 
@@ -179,9 +181,93 @@ pub fn stress_200k() -> SceneData {
     build_scene(&document, &terrain)
 }
 
+/// The document behind the M1 Edwardian showcase on the coastal headland.
+///
+/// It exercises every new M1 element: a twin-tower gatehouse, battered curtain
+/// walls with arrow loops, one round, one square and one D-shaped tower, and a
+/// defensive ditch across the landward approach.
+pub fn m1_edwardian_document() -> CastleDocument {
+    let mut doc = CastleDocument::new();
+
+    let mut gatehouse = Gatehouse::new(1, "Great gatehouse", [0, 0], 0);
+    gatehouse.passage_width_mm = 3_200;
+    gatehouse.passage_height_mm = 4_200;
+    gatehouse.depth_mm = 8_000;
+    gatehouse.height_mm = 14_000;
+    gatehouse.tower_radius_mm = 3_400;
+    doc.add_gatehouse(gatehouse);
+
+    // Landward curtains run west from the two flanking gatehouse towers.
+    for (id, name, z) in [
+        (2u64, "North curtain", -5_100i64),
+        (3, "South curtain", 5_100),
+    ] {
+        let mut wall = BatteredWall::new(id, name, [-32_000, z], [0, z], 9_000, 2_400);
+        wall.batter_mm = 900;
+        wall.plinth_height_mm = 900;
+        wall.plinth_projection_mm = 300;
+        wall.course_height_mm = 450;
+        doc.add_wall(wall);
+    }
+
+    let mut round = RoundTower::new(4, "West drum", [-32_000, -5_100], 3_600, 13_000);
+    round.thickness_mm = 1_300;
+    round.batter_mm = 600;
+    round.plinth_height_mm = 1_000;
+    doc.add_tower(round);
+
+    let mut square = RoundTower::new(5, "Square tower", [-32_000, 5_100], 3_400, 13_000);
+    square.thickness_mm = 1_300;
+    square.batter_mm = 600;
+    square.plinth_height_mm = 1_000;
+    square.plan = TowerPlan::Square;
+    square.orientation_deg = 0;
+    doc.add_tower(square);
+
+    let mut dshaped = RoundTower::new(6, "D-shaped tower", [-16_000, 16_000], 3_600, 13_000);
+    dshaped.thickness_mm = 1_300;
+    dshaped.batter_mm = 600;
+    dshaped.plinth_height_mm = 1_000;
+    dshaped.plan = TowerPlan::DShaped;
+    dshaped.orientation_deg = 180;
+    doc.add_tower(dshaped);
+
+    // A defensive ditch across the landward approach.
+    doc.add_ditch(Ditch::new(
+        7,
+        "Approach ditch",
+        [-46_000, -20_000],
+        [-46_000, 20_000],
+        6_000,
+        2_600,
+    ));
+
+    for (id, name, wall_id, t) in [
+        (10u64, "North loop west", 2u64, 300i64),
+        (11, "North loop east", 2, 620),
+        (12, "South loop", 3, 480),
+    ] {
+        let mut opening = Opening::arrow_loop(id, wall_id, name, t, 1_800);
+        opening.splay_depth_mm = 2_400;
+        doc.add_opening(opening);
+    }
+
+    doc
+}
+
+/// Build the M1 Edwardian showcase scene on the coastal headland.
+pub fn m1_edwardian_showcase() -> SceneData {
+    let terrain =
+        SiteTerrain::for_site("coastal_headland").expect("coastal_headland is a curated site");
+    let document = m1_edwardian_document();
+    build_scene(&document, &terrain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::style::StylePack;
+    use crate::validate::validate_structure;
 
     #[test]
     fn showcase_is_deterministic() {
@@ -267,5 +353,36 @@ mod tests {
                 assert_eq!(lod.indices.len() % 3, 0);
             }
         }
+    }
+
+    #[test]
+    fn m1_edwardian_showcase_validates_and_builds() {
+        let document = m1_edwardian_document();
+        let terrain = SiteTerrain::for_site("coastal_headland").unwrap();
+        let style = StylePack::edwardian_welsh();
+        let report = validate_structure(&document, &terrain, &style);
+        assert!(
+            report.passed,
+            "M1 showcase must pass: {:?}",
+            report.findings
+        );
+        assert_eq!(report.score, 100, "findings: {:?}", report.findings);
+
+        assert_eq!(document.gatehouses().count(), 1);
+        assert_eq!(document.ditches().count(), 1);
+        assert_eq!(document.opening_count(), 3);
+
+        let scene = m1_edwardian_showcase();
+        assert!(
+            scene.block_count > 3_000,
+            "scene had {} blocks",
+            scene.block_count
+        );
+        assert!(!scene.chunks.is_empty());
+        assert!(!scene.terrain_mesh.positions.is_empty());
+
+        let other = m1_edwardian_showcase();
+        assert_eq!(scene.layout_hash, other.layout_hash);
+        assert_eq!(scene.block_count, other.block_count);
     }
 }

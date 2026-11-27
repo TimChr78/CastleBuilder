@@ -10,14 +10,17 @@
 //! `keep-mcp` binary is a small stdin/stdout loop around it.
 
 use keep_core::command::AuthorId;
-use keep_core::document::{CastleDocument, Element};
+use keep_core::document::{CastleDocument, Element, TowerPlan};
 use keep_core::plan_render::{render_plan_svg, PlanView};
 use keep_core::session::Session;
+use keep_core::style::StylePack;
 use keep_core::terrain::SiteTerrain;
+use keep_core::validate::validate_structure;
 use keep_proto::{
-    ApplyOperationsRequest, ApplyOperationsResponse, ElementListResponse, ElementSummary,
-    GetCastleResponse, GetHistoryResponse, HistoryEntry, OpeningSummary, RenderPlanRequest,
-    RenderPlanResponse, UndoResponse,
+    ApplyOperationsRequest, ApplyOperationsResponse, AssessmentResponse, ElementListResponse,
+    ElementSummary, GetCastleResponse, GetHistoryResponse, GetSiteResponse, GetStyleResponse,
+    HistoryEntry, ListStylesResponse, OpeningSummary, RenderPlanRequest, RenderPlanResponse,
+    UndoResponse,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -62,14 +65,29 @@ impl McpServer {
         } else {
             keep_core::fixtures::m0b_showcase_document()
         };
+        Self::from_document(
+            keep_core::session::DEFAULT_SITE_ID,
+            SiteTerrain::m0a_promontory(),
+            document,
+        )
+    }
+
+    /// Create a server around an explicit site terrain and document.
+    pub fn from_document(
+        site_id: impl Into<String>,
+        terrain: SiteTerrain,
+        document: CastleDocument,
+    ) -> Self {
         Self {
-            session: Session::from_document(
-                keep_core::session::DEFAULT_SITE_ID,
-                SiteTerrain::m0a_promontory(),
-                document,
-            ),
+            session: Session::from_document(site_id, terrain, document),
             author: AuthorId::agent(OFFLINE_AUTHOR_ID).expect("offline author id is valid"),
         }
+    }
+
+    /// Create a server on a curated site, or `None` when the site id is unknown.
+    pub fn with_start(site_id: &str, document: CastleDocument) -> Option<Self> {
+        SiteTerrain::for_site(site_id)
+            .map(|terrain| Self::from_document(site_id, terrain, document))
     }
 
     /// Current castle document (tests and embedders).
@@ -170,6 +188,12 @@ impl McpServer {
                 .map(|value| tool_result(&value)),
             "undo" => self.tool_undo().map(|value| tool_result(&value)),
             "get_history" => self.tool_get_history().map(|value| tool_result(&value)),
+            "get_assessment" => self.tool_get_assessment().map(|value| tool_result(&value)),
+            "list_styles" => self.tool_list_styles().map(|value| tool_result(&value)),
+            "get_style" => self
+                .tool_get_style(arguments)
+                .map(|value| tool_result(&value)),
+            "get_site" => self.tool_get_site().map(|value| tool_result(&value)),
             other => {
                 return error_response(id, code::INVALID_PARAMS, format!("unknown tool: {other}"))
             }
@@ -304,6 +328,45 @@ impl McpServer {
         })
     }
 
+    /// Assess the castle against the Edwardian Welsh rules and cite the style.
+    fn tool_get_assessment(&self) -> Result<AssessmentResponse, String> {
+        let style = StylePack::edwardian_welsh();
+        let report = validate_structure(self.session.document(), self.session.terrain(), &style);
+        Ok(AssessmentResponse::new(style.id.clone(), report))
+    }
+
+    /// Every curated style pack, in stable id order.
+    fn tool_list_styles(&self) -> Result<ListStylesResponse, String> {
+        Ok(ListStylesResponse {
+            styles: StylePack::list(),
+        })
+    }
+
+    /// One style pack by id.
+    fn tool_get_style(&self, arguments: Value) -> Result<GetStyleResponse, String> {
+        let id = arguments
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "invalid arguments: missing string field 'id'".to_string())?;
+        let style = StylePack::find(id)
+            .ok_or_else(|| format!("unknown style id '{}'", truncate_message_field(id, 64)))?;
+        Ok(GetStyleResponse { style })
+    }
+
+    /// The active curated site plus the full site catalogue.
+    fn tool_get_site(&self) -> Result<GetSiteResponse, String> {
+        let available_sites = SiteTerrain::list_sites();
+        let site = available_sites
+            .iter()
+            .find(|site| site.id == self.session.site_id())
+            .cloned()
+            .ok_or_else(|| format!("unknown active site '{}'", self.session.site_id()))?;
+        Ok(GetSiteResponse {
+            site,
+            available_sites,
+        })
+    }
+
     fn handle_resource_read(&self, params: &Value) -> Result<Value, (i64, String)> {
         let Some(uri) = params.get("uri").and_then(Value::as_str) else {
             return Err((code::INVALID_PARAMS, "missing resource uri".into()));
@@ -326,6 +389,20 @@ impl McpServer {
             }
             "keep://castle/plan/top" => Ok(self.resource_svg(uri, PlanView::TopPlan)),
             "keep://castle/plan/elevation" => Ok(self.resource_svg(uri, PlanView::ElevationNorth)),
+            "keep://castle/assessment" => {
+                let assessment = self
+                    .tool_get_assessment()
+                    .map_err(|message| (code::INTERNAL_ERROR, message))?;
+                let text = serde_json::to_string_pretty(&assessment)
+                    .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?;
+                Ok(resource_contents(uri, "application/json", text))
+            }
+            "keep://styles/edwardian_welsh" => {
+                let style = StylePack::edwardian_welsh();
+                let text = serde_json::to_string_pretty(&style)
+                    .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?;
+                Ok(resource_contents(uri, "application/json", text))
+            }
             other => Err((
                 code::RESOURCE_NOT_FOUND,
                 format!("unknown resource: {other}"),
@@ -347,7 +424,7 @@ fn initialize_result() -> Value {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Offline Keepwright castle sidecar. Use get_castle, list_elements, render_plan, apply_operations, undo and get_history."
+        "instructions": "Offline Keepwright castle sidecar. Use get_castle, list_elements, render_plan, apply_operations, undo and get_history, plus get_assessment, list_styles, get_style and get_site for structural and style reads."
     })
 }
 
@@ -377,6 +454,18 @@ fn resources_list() -> Value {
                 "name": "North elevation",
                 "description": "Deterministic SVG north elevation with the terrain profile.",
                 "mimeType": "image/svg+xml"
+            },
+            {
+                "uri": "keep://castle/assessment",
+                "name": "Structural assessment",
+                "description": "Edwardian Welsh structural findings with severity, source notes and suggested fixes.",
+                "mimeType": "application/json"
+            },
+            {
+                "uri": "keep://styles/edwardian_welsh",
+                "name": "Edwardian Welsh style pack",
+                "description": "Curated dimension, slenderness, batter, plinth and flanking rules with source notes.",
+                "mimeType": "application/json"
             }
         ]
     })
@@ -423,6 +512,16 @@ fn hex_hash(hash: u64) -> String {
     format!("{hash:016x}")
 }
 
+/// Clamp untrusted input before echoing it back in an error message: control
+/// characters become spaces and the result is limited to `max_chars`.
+fn truncate_message_field(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(max_chars)
+        .collect()
+}
+
 fn element_summaries(document: &CastleDocument) -> Vec<ElementSummary> {
     document
         .elements()
@@ -438,6 +537,11 @@ fn element_summaries(document: &CastleDocument) -> Vec<ElementSummary> {
                 centre_mm: None,
                 radius_mm: None,
                 length_mm: Some(wall.length_mm()),
+                plan: None,
+                orientation_deg: None,
+                passage_width_mm: None,
+                passage_height_mm: None,
+                depth_mm: None,
             },
             Element::RoundTower(tower) => ElementSummary {
                 id: tower.id,
@@ -450,6 +554,52 @@ fn element_summaries(document: &CastleDocument) -> Vec<ElementSummary> {
                 centre_mm: Some(tower.centre_mm),
                 radius_mm: Some(tower.radius_mm),
                 length_mm: None,
+                plan: Some(
+                    match tower.plan {
+                        TowerPlan::Round => "round",
+                        TowerPlan::Square => "square",
+                        TowerPlan::DShaped => "d_shaped",
+                    }
+                    .to_string(),
+                ),
+                orientation_deg: Some(tower.orientation_deg),
+                passage_width_mm: None,
+                passage_height_mm: None,
+                depth_mm: None,
+            },
+            Element::Gatehouse(gatehouse) => ElementSummary {
+                id: gatehouse.id,
+                kind: "gatehouse".to_string(),
+                name: gatehouse.name.clone(),
+                height_mm: gatehouse.height_mm,
+                thickness_mm: gatehouse.depth_mm,
+                start_mm: None,
+                end_mm: None,
+                centre_mm: Some(gatehouse.centre_mm),
+                radius_mm: Some(gatehouse.tower_radius_mm),
+                length_mm: None,
+                plan: None,
+                orientation_deg: Some(gatehouse.orientation_deg),
+                passage_width_mm: Some(gatehouse.passage_width_mm),
+                passage_height_mm: Some(gatehouse.passage_height_mm),
+                depth_mm: Some(gatehouse.depth_mm),
+            },
+            Element::Ditch(ditch) => ElementSummary {
+                id: ditch.id,
+                kind: "ditch".to_string(),
+                name: ditch.name.clone(),
+                height_mm: 0,
+                thickness_mm: ditch.width_mm,
+                start_mm: Some(ditch.start_mm),
+                end_mm: Some(ditch.end_mm),
+                centre_mm: None,
+                radius_mm: None,
+                length_mm: Some(ditch.length_mm()),
+                plan: None,
+                orientation_deg: None,
+                passage_width_mm: None,
+                passage_height_mm: None,
+                depth_mm: Some(ditch.depth_mm),
             },
         })
         .collect()
@@ -479,6 +629,14 @@ mod tests {
 
     fn server() -> McpServer {
         McpServer::new(false)
+    }
+
+    fn m1_server() -> McpServer {
+        McpServer::with_start(
+            "coastal_headland",
+            keep_core::fixtures::m1_edwardian_document(),
+        )
+        .expect("coastal_headland is a curated site")
     }
 
     fn call(server: &mut McpServer, id: u64, method: &str, params: Value) -> Value {
@@ -607,11 +765,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_six_tools_with_schemas() {
+    fn tools_list_exposes_ten_tools_with_schemas() {
         let mut server = server();
         let response = call(&mut server, 4, "tools/list", json!({}));
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 10);
         for tool in tools {
             assert!(tool["inputSchema"].is_object());
             assert!(tool["outputSchema"].is_object());
@@ -626,7 +784,11 @@ mod tests {
                 "render_plan",
                 "apply_operations",
                 "undo",
-                "get_history"
+                "get_history",
+                "get_assessment",
+                "list_styles",
+                "get_style",
+                "get_site"
             ]
         );
     }
@@ -657,6 +819,64 @@ mod tests {
         assert_eq!(list["element_count"], castle["element_count"]);
         assert_eq!(list["elements"], castle["elements"]);
         assert_eq!(list["openings"], castle["openings"]);
+    }
+
+    #[test]
+    fn m1_element_summaries_match_the_output_schema() {
+        let mut server = m1_server();
+        let allowed = ["wall", "tower", "gatehouse", "ditch"];
+        for tool in ["get_castle", "list_elements"] {
+            let summary = structured(&mut server, tool, json!({}));
+            let elements = summary["elements"].as_array().unwrap();
+            assert!(!elements.is_empty(), "{tool} returned no elements");
+            for element in elements {
+                let kind = element["kind"].as_str().unwrap();
+                assert!(allowed.contains(&kind), "unexpected kind {kind} in {tool}");
+            }
+        }
+
+        let castle = structured(&mut server, "get_castle", json!({}));
+        let elements = castle["elements"].as_array().unwrap();
+
+        let towers: Vec<_> = elements.iter().filter(|e| e["kind"] == "tower").collect();
+        assert_eq!(towers.len(), 3);
+        for tower in &towers {
+            assert!(tower["plan"].is_string(), "tower missing plan: {tower}");
+            assert!(
+                tower["orientation_deg"].is_i64(),
+                "tower missing orientation: {tower}"
+            );
+        }
+        let square = towers
+            .iter()
+            .find(|tower| tower["name"] == "Square tower")
+            .unwrap();
+        assert_eq!(square["plan"], "square");
+        let d_shaped = towers
+            .iter()
+            .find(|tower| tower["name"] == "D-shaped tower")
+            .unwrap();
+        assert_eq!(d_shaped["plan"], "d_shaped");
+        assert_eq!(d_shaped["orientation_deg"], 180);
+
+        let gatehouse = elements
+            .iter()
+            .find(|element| element["kind"] == "gatehouse")
+            .unwrap();
+        assert_eq!(gatehouse["passage_width_mm"], 3_200);
+        assert_eq!(gatehouse["passage_height_mm"], 4_200);
+        assert_eq!(gatehouse["depth_mm"], 8_000);
+        assert_ne!(
+            gatehouse["thickness_mm"], 3_200,
+            "gatehouse passage width must not overload thickness_mm"
+        );
+
+        let ditch = elements
+            .iter()
+            .find(|element| element["kind"] == "ditch")
+            .unwrap();
+        assert_eq!(ditch["depth_mm"], 2_600);
+        assert_eq!(ditch["thickness_mm"], 6_000);
     }
 
     #[test]
@@ -1245,11 +1465,14 @@ mod tests {
         let mut server = server();
         let response = call(&mut server, 5, "resources/list", json!({}));
         let resources = response["result"]["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 4);
+        assert_eq!(resources.len(), 6);
         assert_eq!(resources[0]["uri"], "keep://castle/document");
         assert_eq!(resources[1]["uri"], "keep://castle/save");
         assert_eq!(resources[1]["mimeType"], "application/json");
         assert_eq!(resources[2]["mimeType"], "image/svg+xml");
+        assert_eq!(resources[4]["uri"], "keep://castle/assessment");
+        assert_eq!(resources[5]["uri"], "keep://styles/edwardian_welsh");
+        assert_eq!(resources[4]["mimeType"], "application/json");
 
         let document = call(
             &mut server,
@@ -1268,6 +1491,29 @@ mod tests {
             assert_eq!(contents["mimeType"], "image/svg+xml");
             assert!(contents["text"].as_str().unwrap().starts_with("<svg "));
         }
+
+        let assessment = call(
+            &mut server,
+            9,
+            "resources/read",
+            json!({ "uri": "keep://castle/assessment" }),
+        );
+        let contents = &assessment["result"]["contents"][0];
+        assert_eq!(contents["mimeType"], "application/json");
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["style_id"], "edwardian_welsh");
+        assert!(parsed["passed"].is_boolean());
+
+        let style = call(
+            &mut server,
+            10,
+            "resources/read",
+            json!({ "uri": "keep://styles/edwardian_welsh" }),
+        );
+        let contents = &style["result"]["contents"][0];
+        assert_eq!(contents["mimeType"], "application/json");
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["id"], "edwardian_welsh");
     }
 
     #[test]
@@ -1277,7 +1523,7 @@ mod tests {
             &mut server,
             8,
             "resources/read",
-            json!({ "uri": "keep://castle/assessment" }),
+            json!({ "uri": "keep://castle/not-a-resource" }),
         );
         assert_eq!(response["error"]["code"], code::RESOURCE_NOT_FOUND);
     }
@@ -1381,6 +1627,189 @@ mod tests {
         let history = structured(&mut server, "get_history", json!({}));
         assert_eq!(history["count"], 0);
         assert_eq!(history["entries"], json!([]));
+    }
+
+    #[test]
+    fn get_assessment_flags_slenderness_and_a_suggested_fix_repairs_it() {
+        let mut server = McpServer::new(true);
+        structured(
+            &mut server,
+            "apply_operations",
+            json!({
+                "operations": [{
+                    "op": "create_wall_run",
+                    "name": "Thin wall",
+                    "start_mm": [-6_000, 0],
+                    "end_mm": [6_000, 0],
+                    "height_mm": 12_000,
+                    "thickness_mm": 1_000
+                }]
+            }),
+        );
+
+        let before = structured(&mut server, "get_assessment", json!({}));
+        assert_eq!(before["style_id"], "edwardian_welsh");
+        assert_eq!(before["passed"], false);
+        let finding = before["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| finding["code"] == "wall_too_slender")
+            .expect("slenderness finding");
+        assert_eq!(finding["severity"], "error");
+        assert!(finding["source_note"]
+            .as_str()
+            .unwrap()
+            .contains("Caernarfon"));
+        let fix = finding["suggested_fix"].clone();
+        assert_eq!(fix["op"], "modify_element");
+        assert!(fix["thickness_mm"].as_i64().unwrap() >= 2_667);
+
+        // Applying the one-click fix through the normal batch API repairs it.
+        structured(
+            &mut server,
+            "apply_operations",
+            json!({ "operations": [fix] }),
+        );
+        let after = structured(&mut server, "get_assessment", json!({}));
+        assert_eq!(after["passed"], true, "findings: {}", after["findings"]);
+        assert_eq!(after["score"], 100);
+        assert!(after["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["code"] != "wall_too_slender"));
+    }
+
+    #[test]
+    fn list_and_get_styles() {
+        let mut server = server();
+        let styles = structured(&mut server, "list_styles", json!({}));
+        let styles = styles["styles"].as_array().unwrap();
+        assert_eq!(styles.len(), 1);
+        assert_eq!(styles[0]["id"], "edwardian_welsh");
+        assert_eq!(styles[0]["course_height_mm"], 450);
+        assert!(styles[0]["source_notes"].as_array().unwrap().len() >= 4);
+
+        let style = structured(&mut server, "get_style", json!({ "id": "edwardian_welsh" }));
+        assert_eq!(style["style"]["id"], "edwardian_welsh");
+        assert_eq!(style["style"]["min_wall_thickness_mm"], 1_800);
+        assert_eq!(style["style"]["max_slenderness_ratio"], 4.5);
+
+        let message = tool_error_message(&mut server, "get_style", json!({ "id": "gothic" }));
+        assert!(message.contains("unknown style id"), "got {message}");
+
+        let long_id = "x".repeat(200);
+        let message = tool_error_message(&mut server, "get_style", json!({ "id": long_id }));
+        assert_eq!(
+            message.matches('x').count(),
+            64,
+            "unknown-style id must be truncated to 64 chars: {message}"
+        );
+
+        let message = tool_error_message(&mut server, "get_style", json!({}));
+        assert!(message.contains("invalid arguments"), "got {message}");
+    }
+
+    #[test]
+    fn get_site_reports_the_active_site_and_catalogue() {
+        let mut server = server();
+        let site = structured(&mut server, "get_site", json!({}));
+        assert_eq!(site["site"]["id"], "m0a_promontory");
+        assert_eq!(site["site"]["name"], "River Promontory");
+        let available = site["available_sites"].as_array().unwrap();
+        assert_eq!(available.len(), 3);
+        let ids: Vec<&str> = available
+            .iter()
+            .map(|site| site["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["m0a_promontory", "coastal_headland", "lake_island"]
+        );
+
+        let mut lake = McpServer::with_start("lake_island", CastleDocument::new())
+            .expect("lake_island is curated");
+        let site = structured(&mut lake, "get_site", json!({}));
+        assert_eq!(site["site"]["id"], "lake_island");
+        assert_eq!(site["site"]["name"], "Lake Island");
+    }
+
+    #[test]
+    fn create_gatehouse_ditch_and_modify_element() {
+        let mut server = McpServer::new(true);
+        let applied = structured(
+            &mut server,
+            "apply_operations",
+            json!({
+                "operations": [
+                    {
+                        "op": "create_gatehouse",
+                        "ref_id": "gate",
+                        "name": "Great gatehouse",
+                        "centre_mm": [0, 0],
+                        "orientation_deg": 0
+                    },
+                    {
+                        "op": "create_ditch",
+                        "ref_id": "ditch",
+                        "name": "Approach ditch",
+                        "start_mm": [-20_000, -10_000],
+                        "end_mm": [-20_000, 10_000],
+                        "width_mm": 6_000,
+                        "depth_mm": 2_600
+                    },
+                    {
+                        "op": "create_wall_run",
+                        "ref_id": "wall",
+                        "name": "Curtain",
+                        "start_mm": [5_000, 0],
+                        "end_mm": [15_000, 0],
+                        "height_mm": 9_000,
+                        "thickness_mm": 2_400
+                    }
+                ]
+            }),
+        );
+        assert_eq!(applied["applied_count"], 3);
+        assert_eq!(applied["created_ids"]["gate"], 1);
+        assert_eq!(applied["created_ids"]["ditch"], 2);
+        let wall_id = applied["created_ids"]["wall"].as_u64().unwrap();
+        assert_eq!(wall_id, 3);
+
+        let castle = structured(&mut server, "get_castle", json!({}));
+        let kinds: Vec<&str> = castle["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|element| element["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["gatehouse", "ditch", "wall"]);
+        assert_eq!(castle["elements"][0]["name"], "Great gatehouse");
+        assert_eq!(castle["elements"][1]["name"], "Approach ditch");
+
+        let modified = structured(
+            &mut server,
+            "apply_operations",
+            json!({
+                "operations": [{
+                    "op": "modify_element",
+                    "id": wall_id,
+                    "height_mm": 7_000,
+                    "thickness_mm": 2_000
+                }]
+            }),
+        );
+        assert_eq!(modified["applied_count"], 1);
+        let castle = structured(&mut server, "get_castle", json!({}));
+        let wall = castle["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["id"] == wall_id)
+            .unwrap();
+        assert_eq!(wall["height_mm"], 7_000);
+        assert_eq!(wall["thickness_mm"], 2_000);
     }
 
     #[test]

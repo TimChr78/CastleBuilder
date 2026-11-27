@@ -18,7 +18,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::document::{BatteredWall, CastleDocument, Element, RoundTower};
+use crate::document::{
+    BatteredWall, CastleDocument, Element, ElementKind, Gatehouse, RoundTower, TowerPlan,
+};
 use crate::masonry::{generate_blocks, Block, BlockFace};
 use crate::terrain::SiteTerrain;
 use crate::{fnv1a_64, fnv1a_64_update, GENERATOR_VERSION};
@@ -82,7 +84,15 @@ impl SceneData {
 }
 
 /// Generate blocks, then bucket and mesh them into merged chunk meshes.
+///
+/// Ditches are carved into a private copy of the terrain before both masonry
+/// grounding and the terrain mesh are generated, so `terrain_mesh()` always
+/// displays the earthworks described by the document.
 pub fn build_scene(document: &CastleDocument, terrain: &SiteTerrain) -> SceneData {
+    let ditches: Vec<&crate::document::Ditch> = document.ditches().collect();
+    let effective_terrain = terrain.with_ditches(&ditches);
+    let terrain = &effective_terrain;
+
     let blocks = generate_blocks(document, terrain);
     let total_blocks = blocks.len();
     let layout_hash = layout_hash_of(&blocks);
@@ -226,14 +236,36 @@ fn build_chunk(
                 terrain,
                 occupancy,
             ),
-            Element::RoundTower(tower) => emit_lod1_tower(
+            Element::RoundTower(tower) => {
+                if tower.plan == TowerPlan::Round {
+                    emit_lod1_tower(
+                        &mut lod1,
+                        tower,
+                        element_chunk_blocks,
+                        &params,
+                        terrain,
+                        occupancy,
+                    );
+                } else {
+                    emit_lod1_shaped_tower(
+                        &mut lod1,
+                        tower,
+                        element_chunk_blocks,
+                        &params,
+                        terrain,
+                        occupancy,
+                    );
+                }
+            }
+            Element::Gatehouse(gatehouse) => emit_lod1_gatehouse(
                 &mut lod1,
-                tower,
+                gatehouse,
                 element_chunk_blocks,
                 &params,
                 terrain,
                 occupancy,
             ),
+            Element::Ditch(_) => {}
         }
     }
 
@@ -534,6 +566,196 @@ fn emit_lod1_tower(
     let ib = point(a_max, inner_bottom, y_min);
     let it = point(a_max, inner_top, y_max);
     emit_metre_quad(data, [ob, ot, it, ib], *params, terrain, occupancy);
+}
+
+/// LOD1 for shaped (square / D-shaped) towers: an oriented, battered prism
+/// following the local footprint of this chunk, instead of a round cylinder.
+fn emit_lod1_shaped_tower(
+    data: &mut ChunkMeshData,
+    tower: &RoundTower,
+    blocks: &[&Block],
+    params: &EmitParams,
+    terrain: &SiteTerrain,
+    occupancy: &Occupancy,
+) {
+    if blocks.is_empty() {
+        return;
+    }
+    let orientation = tower.orientation_deg as f64 * std::f64::consts::PI / 180.0;
+    let (sin_o, cos_o) = (sin(orientation), cos(orientation));
+    let cx = tower.centre_mm[0] as f64;
+    let cz = tower.centre_mm[1] as f64;
+
+    let local = |point: [i64; 3]| -> (f64, f64) {
+        let dx = point[0] as f64 - cx;
+        let dz = point[2] as f64 - cz;
+        (dx * cos_o + dz * sin_o, -dx * sin_o + dz * cos_o)
+    };
+
+    let mut y_min = i64::MAX;
+    let mut y_max = i64::MIN;
+    for block in blocks {
+        for corner in block.corners_mm {
+            y_min = y_min.min(corner[1]);
+            y_max = y_max.max(corner[1]);
+        }
+    }
+    if y_max <= y_min {
+        return;
+    }
+
+    let mut bottom = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    let mut top = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for block in blocks {
+        for corner in block.corners_mm {
+            let (u, v) = local(corner);
+            let range = if corner[1] <= y_min {
+                &mut bottom
+            } else if corner[1] >= y_max {
+                &mut top
+            } else {
+                continue;
+            };
+            range.0 = range.0.min(u);
+            range.1 = range.1.max(u);
+            range.2 = range.2.min(v);
+            range.3 = range.3.max(v);
+        }
+    }
+    if bottom.0 > bottom.1 || bottom.2 > bottom.3 || top.0 > top.1 || top.2 > top.3 {
+        return;
+    }
+
+    let point = |u: f64, v: f64, y: i64| -> [i64; 3] {
+        [
+            round(cx + u * cos_o - v * sin_o) as i64,
+            y,
+            round(cz + u * sin_o + v * cos_o) as i64,
+        ]
+    };
+    let corners = [
+        point(bottom.0, bottom.2, y_min),
+        point(bottom.1, bottom.2, y_min),
+        point(bottom.1, bottom.3, y_min),
+        point(bottom.0, bottom.3, y_min),
+        point(top.0, top.2, y_max),
+        point(top.1, top.2, y_max),
+        point(top.1, top.3, y_max),
+        point(top.0, top.3, y_max),
+    ];
+
+    for face in [
+        BlockFace::Front,
+        BlockFace::Back,
+        BlockFace::Top,
+        BlockFace::End0,
+        BlockFace::End1,
+    ] {
+        emit_corner_face(data, &corners, face, *params, terrain, occupancy);
+    }
+}
+
+/// LOD1 for a gatehouse: two flanking battered drums plus an oriented bridge
+/// prism that begins *above* the passage, so the gate is visibly open at LOD1.
+fn emit_lod1_gatehouse(
+    data: &mut ChunkMeshData,
+    gatehouse: &Gatehouse,
+    blocks: &[&Block],
+    params: &EmitParams,
+    terrain: &SiteTerrain,
+    occupancy: &Occupancy,
+) {
+    let towers = gatehouse.flank_towers();
+    let tower_blocks: Vec<&Block> = blocks
+        .iter()
+        .copied()
+        .filter(|block| block.kind == ElementKind::RoundTower)
+        .collect();
+    for (index, tower) in towers.iter().enumerate() {
+        let other = towers[1 - index].centre_mm;
+        let own: Vec<&Block> = tower_blocks
+            .iter()
+            .copied()
+            .filter(|block| {
+                let centre = block.centre_mm();
+                let own_dx = centre[0] - tower.centre_mm[0] as f64;
+                let own_dz = centre[2] - tower.centre_mm[1] as f64;
+                let other_dx = centre[0] - other[0] as f64;
+                let other_dz = centre[2] - other[1] as f64;
+                let own_distance = sqrt(own_dx * own_dx + own_dz * own_dz);
+                let other_distance = sqrt(other_dx * other_dx + other_dz * other_dz);
+                own_distance <= other_distance && own_distance <= tower.radius_mm as f64 + 2_000.0
+            })
+            .collect();
+        if !own.is_empty() {
+            emit_lod1_tower(data, tower, &own, params, terrain, occupancy);
+        }
+    }
+
+    let bridge: Vec<&Block> = blocks
+        .iter()
+        .copied()
+        .filter(|block| block.kind == ElementKind::Gatehouse)
+        .collect();
+    if bridge.is_empty() {
+        return;
+    }
+
+    let ground = terrain.height_mm(gatehouse.centre_mm[0], gatehouse.centre_mm[1]);
+    let y_min = ground + gatehouse.passage_height_mm.max(1);
+    let dir = gatehouse.direction();
+    let right = [-dir[1], dir[0]];
+    let cx = gatehouse.centre_mm[0] as f64;
+    let cz = gatehouse.centre_mm[1] as f64;
+
+    let mut a_min = f64::MAX;
+    let mut a_max = f64::MIN;
+    let mut d_min = f64::MAX;
+    let mut d_max = f64::MIN;
+    let mut y_max = i64::MIN;
+    for block in &bridge {
+        for corner in block.corners_mm {
+            let dx = corner[0] as f64 - cx;
+            let dz = corner[2] as f64 - cz;
+            let a = dx * dir[0] + dz * dir[1];
+            let d = dx * right[0] + dz * right[1];
+            a_min = a_min.min(a);
+            a_max = a_max.max(a);
+            d_min = d_min.min(d);
+            d_max = d_max.max(d);
+            y_max = y_max.max(corner[1]);
+        }
+    }
+    if a_max <= a_min || d_max <= d_min || y_max <= y_min {
+        return;
+    }
+
+    let point = |a: f64, d: f64, y: i64| -> [i64; 3] {
+        [
+            round(cx + dir[0] * a + right[0] * d) as i64,
+            y,
+            round(cz + dir[1] * a + right[1] * d) as i64,
+        ]
+    };
+    let corners = [
+        point(a_min, d_min, y_min),
+        point(a_max, d_min, y_min),
+        point(a_max, d_max, y_min),
+        point(a_min, d_max, y_min),
+        point(a_min, d_min, y_max),
+        point(a_max, d_min, y_max),
+        point(a_max, d_max, y_max),
+        point(a_min, d_max, y_max),
+    ];
+    for face in [
+        BlockFace::Front,
+        BlockFace::Back,
+        BlockFace::Top,
+        BlockFace::End0,
+        BlockFace::End1,
+    ] {
+        emit_corner_face(data, &corners, face, *params, terrain, occupancy);
+    }
 }
 
 /// Coarse six-faced massing proxy used by LOD2.
@@ -963,7 +1185,49 @@ pub fn quantise_mm(metres: f32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::Gatehouse;
     use crate::fixtures::m0a_showcase;
+
+    #[test]
+    fn gatehouse_lod1_leaves_the_passage_open() {
+        let terrain = SiteTerrain::m0a_promontory();
+        let mut document = CastleDocument::new();
+        let gatehouse = Gatehouse::new(1, "Gate", [0, 0], 0);
+        document.add_gatehouse(gatehouse.clone());
+        let blocks = generate_blocks(&document, &terrain);
+        let refs: Vec<&Block> = blocks.iter().collect();
+        let occupancy = Occupancy::build(&blocks, &terrain);
+        let params = EmitParams {
+            tint: 0.9,
+            age: 0.8,
+            jitter_seed: 0.0,
+            build_norm: 0.5,
+            course: 4.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let mut lod1 = ChunkMeshData::default();
+        emit_lod1_gatehouse(&mut lod1, &gatehouse, &refs, &params, &terrain, &occupancy);
+        assert!(!lod1.is_empty(), "gatehouse LOD1 produced no geometry");
+
+        let ground_m = terrain.height_mm(0, 0) as f32 / 1000.0;
+        let passage_top_m = ground_m + gatehouse.passage_height_mm as f32 / 1000.0;
+        for position in &lod1.positions {
+            let inside_passage = position[0].abs() < 3.5
+                && position[2].abs() < 1.5
+                && position[1] < passage_top_m - 0.05;
+            assert!(
+                !inside_passage,
+                "gatehouse LOD1 blocks the passage at {position:?}"
+            );
+        }
+        // Masonry still bridges above the gate.
+        let above = lod1
+            .positions
+            .iter()
+            .any(|position| position[1] >= passage_top_m);
+        assert!(above, "gatehouse LOD1 has no masonry above the passage");
+    }
 
     #[test]
     fn exposed_face_triangle_ratio_is_in_target_band() {

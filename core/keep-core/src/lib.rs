@@ -18,7 +18,9 @@ pub mod picking;
 pub mod plan_render;
 pub mod save;
 pub mod session;
+pub mod style;
 pub mod terrain;
+pub mod validate;
 
 /// Version stamped into layout hashes. Bump whenever the generator's output
 /// changes, even if the document schema is unchanged.

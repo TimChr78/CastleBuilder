@@ -62,6 +62,9 @@ const STYLE: &str = "<style>\n\
 .contour{fill:none;stroke:#c3bcae;stroke-width:0.12;stroke-linecap:round;}\n\
 .wall{fill:#d9c8a6;stroke:#3a3226;stroke-width:0.35;stroke-linejoin:round;}\n\
 .tower{fill:#d4c09c;stroke:#3a3226;stroke-width:0.35;}\n\
+.gatehouse{fill:#d4c09c;stroke:#3a3226;stroke-width:0.35;stroke-linejoin:round;}\n\
+.ditch{fill:none;stroke:#6b5b3e;stroke-width:0.42;stroke-linecap:round;stroke-dasharray:1.1 0.7;}\n\
+.ditch-hachure{stroke:#8c7b5a;stroke-width:0.16;stroke-linecap:round;}\n\
 .opening{fill:#f3e3ad;stroke:#8a4f1c;stroke-width:0.28;}\n\
 .terrain-profile{fill:#e8ddc7;stroke:#8c7b5a;stroke-width:0.22;}\n\
 .scale-bar{stroke:#1f1a12;stroke-width:0.6;stroke-linecap:round;}\n\
@@ -127,6 +130,29 @@ impl Bounds {
                     let cz = tower.centre_mm[1] as f64 / 1000.0;
                     let r = (tower.radius_mm + tower.plinth_projection_mm) as f64 / 1000.0;
                     include(cx - r, cz - r, cx + r, cz + r);
+                }
+                Element::Gatehouse(gatehouse) => {
+                    let cx = gatehouse.centre_mm[0] as f64 / 1000.0;
+                    let cz = gatehouse.centre_mm[1] as f64 / 1000.0;
+                    let reach = (gatehouse.depth_mm / 2
+                        + gatehouse.passage_width_mm / 2
+                        + gatehouse.tower_radius_mm * 2
+                        + 100) as f64
+                        / 1000.0;
+                    include(cx - reach, cz - reach, cx + reach, cz + reach);
+                }
+                Element::Ditch(ditch) => {
+                    let half = ditch.width_mm as f64 * 0.5 / 1000.0;
+                    let ax = ditch.start_mm[0] as f64 / 1000.0;
+                    let az = ditch.start_mm[1] as f64 / 1000.0;
+                    let bx = ditch.end_mm[0] as f64 / 1000.0;
+                    let bz = ditch.end_mm[1] as f64 / 1000.0;
+                    include(
+                        ax.min(bx) - half,
+                        az.min(bz) - half,
+                        ax.max(bx) + half,
+                        az.max(bz) + half,
+                    );
                 }
             }
         }
@@ -251,6 +277,52 @@ fn element_label(x: f64, y: f64, id: u64, name: &str) -> String {
     )
 }
 
+fn rotate_plan(centre: [f64; 2], u: f64, v: f64, orientation_deg: i32) -> (f64, f64) {
+    let angle = orientation_deg as f64 * std::f64::consts::PI / 180.0;
+    let c = libm::cos(angle);
+    let s = libm::sin(angle);
+    (centre[0] + u * c - v * s, centre[1] + u * s + v * c)
+}
+
+fn square_plan_points(centre: [f64; 2], radius: f64, orientation_deg: i32) -> Vec<(f64, f64)> {
+    [
+        (-radius, -radius),
+        (radius, -radius),
+        (radius, radius),
+        (-radius, radius),
+    ]
+    .into_iter()
+    .map(|(u, v)| rotate_plan(centre, u, v, orientation_deg))
+    .collect()
+}
+
+fn dshaped_plan_points(centre: [f64; 2], radius: f64, orientation_deg: i32) -> Vec<(f64, f64)> {
+    const SEGMENTS: usize = 16;
+    let mut points = Vec::with_capacity(SEGMENTS + 1);
+    for index in 0..=SEGMENTS {
+        let angle =
+            -std::f64::consts::FRAC_PI_2 + std::f64::consts::PI * index as f64 / SEGMENTS as f64;
+        points.push(rotate_plan(
+            centre,
+            radius * libm::cos(angle),
+            radius * libm::sin(angle),
+            orientation_deg,
+        ));
+    }
+    points
+}
+
+fn polygon_attr(points: &[(f64, f64)], to_svg: &dyn Fn(f64, f64) -> (f64, f64)) -> String {
+    points
+        .iter()
+        .map(|&(x, z)| {
+            let p = to_svg(x, z);
+            format!("{},{}", n(p.0), n(p.1))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn render_top_plan(document: &CastleDocument, terrain: &SiteTerrain) -> String {
     // Crop to the castle plus a 20 m margin (10 m on each side). Only an empty
     // document falls back to the full terrain extent.
@@ -319,22 +391,168 @@ fn render_top_plan(document: &CastleDocument, terrain: &SiteTerrain) -> String {
                 svg.push_str(&element_label(mid.0, mid.1, wall.id, &wall.name));
             }
             Element::RoundTower(tower) => {
-                let c = to_svg(
+                let c = [
                     tower.centre_mm[0] as f64 / 1000.0,
                     tower.centre_mm[1] as f64 / 1000.0,
+                ];
+                let radius = tower.radius_mm as f64 / 1000.0;
+                match tower.plan {
+                    crate::document::TowerPlan::Round => {
+                        let p = to_svg(c[0], c[1]);
+                        svg.push_str(&format!(
+                            "<circle class=\"tower\" cx=\"{}\" cy=\"{}\" r=\"{}\"/>\n",
+                            n(p.0),
+                            n(p.1),
+                            n(radius)
+                        ));
+                    }
+                    crate::document::TowerPlan::Square => {
+                        let points = square_plan_points(c, radius, tower.orientation_deg);
+                        svg.push_str(&format!(
+                            "<polygon class=\"tower\" points=\"{}\"/>\n",
+                            polygon_attr(&points, &to_svg)
+                        ));
+                    }
+                    crate::document::TowerPlan::DShaped => {
+                        let points = dshaped_plan_points(c, radius, tower.orientation_deg);
+                        svg.push_str(&format!(
+                            "<polygon class=\"tower\" points=\"{}\"/>\n",
+                            polygon_attr(&points, &to_svg)
+                        ));
+                    }
+                }
+                let label = to_svg(c[0] - radius, c[1] - radius - 1.0);
+                svg.push_str(&element_label(label.0, label.1, tower.id, &tower.name));
+            }
+            Element::Gatehouse(gatehouse) => {
+                let dir = gatehouse.direction();
+                let right = [-dir[1], dir[0]];
+                // The passage void runs along the gatehouse depth.
+                let cx = gatehouse.centre_mm[0] as f64 / 1000.0;
+                let cz = gatehouse.centre_mm[1] as f64 / 1000.0;
+                let half_depth = gatehouse.depth_mm as f64 * 0.5 / 1000.0;
+                let half_width = gatehouse.passage_width_mm as f64 * 0.5 / 1000.0;
+                let half_outer = (gatehouse.passage_width_mm / 2 + gatehouse.tower_radius_mm + 100)
+                    as f64
+                    / 1000.0;
+                let outline = [
+                    (
+                        cx - dir[0] * half_depth - right[0] * half_outer,
+                        cz - dir[1] * half_depth - right[1] * half_outer,
+                    ),
+                    (
+                        cx + dir[0] * half_depth - right[0] * half_outer,
+                        cz + dir[1] * half_depth - right[1] * half_outer,
+                    ),
+                    (
+                        cx + dir[0] * half_depth + right[0] * half_outer,
+                        cz + dir[1] * half_depth + right[1] * half_outer,
+                    ),
+                    (
+                        cx - dir[0] * half_depth + right[0] * half_outer,
+                        cz - dir[1] * half_depth + right[1] * half_outer,
+                    ),
+                ];
+                svg.push_str(&format!(
+                    "<polygon class=\"gatehouse\" points=\"{}\"/>\n",
+                    polygon_attr(&outline, &to_svg)
+                ));
+                let passage = [
+                    (
+                        cx - dir[0] * half_depth - dir[1] * half_width,
+                        cz - dir[1] * half_depth + dir[0] * half_width,
+                    ),
+                    (
+                        cx + dir[0] * half_depth - dir[1] * half_width,
+                        cz + dir[1] * half_depth + dir[0] * half_width,
+                    ),
+                    (
+                        cx + dir[0] * half_depth + dir[1] * half_width,
+                        cz + dir[1] * half_depth - dir[0] * half_width,
+                    ),
+                    (
+                        cx - dir[0] * half_depth + dir[1] * half_width,
+                        cz - dir[1] * half_depth - dir[0] * half_width,
+                    ),
+                ];
+                svg.push_str(&format!(
+                    "<polygon class=\"opening\" points=\"{}\"/>\n",
+                    polygon_attr(&passage, &to_svg)
+                ));
+                for tower in gatehouse.flank_towers() {
+                    let c = [
+                        tower.centre_mm[0] as f64 / 1000.0,
+                        tower.centre_mm[1] as f64 / 1000.0,
+                    ];
+                    let r = tower.radius_mm as f64 / 1000.0;
+                    let p = to_svg(c[0], c[1]);
+                    svg.push_str(&format!(
+                        "<circle class=\"tower\" cx=\"{}\" cy=\"{}\" r=\"{}\"/>\n",
+                        n(p.0),
+                        n(p.1),
+                        n(r)
+                    ));
+                }
+                let label = to_svg(cx, cz - half_depth - 1.0);
+                svg.push_str(&element_label(
+                    label.0,
+                    label.1,
+                    gatehouse.id,
+                    &gatehouse.name,
+                ));
+            }
+            Element::Ditch(ditch) => {
+                let a = to_svg(
+                    ditch.start_mm[0] as f64 / 1000.0,
+                    ditch.start_mm[1] as f64 / 1000.0,
+                );
+                let b = to_svg(
+                    ditch.end_mm[0] as f64 / 1000.0,
+                    ditch.end_mm[1] as f64 / 1000.0,
                 );
                 svg.push_str(&format!(
-                    "<circle class=\"tower\" cx=\"{}\" cy=\"{}\" r=\"{}\"/>\n",
-                    n(c.0),
-                    n(c.1),
-                    n(tower.radius_mm as f64 / 1000.0)
+                    "<line class=\"ditch\" x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\"/>\n",
+                    n(a.0),
+                    n(a.1),
+                    n(b.0),
+                    n(b.1)
                 ));
-                svg.push_str(&element_label(
-                    c.0 - tower.radius_mm as f64 / 1000.0,
-                    c.1 - tower.radius_mm as f64 / 1000.0 - 1.0,
-                    tower.id,
-                    &tower.name,
-                ));
+                // Hachures across the ditch at a fixed, deterministic pitch.
+                let dx = ditch.end_mm[0] as f64 - ditch.start_mm[0] as f64;
+                let dz = ditch.end_mm[1] as f64 - ditch.start_mm[1] as f64;
+                let len = sqrt(dx * dx + dz * dz);
+                if len > 1.0 {
+                    let dir = [dx / len, dz / len];
+                    let right = [-dir[1], dir[0]];
+                    let half = ditch.width_mm as f64 * 0.5;
+                    let step = 1_500.0;
+                    let mut travelled = step * 0.5;
+                    while travelled < len {
+                        let x = ditch.start_mm[0] as f64 + dir[0] * travelled;
+                        let z = ditch.start_mm[1] as f64 + dir[1] * travelled;
+                        let p0 = to_svg(
+                            (x - right[0] * half) / 1000.0,
+                            (z - right[1] * half) / 1000.0,
+                        );
+                        let p1 = to_svg(
+                            (x + right[0] * half) / 1000.0,
+                            (z + right[1] * half) / 1000.0,
+                        );
+                        svg.push_str(&format!(
+                            "<line class=\"ditch-hachure\" x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\"/>\n",
+                            n(p0.0),
+                            n(p0.1),
+                            n(p1.0),
+                            n(p1.1)
+                        ));
+                        travelled += step;
+                    }
+                }
+                let mid = to_svg(
+                    (ditch.start_mm[0] + ditch.end_mm[0]) as f64 / 2000.0,
+                    (ditch.start_mm[1] + ditch.end_mm[1]) as f64 / 2000.0,
+                );
+                svg.push_str(&element_label(mid.0, mid.1, ditch.id, &ditch.name));
             }
         }
     }
@@ -438,6 +656,15 @@ fn render_elevation(document: &CastleDocument, terrain: &SiteTerrain) -> String 
                 );
                 max_y = max_y.max(ground + tower.height_mm as f64 / 1000.0);
             }
+            Element::Gatehouse(gatehouse) => {
+                let ground = height_at(
+                    terrain,
+                    gatehouse.centre_mm[0] as f64 / 1000.0,
+                    gatehouse.centre_mm[1] as f64 / 1000.0,
+                );
+                max_y = max_y.max(ground + gatehouse.height_mm as f64 / 1000.0);
+            }
+            Element::Ditch(_) => {}
         }
     }
     let world_h = (max_y - min_y).max(5.0);
@@ -541,6 +768,43 @@ fn render_elevation(document: &CastleDocument, terrain: &SiteTerrain) -> String 
                 let label = to_svg(cx, top + 0.8);
                 svg.push_str(&element_label(label.0, label.1, tower.id, &tower.name));
             }
+            Element::Gatehouse(gatehouse) => {
+                let cx = gatehouse.centre_mm[0] as f64 / 1000.0;
+                let cz = gatehouse.centre_mm[1] as f64 / 1000.0;
+                let ground = height_at(terrain, cx, cz);
+                let top = ground + gatehouse.height_mm as f64 / 1000.0;
+                let half = (gatehouse.passage_width_mm / 2 + gatehouse.tower_radius_mm + 100)
+                    as f64
+                    / 1000.0;
+                let p0 = to_svg(cx - half, ground);
+                let p1 = to_svg(cx + half, top);
+                svg.push_str(&format!(
+                    "<rect class=\"gatehouse\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/>\n",
+                    n(p0.0),
+                    n(p0.1.min(p1.1)),
+                    n((p1.0 - p0.0).max(0.05)),
+                    n((p1.1 - p0.1).abs().max(0.05))
+                ));
+                let passage_half = gatehouse.passage_width_mm as f64 * 0.5 / 1000.0;
+                let passage_top = ground + gatehouse.passage_height_mm as f64 / 1000.0;
+                let q0 = to_svg(cx - passage_half, ground);
+                let q1 = to_svg(cx + passage_half, passage_top);
+                svg.push_str(&format!(
+                    "<rect class=\"opening\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/>\n",
+                    n(q0.0),
+                    n(q0.1.min(q1.1)),
+                    n((q1.0 - q0.0).max(0.05)),
+                    n((q1.1 - q0.1).abs().max(0.05))
+                ));
+                let label = to_svg(cx, top + 0.8);
+                svg.push_str(&element_label(
+                    label.0,
+                    label.1,
+                    gatehouse.id,
+                    &gatehouse.name,
+                ));
+            }
+            Element::Ditch(_) => {}
         }
     }
 
@@ -576,7 +840,7 @@ fn render_elevation(document: &CastleDocument, terrain: &SiteTerrain) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{m0a_showcase_document, m0b_showcase_document};
+    use crate::fixtures::{m0a_showcase_document, m0b_showcase_document, m1_edwardian_document};
 
     #[test]
     fn top_plan_is_valid_svg_with_labels_and_contours() {
@@ -635,5 +899,24 @@ mod tests {
         let a = render_plan_svg(&document, &terrain, PlanView::TopPlan);
         let b = render_plan_svg(&document, &terrain, PlanView::TopPlan);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn m1_plan_shows_gatehouse_ditch_and_shaped_towers() {
+        let terrain = SiteTerrain::for_site("coastal_headland").unwrap();
+        let document = m1_edwardian_document();
+        let svg = render_plan_svg(&document, &terrain, PlanView::TopPlan);
+        assert!(svg.contains("class=\"gatehouse\""));
+        assert!(svg.contains("class=\"ditch\""));
+        assert!(svg.contains("class=\"ditch-hachure\""));
+        assert!(svg.contains("Great gatehouse"));
+        assert!(svg.contains("Approach ditch"));
+        assert!(svg.contains("Square tower"));
+        assert!(svg.contains("D-shaped tower"));
+        // A square tower is a four-corner polygon, not a circle.
+        assert!(svg.contains("<polygon class=\"tower\""));
+        let elevation = render_plan_svg(&document, &terrain, PlanView::ElevationNorth);
+        assert!(elevation.contains("class=\"gatehouse\""));
+        assert_eq!(svg, render_plan_svg(&document, &terrain, PlanView::TopPlan));
     }
 }

@@ -21,11 +21,16 @@ use keep_core::command::{
     MAX_WALL_THICKNESS_MM, MIN_TOWER_HEIGHT_MM, MIN_TOWER_RADIUS_MM, MIN_WALL_HEIGHT_MM,
     MIN_WALL_THICKNESS_MM,
 };
-use keep_core::document::{CastleDocument, Element};
+use keep_core::document::{CastleDocument, Element, TowerPlan};
 use keep_core::mesh::{ChunkMeshData, SceneData};
 use keep_core::picking::SnapKind;
-use keep_core::session::{Session, DEFAULT_SITE_ID};
+use keep_core::session::Session;
+use keep_core::style::StylePack;
 use keep_core::terrain::{SiteTerrain, TerrainMeshData};
+use keep_core::validate::{validate_structure, Severity};
+
+/// Site the M1 vertical slice starts on.
+const M1_SITE_ID: &str = "coastal_headland";
 
 /// The only class the game needs for M0a/M0b.
 #[derive(GodotClass)]
@@ -44,9 +49,9 @@ impl INode for KeepBridge {
         Self {
             base,
             session: Session::from_document(
-                DEFAULT_SITE_ID,
-                SiteTerrain::m0a_promontory(),
-                keep_core::fixtures::m0b_showcase_document(),
+                M1_SITE_ID,
+                SiteTerrain::for_site(M1_SITE_ID).expect("coastal_headland is a curated site"),
+                keep_core::fixtures::m1_edwardian_document(),
             ),
             player_author: AuthorId::player("local")
                 .expect("built-in local player author id is always valid"),
@@ -56,11 +61,55 @@ impl INode for KeepBridge {
 
 #[godot_api]
 impl KeepBridge {
+    /// Build the M1 Edwardian showcase on the coastal headland.
+    #[func]
+    fn build_m1_edwardian(&mut self) -> VarDictionary {
+        self.session = Session::from_document(
+            M1_SITE_ID,
+            SiteTerrain::for_site(M1_SITE_ID).expect("coastal_headland is a curated site"),
+            keep_core::fixtures::m1_edwardian_document(),
+        );
+        self.session_scene()
+    }
+
+    /// Switch to an empty castle on one of the curated sites.
+    #[func]
+    fn load_site(&mut self, site_id: GString) -> VarDictionary {
+        let site = site_id.to_string();
+        let Some(terrain) = SiteTerrain::for_site(&site) else {
+            let mut result = VarDictionary::new();
+            result.set("ok", false);
+            result.set(
+                "error",
+                &GString::from(&format!("unknown site id '{site}'")),
+            );
+            return result;
+        };
+        self.session = Session::from_document(site, terrain, CastleDocument::new());
+        let mut result = self.session_scene();
+        result.set("ok", true);
+        result
+    }
+
+    /// Describe every curated site.
+    #[func]
+    fn list_sites(&self) -> Array<VarDictionary> {
+        let mut sites: Array<VarDictionary> = Array::new();
+        for info in SiteTerrain::list_sites() {
+            let mut entry = VarDictionary::new();
+            entry.set("id", &GString::from(&info.id));
+            entry.set("name", &GString::from(&info.name));
+            entry.set("description", &GString::from(&info.description));
+            sites.push(&entry);
+        }
+        sites
+    }
+
     /// Build the fixed M0a look scene (one battered wall, one round tower).
     #[func]
     fn build_m0a_showcase(&mut self) -> VarDictionary {
         self.session = Session::from_document(
-            DEFAULT_SITE_ID,
+            "m0a_promontory",
             SiteTerrain::m0a_promontory(),
             keep_core::fixtures::m0a_showcase_document(),
         );
@@ -71,7 +120,7 @@ impl KeepBridge {
     #[func]
     fn build_m0b_showcase(&mut self) -> VarDictionary {
         self.session = Session::from_document(
-            DEFAULT_SITE_ID,
+            "m0a_promontory",
             SiteTerrain::m0a_promontory(),
             keep_core::fixtures::m0b_showcase_document(),
         );
@@ -82,7 +131,7 @@ impl KeepBridge {
     #[func]
     fn build_stress_200k(&mut self) -> VarDictionary {
         self.session = Session::from_document(
-            DEFAULT_SITE_ID,
+            "m0a_promontory",
             SiteTerrain::m0a_promontory(),
             keep_core::fixtures::stress_200k_document(),
         );
@@ -201,6 +250,141 @@ impl KeepBridge {
         }
     }
 
+    /// Add a tower with a round, square or D-shaped plan.
+    ///
+    /// A shaped plan needs a `ModifyElement` follow-up, which takes an existing
+    /// `ElementId`. Because ids are allocated deterministically from the
+    /// session's `next_element_id`, the create is the first operation in the
+    /// batch and therefore receives exactly that id, so both operations stay in
+    /// one atomic batch (the session validates and applies all-or-nothing).
+    #[func]
+    fn add_tower_shaped(
+        &mut self,
+        center_xz: Vector2,
+        radius_m: f32,
+        height_m: f32,
+        plan: GString,
+        orientation_deg: i32,
+    ) -> VarDictionary {
+        let radius_mm = quantise_m(radius_m).clamp(MIN_TOWER_RADIUS_MM, MAX_TOWER_RADIUS_MM);
+        let height_mm = quantise_m(height_m).clamp(MIN_TOWER_HEIGHT_MM, MAX_TOWER_HEIGHT_MM);
+        let tower_plan = tower_plan_from_key(&plan.to_string());
+        let created_id = self.session.next_element_id();
+        let mut ops = vec![CommandOp::CreateTower {
+            ref_id: None,
+            name: format!("Tower {created_id}"),
+            centre_mm: quantise_xz(center_xz),
+            radius_mm,
+            height_mm,
+            batter_mm: None,
+        }];
+        if tower_plan != TowerPlan::Round {
+            ops.push(CommandOp::ModifyElement {
+                id: created_id,
+                height_mm: None,
+                thickness_mm: None,
+                batter_mm: None,
+                plinth_height_mm: None,
+                plan: Some(tower_plan),
+                orientation_deg: Some(orientation_deg),
+            });
+        }
+        match self.session.apply_batch(self.player_author.clone(), ops) {
+            Ok(_) => {
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Add a twin-towered gatehouse and return the rebuilt scene.
+    #[func]
+    fn add_gatehouse(&mut self, center_xz: Vector2, orientation_deg: i32) -> VarDictionary {
+        let op = CommandOp::CreateGatehouse {
+            ref_id: None,
+            name: format!("Gatehouse {}", self.session.next_element_id()),
+            centre_mm: quantise_xz(center_xz),
+            orientation_deg: Some(orientation_deg),
+            passage_width_mm: None,
+            height_mm: None,
+            tower_radius_mm: None,
+        };
+        match self
+            .session
+            .apply_batch(self.player_author.clone(), vec![op])
+        {
+            Ok(_) => {
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Carve a linear ditch and return the rebuilt scene.
+    #[func]
+    fn add_ditch(
+        &mut self,
+        start_xz: Vector2,
+        end_xz: Vector2,
+        width_m: f32,
+        depth_m: f32,
+    ) -> VarDictionary {
+        let op = CommandOp::CreateDitch {
+            ref_id: None,
+            name: format!("Ditch {}", self.session.next_element_id()),
+            start_mm: quantise_xz(start_xz),
+            end_mm: quantise_xz(end_xz),
+            width_mm: quantise_m(width_m),
+            depth_mm: quantise_m(depth_m),
+        };
+        match self
+            .session
+            .apply_batch(self.player_author.clone(), vec![op])
+        {
+            Ok(_) => {
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Assess the current castle against the Edwardian Welsh style pack.
+    #[func]
+    fn get_assessment(&self) -> VarDictionary {
+        assessment_dictionary(self.session.document(), self.session.terrain())
+    }
+
+    /// Apply a suggested fix (serialised `CommandOp` JSON) as a normal batch.
+    #[func]
+    fn apply_fix_json(&mut self, fix_json: GString) -> VarDictionary {
+        let op = match command_op_from_json(&fix_json.to_string()) {
+            Ok(op) => op,
+            Err(message) => {
+                let mut result = VarDictionary::new();
+                result.set("ok", false);
+                result.set("error", &GString::from(&message));
+                return result;
+            }
+        };
+        match self
+            .session
+            .apply_batch(self.player_author.clone(), vec![op])
+        {
+            Ok(_) => {
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
     /// Compensate the most recent local batch. History is append-only: the undo
     /// is itself a command and never truncates the log.
     #[func]
@@ -271,6 +455,7 @@ impl KeepBridge {
             self.session.document(),
             self.session.terrain(),
             self.session.document().document_hash(),
+            self.session.site_id(),
         );
         result.set("history_len", self.session.history().len() as i64);
         result
@@ -323,6 +508,7 @@ fn scene_to_dictionary(
     document: &CastleDocument,
     terrain: &SiteTerrain,
     document_hash: u64,
+    site_id: &str,
 ) -> VarDictionary {
     let mut result = VarDictionary::new();
 
@@ -348,6 +534,8 @@ fn scene_to_dictionary(
     }
     result.set("chunks", &chunks);
     result.set("elements", &elements_array(document, terrain));
+    result.set("site_id", &GString::from(site_id));
+    result.set("assessment", &assessment_dictionary(document, terrain));
     result.set("block_count", scene.block_count as i64);
     result.set("chunk_count", scene.chunks.len() as i64);
     result.set("triangle_count", scene.triangle_count as i64);
@@ -396,9 +584,82 @@ fn elements_array(document: &CastleDocument, terrain: &SiteTerrain) -> Array<Var
                 entry.set("height", t.height_mm as f32 / 1000.0);
                 elements.push(&entry);
             }
+            Element::Gatehouse(gatehouse) => {
+                // Export the two flanking drums as ordinary tower footprints so
+                // scaffolding wraps the gatehouse exactly like a standalone tower.
+                let radius = gatehouse.tower_radius_mm as f32 / 1000.0;
+                let height = gatehouse.height_mm as f32 / 1000.0;
+                for centre in gatehouse.flank_tower_centres() {
+                    let cx = centre[0] as f32 / 1000.0;
+                    let cz = centre[1] as f32 / 1000.0;
+                    let mut entry = VarDictionary::new();
+                    let kind = GString::from("tower");
+                    entry.set("kind", &kind);
+                    entry.set("center", Vector2::new(cx, cz));
+                    entry.set("radius", radius);
+                    entry.set("base_y", terrain.height_m(cx, cz));
+                    entry.set("height", height);
+                    elements.push(&entry);
+                }
+            }
+            Element::Ditch(_) => {}
         }
     }
     elements
+}
+
+/// Structural assessment in the shape the HUD expects.
+fn assessment_dictionary(document: &CastleDocument, terrain: &SiteTerrain) -> VarDictionary {
+    let report = validate_structure(document, terrain, &StylePack::edwardian_welsh());
+    let mut findings: Array<VarDictionary> = Array::new();
+    for finding in &report.findings {
+        let mut entry = VarDictionary::new();
+        entry.set("severity", &severity_key(finding.severity));
+        entry.set("code", &GString::from(&finding.code));
+        entry.set("element_id", finding.element_id as i64);
+        entry.set("message", &GString::from(&finding.message));
+        entry.set("source_note", &GString::from(&finding.source_note));
+        entry.set("has_fix", finding.suggested_fix.is_some());
+        let fix_json = finding
+            .suggested_fix
+            .as_ref()
+            .map(command_op_to_json)
+            .unwrap_or_default();
+        entry.set("fix_json", &GString::from(&fix_json));
+        findings.push(&entry);
+    }
+    let mut result = VarDictionary::new();
+    result.set("score", i64::from(report.score));
+    result.set("passed", report.passed);
+    result.set("findings", &findings);
+    result
+}
+
+fn severity_key(severity: Severity) -> GString {
+    GString::from(match severity {
+        Severity::Info => "info",
+        Severity::Warning => "warning",
+        Severity::Error => "error",
+    })
+}
+
+fn tower_plan_from_key(key: &str) -> TowerPlan {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "square" => TowerPlan::Square,
+        "d_shaped" | "d-shaped" | "dshaped" => TowerPlan::DShaped,
+        _ => TowerPlan::Round,
+    }
+}
+
+/// Serialise a [`CommandOp`] to compact JSON for Godot callers.
+fn command_op_to_json(op: &CommandOp) -> String {
+    serde_json::to_string(op).unwrap_or_default()
+}
+
+/// Parse a serialised [`CommandOp`] (the JSON stored in a finding's
+/// `fix_json`).
+fn command_op_from_json(text: &str) -> Result<CommandOp, String> {
+    serde_json::from_str::<CommandOp>(text).map_err(|error| format!("invalid command op: {error}"))
 }
 
 fn terrain_mesh(data: &TerrainMeshData) -> Gd<ArrayMesh> {

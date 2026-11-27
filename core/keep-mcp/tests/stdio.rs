@@ -131,7 +131,10 @@ fn offline_binary_completes_a_full_mcp_session() {
     }
 
     assert_eq!(responses[0]["result"]["serverInfo"]["name"], "keep-mcp");
-    assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(
+        responses[1]["result"]["tools"].as_array().unwrap().len(),
+        10
+    );
 
     let castle = &responses[2]["result"]["structuredContent"];
     assert_eq!(castle["element_count"], 3);
@@ -179,6 +182,117 @@ fn empty_flag_starts_from_an_empty_document() {
     assert_eq!(response["result"]["structuredContent"]["element_count"], 0);
     assert!(lines.next().is_none());
     assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn m1_flag_starts_the_edwardian_showcase_on_the_coastal_headland() {
+    let mut child = spawn(&["--offline", "--m1"]);
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "get_castle", "arguments": {} }
+        }),
+    );
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "get_site", "arguments": {} }
+        }),
+    );
+    drop(child.stdin.take());
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let responses: Vec<Value> = BufReader::new(stdout)
+        .lines()
+        .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+        .collect();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(responses.len(), 2, "responses: {responses:#?}");
+
+    let castle = &responses[0]["result"]["structuredContent"];
+    assert_eq!(castle["element_count"], 7);
+    assert_eq!(castle["opening_count"], 3);
+    let kinds: Vec<&str> = castle["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|element| element["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"gatehouse"));
+    assert!(kinds.contains(&"ditch"));
+
+    let site = &responses[1]["result"]["structuredContent"];
+    assert_eq!(site["site"]["id"], "coastal_headland");
+}
+
+#[test]
+fn site_flag_starts_empty_on_a_curated_site() {
+    let mut child = spawn(&["--offline", "--site", "lake_island"]);
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "get_castle", "arguments": {} }
+        }),
+    );
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "get_site", "arguments": {} }
+        }),
+    );
+    drop(child.stdin.take());
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let responses: Vec<Value> = BufReader::new(stdout)
+        .lines()
+        .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+        .collect();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(responses.len(), 2, "responses: {responses:#?}");
+
+    let castle = &responses[0]["result"]["structuredContent"];
+    assert_eq!(castle["element_count"], 0);
+    assert_eq!(castle["opening_count"], 0);
+
+    let site = &responses[1]["result"]["structuredContent"];
+    assert_eq!(site["site"]["id"], "lake_island");
+    assert_eq!(site["available_sites"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn unknown_site_exits_with_code_two() {
+    for site in ["not_a_site", ""] {
+        let status = Command::new(env!("CARGO_BIN_EXE_keep-mcp"))
+            .args(["--offline", "--site", site])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("binary runs");
+        assert_eq!(status.code(), Some(2), "site {site:?}");
+    }
+}
+
+#[test]
+fn missing_site_value_exits_with_code_two() {
+    let status = Command::new(env!("CARGO_BIN_EXE_keep-mcp"))
+        .arg("--site")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("binary runs");
+    assert_eq!(status.code(), Some(2));
 }
 
 #[test]

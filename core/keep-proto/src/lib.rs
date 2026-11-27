@@ -21,13 +21,24 @@ use serde::{Deserialize, Serialize};
 pub use keep_core::command::{
     sanitize_name, sanitize_ref_id, validate_batch, validate_element_budget,
     CommandError as ProtoError, CommandOp as Operation, MAX_BATCH_OPS, MAX_BATTER_MM, MAX_COORD_MM,
-    MAX_DOCUMENT_ELEMENTS, MAX_INNER_SPLAY_WIDTH_MM, MAX_LOOP_HEIGHT_MM, MAX_LOOP_SILL_HEIGHT_MM,
-    MAX_LOOP_T_PERMILLE, MAX_NAME_CHARS, MAX_OUTER_SLIT_MM, MAX_REF_ID_CHARS, MAX_TOWER_HEIGHT_MM,
-    MAX_TOWER_RADIUS_MM, MAX_WALL_HEIGHT_MM, MAX_WALL_LENGTH_MM, MAX_WALL_THICKNESS_MM,
-    MIN_COORD_MM, MIN_INNER_SPLAY_WIDTH_MM, MIN_LOOP_HEIGHT_MM, MIN_LOOP_T_PERMILLE,
-    MIN_OUTER_SLIT_MM, MIN_TOWER_HEIGHT_MM, MIN_TOWER_RADIUS_MM, MIN_WALL_HEIGHT_MM,
-    MIN_WALL_LENGTH_MM, MIN_WALL_THICKNESS_MM,
+    MAX_DITCH_DEPTH_MM, MAX_DITCH_LENGTH_MM, MAX_DITCH_WIDTH_MM, MAX_DOCUMENT_ELEMENTS,
+    MAX_GATEHOUSE_DEPTH_MM, MAX_GATEHOUSE_HEIGHT_MM, MAX_GATEHOUSE_TOWER_RADIUS_MM,
+    MAX_INNER_SPLAY_WIDTH_MM, MAX_LOOP_HEIGHT_MM, MAX_LOOP_SILL_HEIGHT_MM, MAX_LOOP_T_PERMILLE,
+    MAX_NAME_CHARS, MAX_ORIENTATION_DEG, MAX_OUTER_SLIT_MM, MAX_PASSAGE_HEIGHT_MM,
+    MAX_PASSAGE_WIDTH_MM, MAX_REF_ID_CHARS, MAX_TOWER_HEIGHT_MM, MAX_TOWER_RADIUS_MM,
+    MAX_WALL_HEIGHT_MM, MAX_WALL_LENGTH_MM, MAX_WALL_THICKNESS_MM, MIN_COORD_MM,
+    MIN_DITCH_DEPTH_MM, MIN_DITCH_LENGTH_MM, MIN_DITCH_WIDTH_MM, MIN_GATEHOUSE_DEPTH_MM,
+    MIN_GATEHOUSE_HEIGHT_MM, MIN_GATEHOUSE_TOWER_RADIUS_MM, MIN_INNER_SPLAY_WIDTH_MM,
+    MIN_LOOP_HEIGHT_MM, MIN_LOOP_T_PERMILLE, MIN_ORIENTATION_DEG, MIN_OUTER_SLIT_MM,
+    MIN_PASSAGE_HEIGHT_MM, MIN_PASSAGE_WIDTH_MM, MIN_TOWER_HEIGHT_MM, MIN_TOWER_RADIUS_MM,
+    MIN_WALL_HEIGHT_MM, MIN_WALL_LENGTH_MM, MIN_WALL_THICKNESS_MM,
 };
+// The structural assessment, style packs and curated sites are the same types
+// the core and the game host use, so the wire protocol never carries a drifting
+// copy of the validation vocabulary (architecture sections 6.1 and 7.6).
+pub use keep_core::style::StylePack;
+pub use keep_core::terrain::SiteInfo;
+pub use keep_core::validate::{AssessmentReport, Finding as AssessmentFinding, Severity};
 
 /// Default view used by `render_plan` when no view is supplied.
 pub const DEFAULT_PLAN_VIEW: &str = "top_plan";
@@ -85,11 +96,55 @@ pub struct GetHistoryResponse {
     pub entries: Vec<HistoryEntry>,
 }
 
+/// Structural assessment of the current castle against one style pack.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssessmentResponse {
+    /// 0..=100; errors cost more than warnings.
+    pub score: u32,
+    /// True when there are no [`Severity::Error`] findings.
+    pub passed: bool,
+    /// Id of the style pack the document was judged against.
+    pub style_id: String,
+    pub findings: Vec<AssessmentFinding>,
+}
+
+impl AssessmentResponse {
+    /// Wrap a core [`AssessmentReport`] together with the style id that
+    /// produced it.
+    pub fn new(style_id: impl Into<String>, report: AssessmentReport) -> Self {
+        Self {
+            score: report.score,
+            passed: report.passed,
+            style_id: style_id.into(),
+            findings: report.findings,
+        }
+    }
+}
+
+/// Result of the `list_styles` tool.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ListStylesResponse {
+    pub styles: Vec<StylePack>,
+}
+
+/// Result of the `get_style` tool.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GetStyleResponse {
+    pub style: StylePack,
+}
+
+/// Result of the `get_site` tool: the active site plus every curated site.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GetSiteResponse {
+    pub site: SiteInfo,
+    pub available_sites: Vec<SiteInfo>,
+}
+
 /// Compact description of one element.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElementSummary {
     pub id: u64,
-    /// `"wall"` or `"tower"`.
+    /// `"wall"`, `"tower"`, `"gatehouse"` or `"ditch"`.
     pub kind: String,
     pub name: String,
     pub height_mm: i64,
@@ -104,6 +159,21 @@ pub struct ElementSummary {
     pub radius_mm: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length_mm: Option<i64>,
+    /// Tower footprint: `"round"`, `"square"` or `"d_shaped"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// Plan rotation of a shaped tower or gatehouse, degrees clockwise from +X.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation_deg: Option<i32>,
+    /// Clear passage width through a gatehouse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passage_width_mm: Option<i64>,
+    /// Clear passage height through a gatehouse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passage_height_mm: Option<i64>,
+    /// Depth of a ditch or gatehouse block along its axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_mm: Option<i64>,
 }
 
 /// Compact description of one opening.
@@ -187,7 +257,7 @@ fn element_summary_schema() -> serde_json::Value {
         "type": "object",
         "properties": {
             "id": { "type": "integer", "minimum": 0 },
-            "kind": { "type": "string", "enum": ["wall", "tower"] },
+            "kind": { "type": "string", "enum": ["wall", "tower", "gatehouse", "ditch"] },
             "name": { "type": "string" },
             "height_mm": { "type": "integer" },
             "thickness_mm": { "type": "integer" },
@@ -195,7 +265,12 @@ fn element_summary_schema() -> serde_json::Value {
             "end_mm": int_pair_schema(),
             "centre_mm": int_pair_schema(),
             "radius_mm": { "type": "integer", "minimum": MIN_TOWER_RADIUS_MM, "maximum": MAX_TOWER_RADIUS_MM },
-            "length_mm": { "type": "integer" }
+            "length_mm": { "type": "integer" },
+            "plan": { "type": "string", "enum": ["round", "square", "d_shaped"] },
+            "orientation_deg": { "type": "integer" },
+            "passage_width_mm": { "type": "integer" },
+            "passage_height_mm": { "type": "integer" },
+            "depth_mm": { "type": "integer" }
         },
         "required": ["id", "kind", "name", "height_mm", "thickness_mm"]
     })
@@ -355,6 +430,122 @@ fn get_history_schema() -> serde_json::Value {
     })
 }
 
+fn style_pack_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string" },
+            "period": { "type": "string" },
+            "region": { "type": "string" },
+            "course_height_mm": { "type": "integer", "minimum": 0 },
+            "min_wall_thickness_mm": { "type": "integer", "minimum": 0 },
+            "default_wall_thickness_mm": { "type": "integer", "minimum": 0 },
+            "max_slenderness_ratio": { "type": "number", "minimum": 0 },
+            "default_batter_mm": { "type": "integer", "minimum": 0 },
+            "default_plinth_height_mm": { "type": "integer", "minimum": 0 },
+            "flanking_spacing_min_m": { "type": "number", "minimum": 0 },
+            "flanking_spacing_max_m": { "type": "number", "minimum": 0 },
+            "source_notes": {
+                "type": "array",
+                "items": { "type": "string" }
+            }
+        },
+        "required": [
+            "id", "name", "period", "region", "course_height_mm",
+            "min_wall_thickness_mm", "default_wall_thickness_mm",
+            "max_slenderness_ratio", "default_batter_mm",
+            "default_plinth_height_mm", "flanking_spacing_min_m",
+            "flanking_spacing_max_m", "source_notes"
+        ]
+    })
+}
+
+fn site_info_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string" },
+            "description": { "type": "string" },
+            "latitude_deg": { "type": "number" },
+            "landforms": {
+                "type": "array",
+                "items": { "type": "string" }
+            }
+        },
+        "required": ["id", "name", "description", "latitude_deg", "landforms"]
+    })
+}
+
+fn assessment_finding_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "element_id": { "type": "integer", "minimum": 0 },
+            "severity": { "type": "string", "enum": ["info", "warning", "error"] },
+            "code": { "type": "string" },
+            "message": { "type": "string" },
+            "source_note": { "type": "string" },
+            "suggested_fix": operation_schema()
+        },
+        "required": ["element_id", "severity", "code", "message", "source_note"]
+    })
+}
+
+fn assessment_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "passed": { "type": "boolean" },
+            "style_id": { "type": "string" },
+            "findings": {
+                "type": "array",
+                "items": assessment_finding_schema()
+            }
+        },
+        "required": ["score", "passed", "style_id", "findings"]
+    })
+}
+
+fn list_styles_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "styles": {
+                "type": "array",
+                "items": style_pack_schema()
+            }
+        },
+        "required": ["styles"]
+    })
+}
+
+fn get_style_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "style": style_pack_schema()
+        },
+        "required": ["style"]
+    })
+}
+
+fn get_site_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "site": site_info_schema(),
+            "available_sites": {
+                "type": "array",
+                "items": site_info_schema()
+            }
+        },
+        "required": ["site", "available_sites"]
+    })
+}
+
 fn operation_schema() -> serde_json::Value {
     let ref_id = serde_json::json!({
         "type": "string",
@@ -418,6 +609,50 @@ fn operation_schema() -> serde_json::Value {
                 "properties": {
                     "op": { "const": "delete_element" },
                     "id": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["op", "id"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "op": { "const": "create_gatehouse" },
+                    "ref_id": ref_id,
+                    "name": { "type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS },
+                    "centre_mm": int_pair_schema(),
+                    "orientation_deg": { "type": "integer", "minimum": MIN_ORIENTATION_DEG, "maximum": MAX_ORIENTATION_DEG, "default": 0 },
+                    "passage_width_mm": { "type": "integer", "minimum": MIN_PASSAGE_WIDTH_MM, "maximum": MAX_PASSAGE_WIDTH_MM, "default": 3_200 },
+                    "height_mm": { "type": "integer", "minimum": MIN_GATEHOUSE_HEIGHT_MM, "maximum": MAX_GATEHOUSE_HEIGHT_MM, "default": 14_000 },
+                    "tower_radius_mm": { "type": "integer", "minimum": MIN_GATEHOUSE_TOWER_RADIUS_MM, "maximum": MAX_GATEHOUSE_TOWER_RADIUS_MM, "default": 3_400 }
+                },
+                "required": ["op", "name", "centre_mm"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "op": { "const": "create_ditch" },
+                    "ref_id": ref_id,
+                    "name": { "type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS },
+                    "start_mm": int_pair_schema(),
+                    "end_mm": int_pair_schema(),
+                    "width_mm": { "type": "integer", "minimum": MIN_DITCH_WIDTH_MM, "maximum": MAX_DITCH_WIDTH_MM },
+                    "depth_mm": { "type": "integer", "minimum": MIN_DITCH_DEPTH_MM, "maximum": MAX_DITCH_DEPTH_MM }
+                },
+                "required": ["op", "name", "start_mm", "end_mm", "width_mm", "depth_mm"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "op": { "const": "modify_element" },
+                    "id": { "type": "integer", "minimum": 0 },
+                    "height_mm": { "type": "integer", "minimum": MIN_WALL_HEIGHT_MM, "maximum": MAX_WALL_HEIGHT_MM },
+                    "thickness_mm": { "type": "integer", "minimum": MIN_WALL_THICKNESS_MM, "maximum": MAX_WALL_THICKNESS_MM },
+                    "batter_mm": { "type": "integer", "minimum": 0, "maximum": MAX_BATTER_MM },
+                    "plinth_height_mm": { "type": "integer", "minimum": 0, "maximum": MAX_WALL_HEIGHT_MM },
+                    "plan": { "type": "string", "enum": ["round", "square", "d_shaped"] },
+                    "orientation_deg": { "type": "integer", "minimum": MIN_ORIENTATION_DEG, "maximum": MAX_ORIENTATION_DEG }
                 },
                 "required": ["op", "id"],
                 "additionalProperties": false
@@ -534,6 +769,73 @@ pub fn tool_definitions() -> serde_json::Value {
                 "additionalProperties": false
             },
             "outputSchema": get_history_schema(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "get_assessment",
+            "description": "Assess the castle against the Edwardian Welsh style: slenderness, footings and openings, with plain-language findings and one-click suggested fixes. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "outputSchema": assessment_schema(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "list_styles",
+            "description": "List every curated architectural style pack compiled into this build. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "outputSchema": list_styles_schema(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "get_style",
+            "description": "Read one architectural style pack by id, including its dimensions, rules and source notes. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "minLength": 1 }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            },
+            "outputSchema": get_style_schema(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "get_site",
+            "description": "Read the active site and every curated site with its name, description, latitude and landforms. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "outputSchema": get_site_schema(),
             "annotations": {
                 "readOnlyHint": true,
                 "destructiveHint": false,
@@ -910,7 +1212,11 @@ mod tests {
                 "render_plan",
                 "apply_operations",
                 "undo",
-                "get_history"
+                "get_history",
+                "get_assessment",
+                "list_styles",
+                "get_style",
+                "get_site"
             ]
         );
         for tool in tools {
@@ -994,6 +1300,97 @@ mod tests {
             MAX_INNER_SPLAY_WIDTH_MM
         );
 
+        // M1 writes are documented with the same bounds the command engine
+        // enforces, so a host can validate before it ever sends a batch.
+        let one_of = apply["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
+            .as_array()
+            .unwrap();
+        let op_schema = |op: &str| {
+            one_of
+                .iter()
+                .find(|entry| entry["properties"]["op"]["const"] == op)
+                .unwrap_or_else(|| panic!("missing {op} schema"))
+        };
+
+        let gatehouse = op_schema("create_gatehouse");
+        assert_eq!(
+            gatehouse["properties"]["passage_width_mm"]["minimum"],
+            MIN_PASSAGE_WIDTH_MM
+        );
+        assert_eq!(
+            gatehouse["properties"]["passage_width_mm"]["maximum"],
+            MAX_PASSAGE_WIDTH_MM
+        );
+        assert_eq!(
+            gatehouse["properties"]["height_mm"]["minimum"],
+            MIN_GATEHOUSE_HEIGHT_MM
+        );
+        assert_eq!(
+            gatehouse["properties"]["height_mm"]["maximum"],
+            MAX_GATEHOUSE_HEIGHT_MM
+        );
+        assert_eq!(
+            gatehouse["properties"]["tower_radius_mm"]["minimum"],
+            MIN_GATEHOUSE_TOWER_RADIUS_MM
+        );
+        assert_eq!(
+            gatehouse["properties"]["tower_radius_mm"]["maximum"],
+            MAX_GATEHOUSE_TOWER_RADIUS_MM
+        );
+        assert_eq!(
+            gatehouse["properties"]["orientation_deg"]["minimum"],
+            MIN_ORIENTATION_DEG
+        );
+
+        let ditch = op_schema("create_ditch");
+        assert_eq!(
+            ditch["properties"]["width_mm"]["minimum"],
+            MIN_DITCH_WIDTH_MM
+        );
+        assert_eq!(
+            ditch["properties"]["width_mm"]["maximum"],
+            MAX_DITCH_WIDTH_MM
+        );
+        assert_eq!(
+            ditch["properties"]["depth_mm"]["minimum"],
+            MIN_DITCH_DEPTH_MM
+        );
+        assert_eq!(
+            ditch["properties"]["depth_mm"]["maximum"],
+            MAX_DITCH_DEPTH_MM
+        );
+        assert_eq!(ditch["properties"]["start_mm"]["minItems"], 2);
+
+        let modify = op_schema("modify_element");
+        assert_eq!(
+            modify["properties"]["height_mm"]["minimum"],
+            MIN_WALL_HEIGHT_MM
+        );
+        assert_eq!(
+            modify["properties"]["thickness_mm"]["maximum"],
+            MAX_WALL_THICKNESS_MM
+        );
+        assert_eq!(modify["properties"]["batter_mm"]["maximum"], MAX_BATTER_MM);
+        assert_eq!(
+            modify["properties"]["orientation_deg"]["maximum"],
+            MAX_ORIENTATION_DEG
+        );
+        assert_eq!(modify["required"], json!(["op", "id"]));
+        assert_eq!(modify["additionalProperties"], false);
+
+        // Assessment and style reads are pure reads, so hosts may auto-approve.
+        for tool in tools.iter().skip(6) {
+            assert_eq!(tool["annotations"]["readOnlyHint"], true);
+            assert_eq!(tool["annotations"]["destructiveHint"], false);
+            assert_eq!(tool["annotations"]["idempotentHint"], true);
+        }
+        assert_eq!(
+            tools[6]["outputSchema"]["properties"]["findings"]["items"]["properties"]["severity"]
+                ["enum"],
+            json!(["info", "warning", "error"])
+        );
+        assert_eq!(tools[8]["inputSchema"]["required"], json!(["id"]));
+
         // Round-trip every tool definition through JSON to make sure it is
         // actually serialisable and stable.
         let text = serde_json::to_string(&tool_definitions()).unwrap();
@@ -1063,6 +1460,78 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<GetHistoryResponse>(value).unwrap(),
             history
+        );
+    }
+
+    #[test]
+    fn assessment_style_and_site_responses_serialise() {
+        let style = StylePack::edwardian_welsh();
+        let report = AssessmentReport {
+            findings: vec![AssessmentFinding {
+                element_id: 7,
+                severity: Severity::Error,
+                code: "wall_too_slender".into(),
+                message: "Too thin".into(),
+                source_note: style.primary_source_note().into(),
+                suggested_fix: Some(Operation::ModifyElement {
+                    id: 7,
+                    height_mm: None,
+                    thickness_mm: Some(2_667),
+                    batter_mm: None,
+                    plinth_height_mm: None,
+                    plan: None,
+                    orientation_deg: None,
+                }),
+            }],
+            score: 75,
+            passed: false,
+        };
+        let assessment = AssessmentResponse::new(style.id.clone(), report);
+        let value = serde_json::to_value(&assessment).unwrap();
+        assert_eq!(value["style_id"], "edwardian_welsh");
+        assert_eq!(value["score"], 75);
+        assert_eq!(value["findings"][0]["severity"], "error");
+        assert_eq!(
+            value["findings"][0]["suggested_fix"]["op"],
+            "modify_element"
+        );
+        assert_eq!(value["findings"][0]["suggested_fix"]["thickness_mm"], 2_667);
+        assert_eq!(
+            serde_json::from_value::<AssessmentResponse>(value).unwrap(),
+            assessment
+        );
+
+        let styles = ListStylesResponse {
+            styles: StylePack::list(),
+        };
+        let value = serde_json::to_value(&styles).unwrap();
+        assert_eq!(value["styles"][0]["id"], "edwardian_welsh");
+        assert_eq!(
+            serde_json::from_value::<ListStylesResponse>(value).unwrap(),
+            styles
+        );
+
+        let get_style = GetStyleResponse {
+            style: style.clone(),
+        };
+        let value = serde_json::to_value(&get_style).unwrap();
+        assert_eq!(value["style"]["name"], style.name);
+        assert_eq!(
+            serde_json::from_value::<GetStyleResponse>(value).unwrap(),
+            get_style
+        );
+
+        let available_sites = keep_core::terrain::SiteTerrain::list_sites();
+        let get_site = GetSiteResponse {
+            site: available_sites[0].clone(),
+            available_sites,
+        };
+        let value = serde_json::to_value(&get_site).unwrap();
+        assert_eq!(value["site"]["id"], "m0a_promontory");
+        assert_eq!(value["available_sites"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            serde_json::from_value::<GetSiteResponse>(value).unwrap(),
+            get_site
         );
     }
 }

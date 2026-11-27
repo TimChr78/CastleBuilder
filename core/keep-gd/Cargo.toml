@@ -12,3 +12,4 @@ crate-type = ["cdylib"]
 [dependencies]
 godot = { version = "=0.5.6", features = ["api-4-7"] }
 keep-core = { path = "../keep-core" }
+serde_json = "1"

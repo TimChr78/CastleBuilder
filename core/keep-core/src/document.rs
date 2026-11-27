@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::{
     check_dimension, sanitize_name, validate_element_budget, CommandError, CommandOp,
+    MAX_GATEHOUSE_DEPTH_MM, MIN_GATEHOUSE_DEPTH_MM, MIN_GATEHOUSE_HEIGHT_MM, MIN_PASSAGE_HEIGHT_MM,
+    MIN_WALL_THICKNESS_MM,
 };
 use crate::fnv1a_64;
 
@@ -26,6 +28,21 @@ pub type ElementId = u64;
 pub enum ElementKind {
     BatteredWall,
     RoundTower,
+    Gatehouse,
+    Ditch,
+}
+
+/// Plan shape of a tower footprint. Defaults to [`TowerPlan::Round`] so saves
+/// and callers written before shaped towers existed continue to load.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TowerPlan {
+    #[default]
+    Round,
+    Square,
+    DShaped,
 }
 
 /// A straight curtain-wall run with vertical batter and a projecting plinth.
@@ -101,6 +118,12 @@ pub struct RoundTower {
     pub plinth_height_mm: i64,
     pub plinth_projection_mm: i64,
     pub course_height_mm: i64,
+    /// Round, square or D-shaped footprint.
+    #[serde(default)]
+    pub plan: TowerPlan,
+    /// Plan rotation of a shaped tower, in degrees clockwise from +X.
+    #[serde(default)]
+    pub orientation_deg: i32,
     pub seed: u64,
 }
 
@@ -123,8 +146,17 @@ impl RoundTower {
             plinth_height_mm: 1_200,
             plinth_projection_mm: 350,
             course_height_mm: 450,
+            plan: TowerPlan::Round,
+            orientation_deg: 0,
             seed: CASTLE_SEED ^ id.rotate_left(29),
         }
+    }
+
+    /// A tower with an explicit plan and orientation.
+    pub fn with_plan(mut self, plan: TowerPlan, orientation_deg: i32) -> Self {
+        self.plan = plan;
+        self.orientation_deg = orientation_deg;
+        self
     }
 }
 
@@ -231,11 +263,168 @@ impl Opening {
     }
 }
 
+/// A simple Edwardian gatehouse: a clear passage between two flanking drum
+/// towers, with a masonry block bridging above the passage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gatehouse {
+    pub id: ElementId,
+    pub name: String,
+    /// Centre of the passage on the plan, `[x, z]` millimetres.
+    pub centre_mm: [i64; 2],
+    /// Direction of the passage, in degrees clockwise from +X.
+    #[serde(default)]
+    pub orientation_deg: i32,
+    #[serde(default = "default_passage_width_mm")]
+    pub passage_width_mm: i64,
+    #[serde(default = "default_passage_height_mm")]
+    pub passage_height_mm: i64,
+    #[serde(default = "default_gatehouse_depth_mm")]
+    pub depth_mm: i64,
+    #[serde(default = "default_gatehouse_height_mm")]
+    pub height_mm: i64,
+    #[serde(default = "default_gatehouse_tower_radius_mm")]
+    pub tower_radius_mm: i64,
+    pub seed: u64,
+}
+
+const fn default_passage_width_mm() -> i64 {
+    3_200
+}
+const fn default_passage_height_mm() -> i64 {
+    4_200
+}
+const fn default_gatehouse_depth_mm() -> i64 {
+    8_000
+}
+const fn default_gatehouse_height_mm() -> i64 {
+    14_000
+}
+const fn default_gatehouse_tower_radius_mm() -> i64 {
+    3_400
+}
+
+impl Gatehouse {
+    pub fn new(
+        id: ElementId,
+        name: impl Into<String>,
+        centre_mm: [i64; 2],
+        orientation_deg: i32,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            centre_mm,
+            orientation_deg,
+            passage_width_mm: default_passage_width_mm(),
+            passage_height_mm: default_passage_height_mm(),
+            depth_mm: default_gatehouse_depth_mm(),
+            height_mm: default_gatehouse_height_mm(),
+            tower_radius_mm: default_gatehouse_tower_radius_mm(),
+            seed: CASTLE_SEED ^ id.rotate_left(41),
+        }
+    }
+
+    /// Unit passage direction `[x, z]`.
+    pub fn direction(&self) -> [f64; 2] {
+        let angle = self.orientation_deg as f64 * std::f64::consts::PI / 180.0;
+        [libm::cos(angle), libm::sin(angle)]
+    }
+
+    /// Centres of the two flanking towers, left then right of the passage.
+    ///
+    /// The offset includes the plinth projection, so the *ground-level* inner
+    /// faces (which project outward by the plinth) stay clear of the passage
+    /// rather than eating into it.
+    pub fn flank_tower_centres(&self) -> [[i64; 2]; 2] {
+        let dir = self.direction();
+        let right = [-dir[1], dir[0]];
+        let offset = (self.passage_width_mm / 2 + self.tower_radius_mm + 100 + 300) as f64;
+        let mut centres = [[0i64; 2]; 2];
+        for (index, sign) in [-1.0f64, 1.0].into_iter().enumerate() {
+            let x = self.centre_mm[0] as f64 + right[0] * offset * sign;
+            let z = self.centre_mm[1] as f64 + right[1] * offset * sign;
+            centres[index] = [libm::round(x) as i64, libm::round(z) as i64];
+        }
+        centres
+    }
+
+    /// The two flanking towers as ordinary round-tower masses. They share the
+    /// gatehouse id so their stones belong to this element, but get distinct
+    /// seeds so their joint jitter does not mirror.
+    pub fn flank_towers(&self) -> [RoundTower; 2] {
+        let centres = self.flank_tower_centres();
+        let build = |centre: [i64; 2], index: usize| {
+            let mut tower = RoundTower::new(
+                self.id,
+                format!("{} tower", self.name),
+                centre,
+                self.tower_radius_mm,
+                self.height_mm,
+            );
+            tower.thickness_mm = (self.tower_radius_mm * 34 / 100).clamp(900, 1_600);
+            tower.batter_mm = 400;
+            tower.plinth_height_mm = 900;
+            tower.plinth_projection_mm = 300;
+            tower.course_height_mm = 450;
+            tower.seed = self.seed ^ (index as u64 + 1);
+            tower
+        };
+        [build(centres[0], 0), build(centres[1], 1)]
+    }
+}
+
+/// A linear ditch carved into the terrain as an earthwork. No stone blocks are
+/// emitted for a ditch; it is rendered by the terrain heightfield.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ditch {
+    pub id: ElementId,
+    pub name: String,
+    pub start_mm: [i64; 2],
+    pub end_mm: [i64; 2],
+    pub width_mm: i64,
+    pub depth_mm: i64,
+}
+
+impl Ditch {
+    pub fn new(
+        id: ElementId,
+        name: impl Into<String>,
+        start_mm: [i64; 2],
+        end_mm: [i64; 2],
+        width_mm: i64,
+        depth_mm: i64,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            start_mm,
+            end_mm,
+            width_mm,
+            depth_mm,
+        }
+    }
+
+    /// Plan length of the ditch centreline, in millimetres.
+    pub fn length_mm(&self) -> i64 {
+        let dx = self.end_mm[0] as i128 - self.start_mm[0] as i128;
+        let dz = self.end_mm[1] as i128 - self.start_mm[1] as i128;
+        let squared = dx.saturating_mul(dx).saturating_add(dz.saturating_mul(dz));
+        let length = libm::sqrt(squared as f64);
+        if !length.is_finite() || length >= i64::MAX as f64 {
+            i64::MAX
+        } else {
+            libm::round(length) as i64
+        }
+    }
+}
+
 /// One architectural element.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Element {
     BatteredWall(BatteredWall),
     RoundTower(RoundTower),
+    Gatehouse(Gatehouse),
+    Ditch(Ditch),
 }
 
 impl Element {
@@ -243,6 +432,8 @@ impl Element {
         match self {
             Self::BatteredWall(w) => w.id,
             Self::RoundTower(t) => t.id,
+            Self::Gatehouse(g) => g.id,
+            Self::Ditch(d) => d.id,
         }
     }
 
@@ -250,6 +441,8 @@ impl Element {
         match self {
             Self::BatteredWall(w) => &w.name,
             Self::RoundTower(t) => &t.name,
+            Self::Gatehouse(g) => &g.name,
+            Self::Ditch(d) => &d.name,
         }
     }
 
@@ -257,6 +450,8 @@ impl Element {
         match self {
             Self::BatteredWall(_) => ElementKind::BatteredWall,
             Self::RoundTower(_) => ElementKind::RoundTower,
+            Self::Gatehouse(_) => ElementKind::Gatehouse,
+            Self::Ditch(_) => ElementKind::Ditch,
         }
     }
 }
@@ -290,6 +485,34 @@ impl CastleDocument {
         let id = tower.id;
         self.insert(Element::RoundTower(tower));
         id
+    }
+
+    pub fn add_gatehouse(&mut self, gatehouse: Gatehouse) -> ElementId {
+        let id = gatehouse.id;
+        self.insert(Element::Gatehouse(gatehouse));
+        id
+    }
+
+    pub fn add_ditch(&mut self, ditch: Ditch) -> ElementId {
+        let id = ditch.id;
+        self.insert(Element::Ditch(ditch));
+        id
+    }
+
+    /// Every ditch in stable id order.
+    pub fn ditches(&self) -> impl Iterator<Item = &Ditch> {
+        self.elements.values().filter_map(|element| match element {
+            Element::Ditch(ditch) => Some(ditch),
+            _ => None,
+        })
+    }
+
+    /// Every gatehouse in stable id order.
+    pub fn gatehouses(&self) -> impl Iterator<Item = &Gatehouse> {
+        self.elements.values().filter_map(|element| match element {
+            Element::Gatehouse(gatehouse) => Some(gatehouse),
+            _ => None,
+        })
     }
 
     /// Insert an opening. Ids are unique across openings; replacing an
@@ -449,7 +672,37 @@ impl CastleDocument {
                     bytes.extend_from_slice(&t.plinth_height_mm.to_le_bytes());
                     bytes.extend_from_slice(&t.plinth_projection_mm.to_le_bytes());
                     bytes.extend_from_slice(&t.course_height_mm.to_le_bytes());
+                    // M1.1 saves had no shaped-tower fields. Only emit the extra
+                    // bytes when the tower actually departs from the M1.1
+                    // default, so old round towers keep their exact hash.
+                    if t.plan != TowerPlan::Round || t.orientation_deg != 0 {
+                        bytes.extend_from_slice(&[t.plan as u8]);
+                        bytes.extend_from_slice(&t.orientation_deg.to_le_bytes());
+                    }
                     bytes.extend_from_slice(&t.seed.to_le_bytes());
+                }
+                Element::Gatehouse(g) => {
+                    bytes.push(3);
+                    bytes.extend_from_slice(&g.id.to_le_bytes());
+                    bytes.extend_from_slice(&g.centre_mm[0].to_le_bytes());
+                    bytes.extend_from_slice(&g.centre_mm[1].to_le_bytes());
+                    bytes.extend_from_slice(&g.orientation_deg.to_le_bytes());
+                    bytes.extend_from_slice(&g.passage_width_mm.to_le_bytes());
+                    bytes.extend_from_slice(&g.passage_height_mm.to_le_bytes());
+                    bytes.extend_from_slice(&g.depth_mm.to_le_bytes());
+                    bytes.extend_from_slice(&g.height_mm.to_le_bytes());
+                    bytes.extend_from_slice(&g.tower_radius_mm.to_le_bytes());
+                    bytes.extend_from_slice(&g.seed.to_le_bytes());
+                }
+                Element::Ditch(d) => {
+                    bytes.push(4);
+                    bytes.extend_from_slice(&d.id.to_le_bytes());
+                    bytes.extend_from_slice(&d.start_mm[0].to_le_bytes());
+                    bytes.extend_from_slice(&d.start_mm[1].to_le_bytes());
+                    bytes.extend_from_slice(&d.end_mm[0].to_le_bytes());
+                    bytes.extend_from_slice(&d.end_mm[1].to_le_bytes());
+                    bytes.extend_from_slice(&d.width_mm.to_le_bytes());
+                    bytes.extend_from_slice(&d.depth_mm.to_le_bytes());
                 }
             }
         }
@@ -471,8 +724,9 @@ impl CastleDocument {
 
 /// Validate one element against exactly the same bounds the command engine
 /// applies to its creating operation, plus the fields a command does not carry
-/// (course height and plinth dimensions).
-fn validate_element(element: &Element) -> Result<(), CommandError> {
+/// (course height and plinth dimensions) and the cross-field invariants that
+/// only make sense once a full element exists.
+pub(crate) fn validate_element(element: &Element) -> Result<(), CommandError> {
     match element {
         Element::BatteredWall(wall) => {
             sanitize_name(&wall.name)?;
@@ -494,6 +748,12 @@ fn validate_element(element: &Element) -> Result<(), CommandError> {
                 0,
                 i64::MAX,
             )?;
+            check_dimension(
+                "plinth_height_mm",
+                wall.plinth_height_mm,
+                0,
+                wall.height_mm.saturating_sub(1),
+            )?;
         }
         Element::RoundTower(tower) => {
             sanitize_name(&tower.name)?;
@@ -507,13 +767,81 @@ fn validate_element(element: &Element) -> Result<(), CommandError> {
             }
             .validated()?;
             check_dimension("course_height_mm", tower.course_height_mm, 1, i64::MAX)?;
-            check_dimension("plinth_height_mm", tower.plinth_height_mm, 0, i64::MAX)?;
+            check_dimension(
+                "thickness_mm",
+                tower.thickness_mm,
+                MIN_WALL_THICKNESS_MM,
+                tower.radius_mm.saturating_sub(1),
+            )?;
+            check_dimension(
+                "plinth_height_mm",
+                tower.plinth_height_mm,
+                0,
+                tower.height_mm.saturating_sub(1),
+            )?;
             check_dimension(
                 "plinth_projection_mm",
                 tower.plinth_projection_mm,
                 0,
                 i64::MAX,
             )?;
+            check_dimension(
+                "orientation_deg",
+                i64::from(tower.orientation_deg),
+                -360,
+                360,
+            )?;
+        }
+        Element::Gatehouse(gatehouse) => {
+            sanitize_name(&gatehouse.name)?;
+            CommandOp::CreateGatehouse {
+                ref_id: None,
+                name: gatehouse.name.clone(),
+                centre_mm: gatehouse.centre_mm,
+                orientation_deg: Some(gatehouse.orientation_deg),
+                passage_width_mm: Some(gatehouse.passage_width_mm),
+                height_mm: Some(gatehouse.height_mm),
+                tower_radius_mm: Some(gatehouse.tower_radius_mm),
+            }
+            .validated()?;
+            check_dimension(
+                "height_mm",
+                gatehouse.height_mm,
+                MIN_GATEHOUSE_HEIGHT_MM,
+                i64::MAX,
+            )?;
+            check_dimension(
+                "passage_height_mm",
+                gatehouse.passage_height_mm,
+                MIN_PASSAGE_HEIGHT_MM,
+                gatehouse.height_mm.saturating_sub(1_000),
+            )?;
+            if gatehouse.passage_height_mm.saturating_add(1_000) > gatehouse.height_mm {
+                return Err(CommandError::DimensionOutOfRange {
+                    field: "passage_height_mm",
+                    value: gatehouse.passage_height_mm,
+                    min: MIN_PASSAGE_HEIGHT_MM,
+                    max: gatehouse.height_mm.saturating_sub(1_000),
+                });
+            }
+            check_dimension(
+                "depth_mm",
+                gatehouse.depth_mm,
+                MIN_GATEHOUSE_DEPTH_MM,
+                MAX_GATEHOUSE_DEPTH_MM,
+            )?;
+        }
+        Element::Ditch(ditch) => {
+            sanitize_name(&ditch.name)?;
+            CommandOp::CreateDitch {
+                ref_id: None,
+                name: ditch.name.clone(),
+                start_mm: ditch.start_mm,
+                end_mm: ditch.end_mm,
+                width_mm: ditch.width_mm,
+                depth_mm: ditch.depth_mm,
+            }
+            .validated()?;
         }
     }
     Ok(())
@@ -626,6 +954,50 @@ mod tests {
             length,
             BatteredWall::new(2, "same", wall.start_mm, wall.end_mm, 9_000, 2_400).length_mm()
         );
+    }
+
+    #[test]
+    fn standard_round_towers_keep_the_m1_1_document_hash() {
+        let mut doc = CastleDocument::new();
+        let tower = RoundTower::new(7, "Drum", [12_000, -3_000], 3_500, 13_000);
+        doc.add_tower(tower.clone());
+
+        // Reproduce the exact M1.1 byte stream, which had no plan/orientation
+        // fields at all.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"keepwright-document-v2");
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.push(2);
+        bytes.extend_from_slice(&tower.id.to_le_bytes());
+        bytes.extend_from_slice(&tower.centre_mm[0].to_le_bytes());
+        bytes.extend_from_slice(&tower.centre_mm[1].to_le_bytes());
+        bytes.extend_from_slice(&tower.radius_mm.to_le_bytes());
+        bytes.extend_from_slice(&tower.height_mm.to_le_bytes());
+        bytes.extend_from_slice(&tower.thickness_mm.to_le_bytes());
+        bytes.extend_from_slice(&tower.batter_mm.to_le_bytes());
+        bytes.extend_from_slice(&tower.plinth_height_mm.to_le_bytes());
+        bytes.extend_from_slice(&tower.plinth_projection_mm.to_le_bytes());
+        bytes.extend_from_slice(&tower.course_height_mm.to_le_bytes());
+        bytes.extend_from_slice(&tower.seed.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // no openings
+        assert_eq!(doc.document_hash(), fnv1a_64(&bytes));
+    }
+
+    #[test]
+    fn shaped_tower_plan_and_orientation_change_the_hash() {
+        let mut round = CastleDocument::new();
+        round.add_tower(RoundTower::new(1, "Tower", [0, 0], 3_500, 12_000));
+        let mut square = CastleDocument::new();
+        let mut tower = RoundTower::new(1, "Tower", [0, 0], 3_500, 12_000);
+        tower.plan = TowerPlan::Square;
+        square.add_tower(tower);
+        assert_ne!(round.document_hash(), square.document_hash());
+
+        let mut rotated = CastleDocument::new();
+        let mut tower = RoundTower::new(1, "Tower", [0, 0], 3_500, 12_000);
+        tower.orientation_deg = 45;
+        rotated.add_tower(tower);
+        assert_ne!(round.document_hash(), rotated.document_hash());
     }
 
     #[test]

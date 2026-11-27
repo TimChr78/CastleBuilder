@@ -13,7 +13,8 @@
 //! stones share an exact plane and no daylight shows between them.
 
 use crate::document::{
-    BatteredWall, CastleDocument, Element, ElementKind, Opening, RoundTower, CASTLE_SEED,
+    BatteredWall, CastleDocument, Element, ElementKind, Gatehouse, Opening, RoundTower, TowerPlan,
+    CASTLE_SEED,
 };
 use crate::hash01;
 use crate::junction;
@@ -121,6 +122,8 @@ pub fn generate_blocks(document: &CastleDocument, terrain: &SiteTerrain) -> Vec<
         match element {
             Element::BatteredWall(wall) => layout_wall(wall, document, terrain, &mut blocks),
             Element::RoundTower(tower) => layout_tower(tower, terrain, &mut blocks),
+            Element::Gatehouse(gatehouse) => layout_gatehouse(gatehouse, terrain, &mut blocks),
+            Element::Ditch(_) => {}
         }
     }
 
@@ -1241,6 +1244,14 @@ fn wall_corners(
 }
 
 fn layout_tower(tower: &RoundTower, terrain: &SiteTerrain, out: &mut Vec<Block>) {
+    match tower.plan {
+        TowerPlan::Round => layout_round_tower(tower, terrain, out),
+        TowerPlan::Square => layout_shaped_tower(tower, terrain, out, TowerPlan::Square),
+        TowerPlan::DShaped => layout_shaped_tower(tower, terrain, out, TowerPlan::DShaped),
+    }
+}
+
+fn layout_round_tower(tower: &RoundTower, terrain: &SiteTerrain, out: &mut Vec<Block>) {
     let radius = tower.radius_mm.max(500);
     let thickness = tower.thickness_mm.clamp(300, radius);
     let (ground_min, ground_max) = ground_range_tower(tower, terrain);
@@ -1335,6 +1346,620 @@ fn layout_tower(tower: &RoundTower, terrain: &SiteTerrain, out: &mut Vec<Block>)
                 expose: [false, expose_top, true, true, false, false],
                 role: BlockRole::Masonry,
             });
+        }
+
+        course_index += 1;
+        y0 = y1;
+    }
+}
+
+/// Square and D-shaped towers share the round tower's course/batter machinery.
+/// Square plans are generated as a four-sided ring whose boundary point is the
+/// Chebyshev radius, so adjacent stones share exact vertical joints and the
+/// corner blocks meet on the diagonal. D-shaped plans generate a curved front
+/// drum plus a straight rear gorge wall.
+fn layout_shaped_tower(
+    tower: &RoundTower,
+    terrain: &SiteTerrain,
+    out: &mut Vec<Block>,
+    plan: TowerPlan,
+) {
+    let radius = tower.radius_mm.max(500);
+    let thickness = tower.thickness_mm.clamp(300, radius);
+    let (ground_min, ground_max) = ground_range_tower(tower, terrain);
+    let foundation_y = ground_min - 1_200;
+    let plinth_top_y = ground_max + tower.plinth_height_mm;
+    let top_y = ground_max + tower.height_mm;
+    let total_height = (top_y - foundation_y).max(1);
+    let element_seed = tower.seed ^ CASTLE_SEED.rotate_left(13);
+    let orientation = tower.orientation_deg;
+
+    let arc_count = 14i32;
+    let arc_step = std::f64::consts::PI / arc_count as f64;
+
+    let course_nominal = tower.course_height_mm.max(150);
+    let mut course_index = 0i32;
+    let mut y0 = foundation_y;
+
+    while y0 < top_y {
+        let jitter = (hash01(element_seed, i64::from(course_index), 1, 0) - 0.5) * 40.0;
+        let mut y1 = y0 + course_nominal + jitter as i64;
+        if y1 > top_y || top_y - y1 < course_nominal / 2 {
+            y1 = top_y;
+        }
+        if y1 <= y0 {
+            break;
+        }
+
+        let mid_y = (y0 + y1) / 2;
+        let t = ((mid_y - foundation_y) as f64 / total_height as f64).clamp(0.0, 1.0);
+        let is_plinth = y0 < plinth_top_y;
+        let plinth = if is_plinth {
+            tower.plinth_projection_mm
+        } else {
+            0
+        };
+        let expose_top = y1 >= top_y || (is_plinth && y1 >= plinth_top_y);
+        let (r_out_bot, r_in_bot) =
+            tower_face_radii(tower, thickness, foundation_y, total_height, y0, plinth);
+        let (r_out_top, r_in_top) =
+            tower_face_radii(tower, thickness, foundation_y, total_height, y1, plinth);
+
+        match plan {
+            TowerPlan::Square => {
+                let bond = if course_index % 2 == 0 { 0 } else { 475 };
+                // Alternate which pair of faces owns the corners. The owning
+                // faces run the full battered square width; the other pair stops
+                // at the inner face, so the two never overlap and every corner
+                // stays a crisp 90 degrees on every course.
+                let u_faces_own = course_index % 2 == 0;
+                for face in [
+                    SquareFace::PosU,
+                    SquareFace::NegU,
+                    SquareFace::PosV,
+                    SquareFace::NegV,
+                ] {
+                    let owns_corner = match face {
+                        SquareFace::PosU | SquareFace::NegU => u_faces_own,
+                        SquareFace::PosV | SquareFace::NegV => !u_faces_own,
+                    };
+                    let (a0_bot, a1_bot) = if owns_corner {
+                        (-r_out_bot, r_out_bot)
+                    } else {
+                        (-r_in_bot, r_in_bot)
+                    };
+                    let (a0_top, a1_top) = if owns_corner {
+                        (-r_out_top, r_out_top)
+                    } else {
+                        (-r_in_top, r_in_top)
+                    };
+                    let (d0_bot, d1_bot) = match face {
+                        SquareFace::PosU | SquareFace::NegV => (-r_out_bot, -r_in_bot),
+                        SquareFace::NegU | SquareFace::PosV => (r_in_bot, r_out_bot),
+                    };
+                    let (d0_top, d1_top) = match face {
+                        SquareFace::PosU | SquareFace::NegV => (-r_out_top, -r_in_top),
+                        SquareFace::NegU | SquareFace::PosV => (r_in_top, r_out_top),
+                    };
+                    let face_index = face.index();
+                    let joints = joint_positions(
+                        a0_bot,
+                        a1_bot,
+                        950,
+                        bond,
+                        element_seed,
+                        course_index,
+                        face_index * 1_000,
+                    );
+                    let count = joints.len() - 1;
+                    for (segment, pair) in joints.windows(2).enumerate() {
+                        let (a0b, a1b) = (pair[0], pair[1]);
+                        let a0t = map_run(a0b, a0_bot, a1_bot, a0_top, a1_top);
+                        let a1t = map_run(a1b, a0_bot, a1_bot, a0_top, a1_top);
+                        if a1b <= a0b || a1t <= a0t {
+                            continue;
+                        }
+                        let corners = square_face_corners(
+                            tower.centre_mm,
+                            orientation,
+                            face,
+                            a0b,
+                            a1b,
+                            a0t,
+                            a1t,
+                            d0_bot,
+                            d1_bot,
+                            d0_top,
+                            d1_top,
+                            y0,
+                            y1,
+                        );
+                        if is_buried(&corners, terrain) {
+                            continue;
+                        }
+                        let column = face_index * 100_000 + segment as i32;
+                        out.push(Block {
+                            element_id: tower.id,
+                            kind: ElementKind::RoundTower,
+                            course_index,
+                            run_pos_mm: column as i64,
+                            build_index: 0,
+                            corners_mm: corners,
+                            block_width_mm: (a1b - a0b).max(1),
+                            block_height_mm: (y1 - y0).max(1),
+                            tint: stone_tint(hash01(
+                                element_seed,
+                                course_index as i64,
+                                column as i64,
+                                11,
+                            )),
+                            age: (0.55 + 0.45 * t as f32).min(1.0),
+                            jitter_seed: hash01(
+                                element_seed,
+                                course_index as i64,
+                                column as i64,
+                                12,
+                            ),
+                            expose: [
+                                false,
+                                expose_top,
+                                true,
+                                true,
+                                owns_corner && segment == 0,
+                                owns_corner && segment + 1 == count,
+                            ],
+                            role: BlockRole::Masonry,
+                        });
+                    }
+                }
+            }
+            TowerPlan::DShaped => {
+                // Half-step running bond on alternating courses, shared joint
+                // jitter, with both ends pinned at the flat gorge wall so the
+                // arc still meets it exactly.
+                let bond = if course_index % 2 == 0 {
+                    0.0
+                } else {
+                    arc_step * 0.5
+                };
+                let joint_angle = |joint: i32| -> f64 {
+                    if joint <= 0 {
+                        -std::f64::consts::FRAC_PI_2
+                    } else if joint >= arc_count {
+                        std::f64::consts::FRAC_PI_2
+                    } else {
+                        let jitter_mm = stone_jitter(element_seed, course_index, joint, 3) as f64;
+                        -std::f64::consts::FRAC_PI_2
+                            + arc_step * joint as f64
+                            + bond
+                            + jitter_mm / radius as f64
+                    }
+                };
+                for j in 0..arc_count {
+                    let a0 = joint_angle(j);
+                    let a1 = joint_angle(j + 1);
+                    if a1 <= a0 {
+                        continue;
+                    }
+                    let corners = dshaped_arc_corners(
+                        tower.centre_mm,
+                        a0,
+                        a1,
+                        r_out_bot,
+                        r_in_bot,
+                        r_out_top,
+                        r_in_top,
+                        orientation,
+                        y0,
+                        y1,
+                    );
+                    if is_buried(&corners, terrain) {
+                        continue;
+                    }
+                    let width = round(r_out_bot as f64 * (a1 - a0)) as i64;
+                    out.push(Block {
+                        element_id: tower.id,
+                        kind: ElementKind::RoundTower,
+                        course_index,
+                        run_pos_mm: j as i64,
+                        build_index: 0,
+                        corners_mm: corners,
+                        block_width_mm: width.max(1),
+                        block_height_mm: (y1 - y0).max(1),
+                        tint: stone_tint(hash01(element_seed, course_index as i64, j as i64, 11)),
+                        age: (0.55 + 0.45 * t as f32).min(1.0),
+                        jitter_seed: hash01(element_seed, course_index as i64, j as i64, 12),
+                        expose: [false, expose_top, true, true, false, false],
+                        role: BlockRole::Masonry,
+                    });
+                }
+                // Straight rear gorge wall on the flat side of the D. It is
+                // trimmed to the arc's inner radius at each course (bottom and
+                // top separately) so battering never pushes rear stones into the
+                // curved shell.
+                let bond = if course_index % 2 == 0 { 0 } else { 475 };
+                if r_in_bot > 0 {
+                    let joints = joint_positions(
+                        -r_in_bot,
+                        r_in_bot,
+                        950,
+                        bond,
+                        element_seed,
+                        course_index,
+                        50_000,
+                    );
+                    for (column, pair) in joints.windows(2).enumerate() {
+                        let (v0_bot, v1_bot) = (pair[0], pair[1]);
+                        let v0_top = map_radius(v0_bot, r_in_bot, r_in_top);
+                        let v1_top = map_radius(v1_bot, r_in_bot, r_in_top);
+                        if v1_bot <= v0_bot || v1_top <= v0_top {
+                            continue;
+                        }
+                        // Follow the arc's inner circle on the courtyard side:
+                        // the rear wall is full thickness at the centre and
+                        // tapers to nothing where it meets the arc, so the two
+                        // solids share one boundary with no overlapping volume.
+                        let u_inner = rear_wall_inner_face(
+                            v0_bot, v1_bot, r_in_bot, r_in_top, v0_top, v1_top, thickness,
+                        );
+                        if u_inner <= 0 {
+                            continue;
+                        }
+                        let corners = dshaped_rear_corners(
+                            tower.centre_mm,
+                            orientation,
+                            v0_bot,
+                            v1_bot,
+                            v0_top,
+                            v1_top,
+                            u_inner,
+                            0,
+                            y0,
+                            y1,
+                        );
+                        if !is_buried(&corners, terrain) {
+                            out.push(Block {
+                                element_id: tower.id,
+                                kind: ElementKind::RoundTower,
+                                course_index,
+                                run_pos_mm: 2_000_000 + v0_bot,
+                                build_index: 0,
+                                corners_mm: corners,
+                                block_width_mm: (v1_bot - v0_bot).max(1),
+                                block_height_mm: (y1 - y0).max(1),
+                                tint: stone_tint(hash01(
+                                    element_seed,
+                                    course_index as i64,
+                                    10_000 + column as i64,
+                                    11,
+                                )),
+                                age: (0.55 + 0.45 * t as f32).min(1.0),
+                                jitter_seed: hash01(
+                                    element_seed,
+                                    course_index as i64,
+                                    10_000 + column as i64,
+                                    12,
+                                ),
+                                expose: [false, expose_top, true, true, true, true],
+                                role: BlockRole::Masonry,
+                            });
+                        }
+                    }
+                }
+            }
+            TowerPlan::Round => {}
+        }
+
+        course_index += 1;
+        y0 = y1;
+    }
+}
+
+/// Which straight face of a square tower a block belongs to. The `d` axis is
+/// always the right-hand axis of the run so the shared [`Block`] winding stays
+/// outward on every face.
+#[derive(Clone, Copy)]
+enum SquareFace {
+    PosU,
+    NegU,
+    PosV,
+    NegV,
+}
+
+impl SquareFace {
+    fn index(self) -> i32 {
+        match self {
+            Self::PosU => 0,
+            Self::NegU => 1,
+            Self::PosV => 2,
+            Self::NegV => 3,
+        }
+    }
+
+    fn local_uv(self, a: i64, d: i64) -> (i64, i64) {
+        match self {
+            // The u-faces run along v; their thickness axis points along -u.
+            Self::PosU | Self::NegU => (-d, a),
+            // The v-faces run along u; their thickness axis points along +v.
+            Self::PosV | Self::NegV => (a, d),
+        }
+    }
+}
+
+/// Solve a single run of shared, jittered joints between `start_mm` and
+/// `end_mm`. `bond` shifts the whole joint pattern so alternate courses break
+/// stack bond without ever moving the two end joints.
+fn joint_positions(
+    start_mm: i64,
+    end_mm: i64,
+    nominal_mm: i64,
+    bond_mm: i64,
+    seed: u64,
+    course: i32,
+    column_base: i32,
+) -> Vec<i64> {
+    if end_mm <= start_mm {
+        return vec![start_mm, end_mm];
+    }
+    let mut joints = vec![start_mm];
+    let mut pos = start_mm + bond_mm;
+    let mut column = 0i32;
+    while pos + nominal_mm < end_mm {
+        let vary =
+            (hash01(seed, i64::from(course), i64::from(column_base + column), 7) - 0.5) * 420.0;
+        pos += nominal_mm + vary as i64;
+        let previous = *joints.last().unwrap();
+        if pos <= previous + 250 {
+            pos = previous + 500;
+        }
+        if pos >= end_mm - 200 {
+            break;
+        }
+        let jitter = stone_jitter(seed, course, column_base + column, 1);
+        joints.push(pos + jitter);
+        column += 1;
+    }
+    joints.push(end_mm);
+    joints
+}
+
+/// Map a joint position from the bottom run span onto the top run span so a
+/// battered face keeps a straight, quartered edge.
+fn map_run(a: i64, a_start: i64, a_end: i64, top_start: i64, top_end: i64) -> i64 {
+    if a_end == a_start {
+        return top_start;
+    }
+    top_start
+        + round((a - a_start) as f64 * (top_end - top_start) as f64 / (a_end - a_start) as f64)
+            as i64
+}
+
+/// Scale a plan coordinate from one course radius to the next.
+fn map_radius(value: i64, from: i64, to: i64) -> i64 {
+    if from == 0 {
+        0
+    } else {
+        round(value as f64 * to as f64 / from as f64) as i64
+    }
+}
+
+/// Depth available to the straight rear wall at a given span. The wall fills
+/// the flat side but must stop at the arc's circular inner boundary, so its
+/// thickness tapers where that boundary curves back toward the chord.
+fn rear_wall_inner_face(
+    v0_bot: i64,
+    v1_bot: i64,
+    r_in_bot: i64,
+    r_in_top: i64,
+    v0_top: i64,
+    v1_top: i64,
+    thickness: i64,
+) -> i64 {
+    let available = |radius: i64, far: i64| -> i64 {
+        let r = radius.max(1) as f64;
+        let far = far as f64;
+        let squared = (r * r - far * far).max(0.0);
+        (sqrt(squared).floor() as i64).saturating_sub(20)
+    };
+    let far_bot = v0_bot.abs().max(v1_bot.abs());
+    let far_top = v0_top.abs().max(v1_top.abs());
+    available(r_in_bot, far_bot)
+        .min(available(r_in_top, far_top))
+        .min(thickness)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn square_face_corners(
+    centre_mm: [i64; 2],
+    orientation_deg: i32,
+    face: SquareFace,
+    a0_bot: i64,
+    a1_bot: i64,
+    a0_top: i64,
+    a1_top: i64,
+    d0_bot: i64,
+    d1_bot: i64,
+    d0_top: i64,
+    d1_top: i64,
+    y0: i64,
+    y1: i64,
+) -> [[i64; 3]; 8] {
+    let p = |a: i64, d: i64, y: i64| -> [i64; 3] {
+        let (u, v) = face.local_uv(a, d);
+        shaped_local_point(centre_mm, orientation_deg, u, v, y)
+    };
+    [
+        p(a0_bot, d0_bot, y0),
+        p(a1_bot, d0_bot, y0),
+        p(a1_bot, d1_bot, y0),
+        p(a0_bot, d1_bot, y0),
+        p(a0_top, d0_top, y1),
+        p(a1_top, d0_top, y1),
+        p(a1_top, d1_top, y1),
+        p(a0_top, d1_top, y1),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dshaped_arc_corners(
+    centre_mm: [i64; 2],
+    a0: f64,
+    a1: f64,
+    r_out_bot: i64,
+    r_in_bot: i64,
+    r_out_top: i64,
+    r_in_top: i64,
+    orientation_deg: i32,
+    y0: i64,
+    y1: i64,
+) -> [[i64; 3]; 8] {
+    let p = |angle: f64, radius: i64, y: i64| -> [i64; 3] {
+        shaped_local_point(
+            centre_mm,
+            orientation_deg,
+            round(cos(angle) * radius as f64) as i64,
+            round(sin(angle) * radius as f64) as i64,
+            y,
+        )
+    };
+    [
+        p(a0, r_out_bot, y0),
+        p(a1, r_out_bot, y0),
+        p(a1, r_in_bot, y0),
+        p(a0, r_in_bot, y0),
+        p(a0, r_out_top, y1),
+        p(a1, r_out_top, y1),
+        p(a1, r_in_top, y1),
+        p(a0, r_in_top, y1),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shaped_local_point(
+    centre_mm: [i64; 2],
+    orientation_deg: i32,
+    u: i64,
+    v: i64,
+    y: i64,
+) -> [i64; 3] {
+    let o = orientation_deg as f64 * std::f64::consts::PI / 180.0;
+    let (oc, os) = (cos(o), sin(o));
+    let x = centre_mm[0] as f64 + u as f64 * oc - v as f64 * os;
+    let z = centre_mm[1] as f64 + u as f64 * os + v as f64 * oc;
+    [round(x) as i64, y, round(z) as i64]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dshaped_rear_corners(
+    centre_mm: [i64; 2],
+    orientation_deg: i32,
+    v0_bot: i64,
+    v1_bot: i64,
+    v0_top: i64,
+    v1_top: i64,
+    u_out: i64,
+    u_in: i64,
+    y0: i64,
+    y1: i64,
+) -> [[i64; 3]; 8] {
+    [
+        shaped_local_point(centre_mm, orientation_deg, u_out, v0_bot, y0),
+        shaped_local_point(centre_mm, orientation_deg, u_out, v1_bot, y0),
+        shaped_local_point(centre_mm, orientation_deg, u_in, v1_bot, y0),
+        shaped_local_point(centre_mm, orientation_deg, u_in, v0_bot, y0),
+        shaped_local_point(centre_mm, orientation_deg, u_out, v0_top, y1),
+        shaped_local_point(centre_mm, orientation_deg, u_out, v1_top, y1),
+        shaped_local_point(centre_mm, orientation_deg, u_in, v1_top, y1),
+        shaped_local_point(centre_mm, orientation_deg, u_in, v0_top, y1),
+    ]
+}
+
+/// Lay out the gatehouse: two flanking drum towers plus a central block that
+/// starts above `passage_height_mm`, leaving a clear passage underneath.
+fn layout_gatehouse(gatehouse: &Gatehouse, terrain: &SiteTerrain, out: &mut Vec<Block>) {
+    for tower in gatehouse.flank_towers() {
+        layout_tower(&tower, terrain, out);
+    }
+
+    let ground = terrain.height_mm(gatehouse.centre_mm[0], gatehouse.centre_mm[1]);
+    let passage_top = ground + gatehouse.passage_height_mm.max(1);
+    let top = ground + gatehouse.height_mm.max(1);
+    if top <= passage_top {
+        return;
+    }
+
+    let dir = gatehouse.direction();
+    let right = [-dir[1], dir[0]];
+    let half_depth = gatehouse.depth_mm.max(1) / 2;
+    // Meet the flanking towers' inner faces so the bridging block is connected.
+    let half_width = gatehouse.passage_width_mm.max(1) / 2 + 100;
+    let element_seed = gatehouse.seed ^ CASTLE_SEED.rotate_left(23);
+    let course_nominal = 450i64;
+    let total_height = (top - passage_top).max(1);
+    let mut course_index = 0i32;
+    let mut y0 = passage_top;
+
+    while y0 < top {
+        let jitter = (hash01(element_seed, i64::from(course_index), 3, 0) - 0.5) * 40.0;
+        let mut y1 = y0 + course_nominal + jitter as i64;
+        if y1 > top || top - y1 < course_nominal / 2 {
+            y1 = top;
+        }
+        if y1 <= y0 {
+            break;
+        }
+        let expose_top = y1 >= top;
+        let t = ((y0 + y1) / 2 - passage_top) as f64 / total_height as f64;
+        let lintel = course_index == 0;
+
+        let mut a = -half_depth;
+        let mut column = 0i32;
+        while a < half_depth {
+            let vary =
+                (hash01(element_seed, i64::from(course_index), i64::from(column), 7) - 0.5) * 360.0;
+            let mut next = a + 950 + vary as i64;
+            if next <= a + 250 {
+                next = a + 500;
+            }
+            next = next.min(half_depth);
+            let point = |u: i64, v: i64, y: i64| -> [i64; 3] {
+                let x = gatehouse.centre_mm[0] as f64 + dir[0] * u as f64 + right[0] * v as f64;
+                let z = gatehouse.centre_mm[1] as f64 + dir[1] * u as f64 + right[1] * v as f64;
+                [round(x) as i64, y, round(z) as i64]
+            };
+            let corners = [
+                point(a, -half_width, y0),
+                point(next, -half_width, y0),
+                point(next, half_width, y0),
+                point(a, half_width, y0),
+                point(a, -half_width, y1),
+                point(next, -half_width, y1),
+                point(next, half_width, y1),
+                point(a, half_width, y1),
+            ];
+            if !is_buried(&corners, terrain) {
+                out.push(Block {
+                    element_id: gatehouse.id,
+                    kind: ElementKind::Gatehouse,
+                    course_index,
+                    run_pos_mm: a + half_depth,
+                    build_index: 0,
+                    corners_mm: corners,
+                    block_width_mm: (next - a).max(1),
+                    block_height_mm: (y1 - y0).max(1),
+                    tint: stone_tint(hash01(element_seed, course_index as i64, column as i64, 11)),
+                    age: (0.55 + 0.45 * t as f32).min(1.0),
+                    jitter_seed: hash01(element_seed, course_index as i64, column as i64, 12),
+                    expose: [false, expose_top, true, true, true, true],
+                    role: if lintel {
+                        BlockRole::Lintel
+                    } else {
+                        BlockRole::Masonry
+                    },
+                });
+            }
+            a = next;
+            column += 1;
         }
 
         course_index += 1;
@@ -1450,7 +2075,7 @@ fn ground_range_tower(tower: &RoundTower, terrain: &SiteTerrain) -> (i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{m0a_showcase_document, m0b_showcase_document};
+    use crate::fixtures::{m0a_showcase_document, m0b_showcase_document, m1_edwardian_document};
 
     #[test]
     fn blocks_have_monotonic_build_indices_and_courses() {
@@ -1699,6 +2324,7 @@ mod tests {
                         tower_pairs += 1;
                     }
                 }
+                Element::Gatehouse(_) | Element::Ditch(_) => {}
             }
         }
 
@@ -1797,6 +2423,75 @@ mod tests {
             ];
             let dot = normal[0] * outward[0] + normal[1] * outward[1] + normal[2] * outward[2];
             assert!(dot > 0.0, "{face:?}: normal points inward ({dot})");
+        }
+    }
+
+    #[test]
+    fn every_exposed_face_points_outward_for_all_element_kinds() {
+        let terrain =
+            SiteTerrain::for_site("coastal_headland").expect("coastal_headland is a curated site");
+        let doc = m1_edwardian_document();
+        let blocks = generate_blocks(&doc, &terrain);
+        assert!(!blocks.is_empty());
+
+        let mut kinds = std::collections::BTreeSet::new();
+        for block in &blocks {
+            kinds.insert(block.kind);
+            let centre = block.centre_mm();
+            for face in [
+                BlockFace::Bottom,
+                BlockFace::Top,
+                BlockFace::Front,
+                BlockFace::Back,
+                BlockFace::End0,
+                BlockFace::End1,
+            ] {
+                if !block.face_enabled(face) {
+                    continue;
+                }
+                let ids = Block::face_corners(face);
+                let p: Vec<[f64; 3]> = ids
+                    .iter()
+                    .map(|i| {
+                        [
+                            block.corners_mm[*i][0] as f64,
+                            block.corners_mm[*i][1] as f64,
+                            block.corners_mm[*i][2] as f64,
+                        ]
+                    })
+                    .collect();
+                let e1 = [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]];
+                let e2 = [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]];
+                let normal = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                let face_centre = [
+                    (p[0][0] + p[1][0] + p[2][0] + p[3][0]) * 0.25,
+                    (p[0][1] + p[1][1] + p[2][1] + p[3][1]) * 0.25,
+                    (p[0][2] + p[1][2] + p[2][2] + p[3][2]) * 0.25,
+                ];
+                let outward = [
+                    face_centre[0] - centre[0],
+                    face_centre[1] - centre[1],
+                    face_centre[2] - centre[2],
+                ];
+                let dot = normal[0] * outward[0] + normal[1] * outward[1] + normal[2] * outward[2];
+                assert!(
+                    dot > 1.0,
+                    "{:?} block {} face {face:?} points inward (dot {dot})",
+                    block.kind,
+                    block.element_id
+                );
+            }
+        }
+        for kind in [
+            ElementKind::BatteredWall,
+            ElementKind::RoundTower,
+            ElementKind::Gatehouse,
+        ] {
+            assert!(kinds.contains(&kind), "no {kind:?} blocks were checked");
         }
     }
 
@@ -2237,5 +2932,316 @@ mod tests {
             y += 200;
         }
         assert!(samples > 10);
+    }
+
+    fn block_bounds(block: &Block) -> ([f64; 3], [f64; 3]) {
+        let mut min = [f64::MAX; 3];
+        let mut max = [f64::MIN; 3];
+        for corner in block.corners_mm {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(corner[axis] as f64);
+                max[axis] = max[axis].max(corner[axis] as f64);
+            }
+        }
+        (min, max)
+    }
+
+    fn assert_blocks_valid(blocks: &[Block], label: &str) {
+        assert!(!blocks.is_empty(), "{label} produced no blocks");
+        for block in blocks {
+            let (min, max) = block_bounds(block);
+            let volume = (max[0] - min[0]) * (max[1] - min[1]) * (max[2] - min[2]);
+            assert!(volume > 0.0, "{label} produced a zero-volume block");
+            assert!(volume.is_finite(), "{label} produced a non-finite block");
+            for corner in block.corners_mm {
+                assert!(corner[0].abs() < 500_000_000);
+                assert!(corner[1].abs() < 500_000_000);
+                assert!(corner[2].abs() < 500_000_000);
+            }
+        }
+    }
+
+    #[test]
+    fn square_and_dshaped_towers_have_watertight_positive_volume_masonry() {
+        let terrain = SiteTerrain::m0a_promontory();
+        for (id, plan, orientation) in [
+            (1u64, TowerPlan::Square, 0i32),
+            (2, TowerPlan::Square, 37),
+            (3, TowerPlan::DShaped, 0),
+            (4, TowerPlan::DShaped, 145),
+        ] {
+            let mut doc = CastleDocument::new();
+            let mut tower = RoundTower::new(id, "Shaped tower", [0, 0], 3_500, 12_000);
+            tower.plan = plan;
+            tower.orientation_deg = orientation;
+            doc.add_tower(tower);
+            let blocks = generate_blocks(&doc, &terrain);
+            assert_blocks_valid(&blocks, &format!("{plan:?} tower"));
+            // Courses must not leave daylight between stacked blocks.
+            let mut courses = std::collections::BTreeMap::new();
+            for block in &blocks {
+                let (min, max) = block_bounds(block);
+                courses
+                    .entry(block.course_index)
+                    .and_modify(|(low, high): &mut (f64, f64)| {
+                        *low = low.min(min[1]);
+                        *high = high.max(max[1]);
+                    })
+                    .or_insert((min[1], max[1]));
+            }
+            let ordered: Vec<(f64, f64)> = courses.values().copied().collect();
+            for pair in ordered.windows(2) {
+                assert!(
+                    (pair[0].1 - pair[1].0).abs() <= 1.0,
+                    "bed joint gap in {plan:?} tower"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn square_tower_corners_stay_crisp_on_every_course() {
+        let terrain = SiteTerrain::m0a_promontory();
+        for orientation in [0i32, 37, 145] {
+            let mut doc = CastleDocument::new();
+            let mut tower = RoundTower::new(1, "Square tower", [0, 0], 3_500, 12_000);
+            tower.plan = TowerPlan::Square;
+            tower.orientation_deg = orientation;
+            doc.add_tower(tower.clone());
+            let blocks = generate_blocks(&doc, &terrain);
+
+            let o = orientation as f64 * std::f64::consts::PI / 180.0;
+            let (oc, os) = (cos(o), sin(o));
+            let to_world = |u: f64, v: f64| -> [f64; 2] {
+                [
+                    tower.centre_mm[0] as f64 + u * oc - v * os,
+                    tower.centre_mm[1] as f64 + u * os + v * oc,
+                ]
+            };
+            let to_local = |x: f64, z: f64| -> [f64; 2] {
+                let dx = x - tower.centre_mm[0] as f64;
+                let dz = z - tower.centre_mm[1] as f64;
+                [dx * oc + dz * os, -dx * os + dz * oc]
+            };
+
+            let mut courses: std::collections::BTreeMap<i32, (f64, f64, f64, f64, f64)> =
+                std::collections::BTreeMap::new();
+            for block in &blocks {
+                let y0 = block.corners_mm[0][1] as f64;
+                let entry = courses.entry(block.course_index).or_insert((
+                    f64::MAX,
+                    f64::MIN,
+                    f64::MAX,
+                    f64::MIN,
+                    y0,
+                ));
+                entry.4 = entry.4.max(y0);
+                for corner in block.corners_mm.iter().take(4) {
+                    let [u, v] = to_local(corner[0] as f64, corner[2] as f64);
+                    entry.0 = entry.0.min(u);
+                    entry.1 = entry.1.max(u);
+                    entry.2 = entry.2.min(v);
+                    entry.3 = entry.3.max(v);
+                }
+            }
+
+            for (course, (u_min, u_max, v_min, v_max, y0)) in courses {
+                // Lower courses are legitimately culled where they are buried
+                // in the promontory; check the exposed masonry only.
+                if y0 < terrain.height_mm(0, 0) as f64 + 1_500.0 {
+                    continue;
+                }
+                let y = y0 + 1.0;
+                // The outer corner of a battered square is a single crisp
+                // point; probing 5 mm inside each corner must hit masonry.
+                for (u, v) in [
+                    (u_min + 5.0, v_min + 5.0),
+                    (u_max - 5.0, v_min + 5.0),
+                    (u_min + 5.0, v_max - 5.0),
+                    (u_max - 5.0, v_max - 5.0),
+                ] {
+                    let world = to_world(u, v);
+                    assert!(
+                        covered(&blocks, world[0], world[1], y),
+                        "orientation {orientation} course {course}: corner ({u:.0}, {v:.0}) is notched"
+                    );
+                }
+            }
+        }
+    }
+
+    fn polygon_area(poly: &[[f64; 2]]) -> f64 {
+        let mut area = 0.0;
+        for i in 0..poly.len() {
+            let a = poly[i];
+            let b = poly[(i + 1) % poly.len()];
+            area += a[0] * b[1] - b[0] * a[1];
+        }
+        area * 0.5
+    }
+
+    fn segment_intersection(p: [f64; 2], q: [f64; 2], a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
+        let r = [q[0] - p[0], q[1] - p[1]];
+        let s = [b[0] - a[0], b[1] - a[1]];
+        let denom = r[0] * s[1] - r[1] * s[0];
+        if denom.abs() < 1.0e-9 {
+            return p;
+        }
+        let t = ((a[0] - p[0]) * s[1] - (a[1] - p[1]) * s[0]) / denom;
+        [p[0] + r[0] * t, p[1] + r[1] * t]
+    }
+
+    /// Sutherland-Hodgman clip of one convex polygon against another.
+    fn clip_polygon(subject: &[[f64; 2]], clip: &[[f64; 2]]) -> Vec<[f64; 2]> {
+        let mut clip = clip.to_vec();
+        if polygon_area(&clip) < 0.0 {
+            clip.reverse();
+        }
+        let mut output = subject.to_vec();
+        for i in 0..clip.len() {
+            let a = clip[i];
+            let b = clip[(i + 1) % clip.len()];
+            let input = std::mem::take(&mut output);
+            if input.is_empty() {
+                break;
+            }
+            for j in 0..input.len() {
+                let p = input[j];
+                let q = input[(j + 1) % input.len()];
+                let inside = |point: [f64; 2]| {
+                    (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0]) >= -1.0e-9
+                };
+                match (inside(p), inside(q)) {
+                    (true, true) => output.push(q),
+                    (true, false) => output.push(segment_intersection(p, q, a, b)),
+                    (false, true) => {
+                        output.push(segment_intersection(p, q, a, b));
+                        output.push(q);
+                    }
+                    (false, false) => {}
+                }
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn dshaped_rear_wall_is_trimmed_to_the_arc_inner_radius() {
+        let terrain = SiteTerrain::m0a_promontory();
+        for orientation in [0i32, 180, 145] {
+            let mut doc = CastleDocument::new();
+            let mut tower = RoundTower::new(1, "D tower", [0, 0], 3_500, 12_000);
+            tower.thickness_mm = 1_200;
+            tower.plan = TowerPlan::DShaped;
+            tower.orientation_deg = orientation;
+            doc.add_tower(tower.clone());
+            let blocks = generate_blocks(&doc, &terrain);
+
+            let o = orientation as f64 * std::f64::consts::PI / 180.0;
+            let (oc, os) = (cos(o), sin(o));
+            let to_local = |p: [i64; 3]| -> [f64; 2] {
+                let dx = p[0] as f64 - tower.centre_mm[0] as f64;
+                let dz = p[2] as f64 - tower.centre_mm[1] as f64;
+                [dx * oc + dz * os, -dx * os + dz * oc]
+            };
+
+            let inner_limit = (tower.radius_mm - tower.thickness_mm + 1) as f64;
+            let mut rear_blocks: Vec<&Block> = Vec::new();
+            let mut arc_blocks: Vec<&Block> = Vec::new();
+            for block in &blocks {
+                let local: Vec<[f64; 2]> = block
+                    .corners_mm
+                    .iter()
+                    .map(|corner| to_local(*corner))
+                    .collect();
+                if block.run_pos_mm >= 1_000_000 {
+                    for point in local {
+                        assert!(
+                            point[1].abs() <= inner_limit,
+                            "rear block reaches v={:.1} beyond r_in={inner_limit:.1}",
+                            point[1]
+                        );
+                    }
+                    rear_blocks.push(block);
+                } else {
+                    arc_blocks.push(block);
+                }
+            }
+            assert!(!rear_blocks.is_empty());
+
+            let to_local_plan = |p: [f64; 2]| -> [f64; 2] {
+                let dx = p[0] - tower.centre_mm[0] as f64;
+                let dz = p[1] - tower.centre_mm[1] as f64;
+                [dx * oc + dz * os, -dx * os + dz * oc]
+            };
+
+            // No rear stone may share volume with an arc stone on its course.
+            for rear in &rear_blocks {
+                for arc in &arc_blocks {
+                    if rear.course_index != arc.course_index {
+                        continue;
+                    }
+                    let y = (rear.corners_mm[0][1] + rear.corners_mm[4][1]) as f64 / 2.0;
+                    let rear_poly: Vec<[f64; 2]> = block_section(rear, y)
+                        .iter()
+                        .map(|p| to_local_plan(*p))
+                        .collect();
+                    let arc_poly: Vec<[f64; 2]> = block_section(arc, y)
+                        .iter()
+                        .map(|p| to_local_plan(*p))
+                        .collect();
+                    let area = polygon_area(&clip_polygon(&rear_poly, &arc_poly)).abs();
+                    assert!(
+                        area <= 2.0,
+                        "orientation {orientation} course {}: rear/arc overlap {area:.1} mm^2",
+                        rear.course_index
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gatehouse_keeps_the_passage_clear_below_the_lintel() {
+        let terrain = SiteTerrain::m0a_promontory();
+        let mut doc = CastleDocument::new();
+        let gatehouse = Gatehouse::new(1, "Gatehouse", [0, 0], 0);
+        let ground = terrain.height_mm(0, 0);
+        doc.add_gatehouse(gatehouse.clone());
+        let blocks = generate_blocks(&doc, &terrain);
+        assert_blocks_valid(&blocks, "gatehouse");
+
+        let mut checked = 0;
+        let mut x = -3_000;
+        while x <= 3_000 {
+            let mut y = ground + 100;
+            while y < ground + gatehouse.passage_height_mm - 100 {
+                for block in &blocks {
+                    let (min, max) = block_bounds(block);
+                    let inside = (x as f64) > min[0] + 0.5
+                        && (x as f64) < max[0] - 0.5
+                        && (-100.0f64) > min[2] + 0.5
+                        && (100.0f64) < max[2] - 0.5
+                        && (y as f64) > min[1] + 0.5
+                        && (y as f64) < max[1] - 0.5;
+                    assert!(
+                        !inside,
+                        "gatehouse block obstructs the passage at ({x}, {y})"
+                    );
+                }
+                checked += 1;
+                y += 350;
+            }
+            x += 500;
+        }
+        assert!(checked > 20);
+
+        // Masonry does span above the passage, so the gatehouse reads as a gate.
+        let above = blocks.iter().any(|block| {
+            let (min, max) = block_bounds(block);
+            min[1] >= (ground + gatehouse.passage_height_mm - 1) as f64
+                && max[1] > (ground + gatehouse.passage_height_mm) as f64
+        });
+        assert!(above, "no masonry bridges the passage");
     }
 }
