@@ -168,6 +168,9 @@ func _check_wave2(bridge: Object, failures: Array[String]) -> void:
 	elif bool((undo_empty as Dictionary).get("undone", false)):
 		failures.append("undo_last() reported an undo with an empty history.")
 
+	_check_elements(m0b, failures)
+	_check_lod_chunks(m0b, failures)
+
 	if failures.is_empty():
 		print(
 			"M0b bridge OK: blocks=%d chunks=%d doc=%s"
@@ -210,6 +213,38 @@ func _check_feel_scripts(failures: Array[String]) -> void:
 				failures.append("ConstructionFx did not strike its scaffolding at build_front 1.0.")
 			if dust_done:
 				failures.append("ConstructionFx keeps emitting dust after completion.")
+			if not fx.has_method("configure_elements"):
+				failures.append("ConstructionFx has no configure_elements().")
+			else:
+				var sample_elements: Array = [
+					{
+						"kind": "wall",
+						"start": Vector2(-4.0, 0.0),
+						"end": Vector2(4.0, 0.0),
+						"thickness": 1.5,
+						"base_y": 0.0,
+						"start_y": 0.0,
+						"end_y": 0.0,
+						"height": 8.0,
+					},
+					{
+						"kind": "tower",
+						"center": Vector2(5.0, 0.0),
+						"radius": 2.0,
+						"base_y": 0.0,
+						"height": 9.0,
+					},
+				]
+				fx.call(
+					"configure_elements",
+					sample_elements,
+					AABB(Vector3(-6.0, 0.0, -4.0), Vector3(16.0, 9.0, 8.0))
+				)
+				fx.call("set_build_front", 0.5, true)
+				if not bool(fx.call("is_scaffold_visible")):
+					failures.append("ConstructionFx shows no scaffolding for element footprints.")
+				if not bool(fx.call("is_dust_emitting")):
+					failures.append("ConstructionFx emits no dust for element footprints.")
 			(fx as Node).free()
 
 	var audio_script: Variant = load("res://scripts/build_audio.gd")
@@ -255,6 +290,120 @@ func _check_feel_scripts(failures: Array[String]) -> void:
 				failures.append("DesignTool.set_mode(2) did not stick.")
 			tool.call("set_mode", 0)
 			(tool as Node).free()
+
+
+## Contract for the construction-FX element footprints emitted by keep-gd.
+func _check_elements(data: Dictionary, failures: Array[String]) -> void:
+	if not data.has("elements"):
+		failures.append("build_m0b_showcase() is missing \"elements\".")
+		return
+	var elements: Variant = data.get("elements", null)
+	if not (elements is Array):
+		failures.append("build_m0b_showcase().elements is not an Array.")
+		return
+	var element_array: Array = elements
+	if element_array.is_empty():
+		failures.append("build_m0b_showcase().elements is empty.")
+		return
+
+	var index := 0
+	for entry in element_array:
+		if not (entry is Dictionary):
+			failures.append("elements[%d] is not a Dictionary." % index)
+			index += 1
+			continue
+		var element: Dictionary = entry
+		var kind := str(element.get("kind", ""))
+		if kind == "wall":
+			for key in ["start", "end", "thickness", "base_y", "start_y", "end_y", "height"]:
+				if not element.has(key):
+					failures.append("elements[%d] wall is missing \"%s\"." % [index, key])
+			if element.has("start") and not (element.get("start") is Vector2):
+				failures.append("elements[%d].start is not a Vector2." % index)
+			if element.has("end") and not (element.get("end") is Vector2):
+				failures.append("elements[%d].end is not a Vector2." % index)
+		elif kind == "tower":
+			for key in ["center", "radius", "base_y", "height"]:
+				if not element.has(key):
+					failures.append("elements[%d] tower is missing \"%s\"." % [index, key])
+			if element.has("center") and not (element.get("center") is Vector2):
+				failures.append("elements[%d].center is not a Vector2." % index)
+		else:
+			failures.append("elements[%d] has unexpected kind \"%s\"." % [index, kind])
+		index += 1
+
+	if failures.is_empty():
+		print("Construction elements OK: %d footprints" % element_array.size())
+
+
+## Spawn the M0b chunks through main.gd's real `_spawn_chunks()` and confirm all
+## three LODs share one `custom_aabb` and zero visibility fade margins.
+func _check_lod_chunks(data: Dictionary, failures: Array[String]) -> void:
+	var chunks: Variant = data.get("chunks", null)
+	if not (chunks is Array) or (chunks as Array).is_empty():
+		failures.append("Cannot check LOD culling: build has no chunks.")
+		return
+
+	var main_script: Variant = load("res://scripts/main.gd")
+	if not (main_script is GDScript):
+		failures.append("main.gd did not load as a GDScript.")
+		return
+	var host: Variant = (main_script as GDScript).new()
+	if host == null or not (host is Node3D):
+		failures.append("main.gd did not instantiate as a Node3D.")
+		return
+
+	var host_node: Node3D = host
+	# Not added to the SceneTree, so _ready() does not run; _spawn_chunks only
+	# builds child MeshInstance3D nodes, which is exactly what we want to test.
+	host_node.call("_spawn_chunks", chunks)
+
+	var groups := {}
+	for child in host_node.get_children():
+		if not (child is MeshInstance3D):
+			continue
+		var parts := str(child.name).split("_LOD")
+		if parts.size() != 2:
+			continue
+		if not groups.has(parts[0]):
+			groups[parts[0]] = []
+		groups[parts[0]].append(child)
+
+	if groups.is_empty():
+		failures.append("main.gd._spawn_chunks() created no LOD instances.")
+		host_node.free()
+		return
+
+	for chunk_key in groups:
+		var lods: Array = groups[chunk_key]
+		if lods.size() != 3:
+			failures.append(
+				"Chunk %s spawned %d LOD instances, expected 3." % [chunk_key, lods.size()]
+			)
+			continue
+		var reference: MeshInstance3D = lods[0]
+		for entry in lods:
+			var lod: MeshInstance3D = entry
+			if (
+				not lod.custom_aabb.position.is_equal_approx(reference.custom_aabb.position)
+				or not lod.custom_aabb.size.is_equal_approx(reference.custom_aabb.size)
+			):
+				failures.append(
+					"Chunk %s LODs do not share an identical custom_aabb." % chunk_key
+				)
+				break
+			if (
+				not is_zero_approx(lod.visibility_range_begin_margin)
+				or not is_zero_approx(lod.visibility_range_end_margin)
+			):
+				failures.append(
+					"Chunk %s %s has non-zero visibility fade margins." % [chunk_key, lod.name]
+				)
+				break
+
+	if failures.is_empty():
+		print("LOD culling OK: %d chunks share one AABB and zero fade margins" % groups.size())
+	host_node.free()
 
 
 func _check_result(

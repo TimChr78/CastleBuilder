@@ -15,7 +15,7 @@ use godot::classes::{ArrayMesh, INode, Node};
 use godot::obj::{EngineBitfield, EngineEnum};
 use godot::prelude::*;
 
-use keep_core::document::{BatteredWall, CastleDocument, RoundTower};
+use keep_core::document::{BatteredWall, CastleDocument, Element, RoundTower};
 use keep_core::mesh::{build_scene, ChunkMeshData, SceneData};
 use keep_core::picking::SnapKind;
 use keep_core::terrain::{SiteTerrain, TerrainMeshData};
@@ -182,13 +182,18 @@ impl KeepBridge {
         self.document = document;
         self.next_id = FIRST_INTERACTIVE_ID;
         self.history.clear();
-        scene_to_dictionary(scene, document_hash)
+        scene_to_dictionary(scene, &self.document, &self.terrain, document_hash)
     }
 
     /// Rebuild the current session document into a scene dictionary.
     fn rebuild(&self) -> VarDictionary {
         let scene = build_scene(&self.document, &self.terrain);
-        scene_to_dictionary(scene, self.document.document_hash())
+        scene_to_dictionary(
+            scene,
+            &self.document,
+            &self.terrain,
+            self.document.document_hash(),
+        )
     }
 
     fn take_next_id(&mut self) -> u64 {
@@ -247,11 +252,16 @@ fn snap_kind_key(kind: Option<SnapKind>) -> GString {
     GString::from(text)
 }
 
-fn scene_to_dictionary(scene: SceneData, document_hash: u64) -> VarDictionary {
+fn scene_to_dictionary(
+    scene: SceneData,
+    document: &CastleDocument,
+    terrain: &SiteTerrain,
+    document_hash: u64,
+) -> VarDictionary {
     let mut result = VarDictionary::new();
 
-    let terrain = terrain_mesh(&scene.terrain_mesh);
-    result.set("terrain", &terrain);
+    let terrain_mesh = terrain_mesh(&scene.terrain_mesh);
+    result.set("terrain", &terrain_mesh);
 
     let mut chunks: Array<VarDictionary> = Array::new();
     for chunk in &scene.chunks {
@@ -271,6 +281,7 @@ fn scene_to_dictionary(scene: SceneData, document_hash: u64) -> VarDictionary {
         chunks.push(&entry);
     }
     result.set("chunks", &chunks);
+    result.set("elements", &elements_array(document, terrain));
     result.set("block_count", scene.block_count as i64);
     result.set("chunk_count", scene.chunks.len() as i64);
     result.set("triangle_count", scene.triangle_count as i64);
@@ -279,6 +290,49 @@ fn scene_to_dictionary(scene: SceneData, document_hash: u64) -> VarDictionary {
     let document_hash = GString::from(&format!("{document_hash:016x}"));
     result.set("document_hash", &document_hash);
     result
+}
+
+/// Per-element plan footprints in metres for the construction FX layer. Each
+/// entry carries the terrain-grounded base height (and wall end heights) so the
+/// scaffold follows slopes instead of sitting on one global castle AABB.
+fn elements_array(document: &CastleDocument, terrain: &SiteTerrain) -> Array<VarDictionary> {
+    let mut elements: Array<VarDictionary> = Array::new();
+    for element in document.elements() {
+        match element {
+            Element::BatteredWall(w) => {
+                let start_x = w.start_mm[0] as f32 / 1000.0;
+                let start_z = w.start_mm[1] as f32 / 1000.0;
+                let end_x = w.end_mm[0] as f32 / 1000.0;
+                let end_z = w.end_mm[1] as f32 / 1000.0;
+                let mid_x = (start_x + end_x) * 0.5;
+                let mid_z = (start_z + end_z) * 0.5;
+                let mut entry = VarDictionary::new();
+                let kind = GString::from("wall");
+                entry.set("kind", &kind);
+                entry.set("start", Vector2::new(start_x, start_z));
+                entry.set("end", Vector2::new(end_x, end_z));
+                entry.set("thickness", w.thickness_mm as f32 / 1000.0);
+                entry.set("base_y", terrain.height_m(mid_x, mid_z));
+                entry.set("start_y", terrain.height_m(start_x, start_z));
+                entry.set("end_y", terrain.height_m(end_x, end_z));
+                entry.set("height", w.height_mm as f32 / 1000.0);
+                elements.push(&entry);
+            }
+            Element::RoundTower(t) => {
+                let cx = t.centre_mm[0] as f32 / 1000.0;
+                let cz = t.centre_mm[1] as f32 / 1000.0;
+                let mut entry = VarDictionary::new();
+                let kind = GString::from("tower");
+                entry.set("kind", &kind);
+                entry.set("center", Vector2::new(cx, cz));
+                entry.set("radius", t.radius_mm as f32 / 1000.0);
+                entry.set("base_y", terrain.height_m(cx, cz));
+                entry.set("height", t.height_mm as f32 / 1000.0);
+                elements.push(&entry);
+            }
+        }
+    }
+    elements
 }
 
 fn terrain_mesh(data: &TerrainMeshData) -> Gd<ArrayMesh> {

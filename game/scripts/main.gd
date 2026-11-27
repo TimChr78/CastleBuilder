@@ -6,8 +6,9 @@ extends Node3D
 ## debug HUD and the KeepBridge GDExtension. Terrain and chunk meshes returned by
 ## keep-gd are already in world space, so they are wrapped in identity-transform
 ## MeshInstance3D nodes with visibility ranges for LOD0 (0-90 m), LOD1 (90-200 m)
-## and LOD2 (200-650 m). Keeping the nodes at the origin preserves the mesh AABB
-## at its true world position for frustum, shadow and visibility-range culling.
+## and LOD2 (200 m to infinity). Every LOD of a chunk shares one `custom_aabb` and
+## zero fade margins so Godot evaluates the exact same camera distance for all
+## three LODs; otherwise their slightly different mesh AABBs create pops.
 ##
 ## M0b adds the construction theater (climbing scaffolding + rising dust), the
 ## procedural generator audio and the interactive design-tool overlay.
@@ -23,8 +24,8 @@ const DESIGN_TOOL_SCRIPT := preload("res://scripts/design_tool.gd")
 # Chunk visibility ranges in metres. Keep aligned with the M0a budget. LOD0
 # extends far enough that the default framing (~50 m) always shows full detail.
 const LOD_BEGIN := [0.0, 90.0, 200.0]
-const LOD_END := [90.0, 200.0, 650.0]
-const LOD_FADE_MARGIN := [4.0, 8.0, 16.0]
+## 0.0 means "infinite far distance": distant chunks never disappear.
+const LOD_END := [90.0, 200.0, 0.0]
 
 ## Seconds for the construction front to sweep 0 → 1 once, then hold.
 const BUILD_PLAY_SECONDS := 27.0
@@ -331,7 +332,11 @@ func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 
 	var bounds := _compute_masonry_bounds(data)
 	if _fx != null:
-		_fx.call("configure_bounds", bounds)
+		var elements: Variant = data.get("elements", [])
+		if elements is Array and not (elements as Array).is_empty():
+			_fx.call("configure_elements", elements as Array, bounds)
+		else:
+			_fx.call("configure_bounds", bounds)
 	if _design_tool != null:
 		_design_tool.call("set_ground_height", bounds.position.y)
 
@@ -364,6 +369,17 @@ func _spawn_chunks(chunks: Variant) -> void:
 			continue
 		var chunk: Dictionary = entry
 
+		# One shared AABB for every LOD of this chunk. Godot measures the
+		# camera-to-AABB distance for visibility ranges, so differing per-LOD
+		# mesh AABBs would make LOD0/LOD1/LOD2 swap at slightly different
+		# distances and flicker. Sharing the AABB removes that mismatch.
+		var shared_aabb := _chunk_shared_aabb(chunk)
+		var has_shared := (
+			shared_aabb.size.x > 0.0
+			or shared_aabb.size.y > 0.0
+			or shared_aabb.size.z > 0.0
+		)
+
 		for lod in range(3):
 			var mesh: Variant = chunk.get("lod%d" % lod, null)
 			if mesh == null or not (mesh is ArrayMesh):
@@ -376,15 +392,40 @@ func _spawn_chunks(chunks: Variant) -> void:
 			# keep-core already emits world-space vertices; leave the node at the
 			# identity transform so its AABB matches the real world position.
 			instance.position = Vector3.ZERO
+			if has_shared:
+				instance.custom_aabb = shared_aabb
 			instance.visibility_range_begin = LOD_BEGIN[lod]
-			instance.visibility_range_begin_margin = LOD_FADE_MARGIN[lod]
+			# Zero margins with FADE_DISABLED: non-zero margins create hysteresis
+			# dead zones where both LOD0 and LOD1 are hidden at once.
+			instance.visibility_range_begin_margin = 0.0
 			instance.visibility_range_end = LOD_END[lod]
-			instance.visibility_range_end_margin = LOD_FADE_MARGIN[lod]
+			instance.visibility_range_end_margin = 0.0
 			instance.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_DISABLED
 			instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 			instance.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
 			add_child(instance)
 			_chunk_instances.append(instance)
+
+
+## Merge the LOD meshes' world-space bounds for one chunk. LOD0 anchors the
+## result; LOD1/LOD2 contribute only when they actually contain geometry.
+func _chunk_shared_aabb(chunk: Dictionary) -> AABB:
+	var bounds := AABB()
+	var have_bounds := false
+	for lod in range(3):
+		var mesh: Variant = chunk.get("lod%d" % lod, null)
+		if not (mesh is ArrayMesh):
+			continue
+		var array_mesh: ArrayMesh = mesh as ArrayMesh
+		if array_mesh.get_surface_count() == 0:
+			continue
+		var mesh_bounds: AABB = array_mesh.get_aabb()
+		if not have_bounds:
+			bounds = mesh_bounds
+			have_bounds = true
+		else:
+			bounds = bounds.merge(mesh_bounds)
+	return bounds
 
 
 func _clear_world_meshes() -> void:
