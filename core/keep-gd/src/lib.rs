@@ -1,10 +1,11 @@
 //! Thin GDExtension binding: commands in, mesh buffers out.
 //!
-//! `KeepBridge` is a thin *session* bridge, not an authority: it keeps the
-//! active [`CastleDocument`] and [`SiteTerrain`] so interactive edits can be
-//! applied and re-meshed, but every rebuild still runs the deterministic
-//! `keep-core` pipeline. The returned dictionary is Godot scenery, never the
-//! source of truth.
+//! `KeepBridge` is a thin *session* bridge, not an authority: it forwards
+//! interactive edits to a [`keep_core::session::Session`], which owns the
+//! authoritative [`keep_core::document::CastleDocument`], the append-only
+//! command log and the undo semantics. Every rebuild still runs the
+//! deterministic `keep-core` pipeline. The returned dictionary is Godot
+//! scenery, never the source of truth.
 
 use godot::builtin::{
     Array, Color, GString, PackedColorArray, PackedFloat32Array, PackedInt32Array,
@@ -15,25 +16,26 @@ use godot::classes::{ArrayMesh, INode, Node};
 use godot::obj::{EngineBitfield, EngineEnum};
 use godot::prelude::*;
 
-use keep_core::document::{BatteredWall, CastleDocument, Element, RoundTower};
-use keep_core::mesh::{build_scene, ChunkMeshData, SceneData};
+use keep_core::command::{
+    AuthorId, CommandOp, MAX_TOWER_HEIGHT_MM, MAX_TOWER_RADIUS_MM, MAX_WALL_HEIGHT_MM,
+    MAX_WALL_THICKNESS_MM, MIN_TOWER_HEIGHT_MM, MIN_TOWER_RADIUS_MM, MIN_WALL_HEIGHT_MM,
+    MIN_WALL_THICKNESS_MM,
+};
+use keep_core::document::{CastleDocument, Element};
+use keep_core::mesh::{ChunkMeshData, SceneData};
 use keep_core::picking::SnapKind;
+use keep_core::session::{Session, DEFAULT_SITE_ID};
 use keep_core::terrain::{SiteTerrain, TerrainMeshData};
-
-/// First id handed to an interactively added element. Fixture ids stay well
-/// below this, so interactive edits never collide with the loaded showcase.
-const FIRST_INTERACTIVE_ID: u64 = 1_000;
 
 /// The only class the game needs for M0a/M0b.
 #[derive(GodotClass)]
 #[class(base = Node)]
 pub struct KeepBridge {
     base: Base<Node>,
-    terrain: SiteTerrain,
-    document: CastleDocument,
-    next_id: u64,
-    /// Ids of interactively added elements, newest last, for undo.
-    history: Vec<u64>,
+    /// Host-authoritative session: document, command log and undo live here.
+    session: Session,
+    /// Author used for every local interactive edit.
+    player_author: AuthorId,
 }
 
 #[godot_api]
@@ -41,10 +43,13 @@ impl INode for KeepBridge {
     fn init(base: Base<Node>) -> Self {
         Self {
             base,
-            terrain: SiteTerrain::m0a_promontory(),
-            document: keep_core::fixtures::m0b_showcase_document(),
-            next_id: FIRST_INTERACTIVE_ID,
-            history: Vec::new(),
+            session: Session::from_document(
+                DEFAULT_SITE_ID,
+                SiteTerrain::m0a_promontory(),
+                keep_core::fixtures::m0b_showcase_document(),
+            ),
+            player_author: AuthorId::player("local")
+                .expect("built-in local player author id is always valid"),
         }
     }
 }
@@ -54,26 +59,41 @@ impl KeepBridge {
     /// Build the fixed M0a look scene (one battered wall, one round tower).
     #[func]
     fn build_m0a_showcase(&mut self) -> VarDictionary {
-        self.load_document(keep_core::fixtures::m0a_showcase_document())
+        self.session = Session::from_document(
+            DEFAULT_SITE_ID,
+            SiteTerrain::m0a_promontory(),
+            keep_core::fixtures::m0a_showcase_document(),
+        );
+        self.session_scene()
     }
 
     /// Build the M0b junction and void look scene.
     #[func]
     fn build_m0b_showcase(&mut self) -> VarDictionary {
-        self.load_document(keep_core::fixtures::m0b_showcase_document())
+        self.session = Session::from_document(
+            DEFAULT_SITE_ID,
+            SiteTerrain::m0a_promontory(),
+            keep_core::fixtures::m0b_showcase_document(),
+        );
+        self.session_scene()
     }
 
     /// Build the large concentric-castle stress scene (~200k blocks).
     #[func]
     fn build_stress_200k(&mut self) -> VarDictionary {
-        self.load_document(keep_core::fixtures::stress_200k_document())
+        self.session = Session::from_document(
+            DEFAULT_SITE_ID,
+            SiteTerrain::m0a_promontory(),
+            keep_core::fixtures::stress_200k_document(),
+        );
+        self.session_scene()
     }
 
     /// Pick the promontory ground under a world-space ray. `point` is in metres.
     #[func]
     fn pick_terrain(&self, ray_origin: Vector3, ray_dir: Vector3) -> VarDictionary {
         let hit = keep_core::picking::pick_terrain(
-            &self.terrain,
+            self.session.terrain(),
             [ray_origin.x, ray_origin.y, ray_origin.z],
             [ray_dir.x, ray_dir.y, ray_dir.z],
         );
@@ -101,7 +121,7 @@ impl KeepBridge {
     fn snap_point(&self, point_xz: Vector2, snap_radius_m: f32) -> VarDictionary {
         let point_mm = quantise_xz(point_xz);
         let radius_mm = (f64::from(snap_radius_m.max(0.0)) * 1000.0).round() as i64;
-        let snap = keep_core::picking::snap_point(&self.document, point_mm, radius_mm);
+        let snap = keep_core::picking::snap_point(self.session.document(), point_mm, radius_mm);
 
         let mut result = VarDictionary::new();
         result.set("snapped", snap.is_snapped());
@@ -119,6 +139,9 @@ impl KeepBridge {
     }
 
     /// Add a battered curtain wall and return the rebuilt scene.
+    ///
+    /// The edit is a normal command batch, so it is validated, logged and
+    /// undoable exactly like an agent edit.
     #[func]
     fn add_wall(
         &mut self,
@@ -127,95 +150,138 @@ impl KeepBridge {
         height_m: f32,
         thickness_m: f32,
     ) -> VarDictionary {
-        let id = self.take_next_id();
-        let height_mm = quantise_m(height_m).max(1_000);
-        let thickness_mm = quantise_m(thickness_m).max(200);
-        let wall = BatteredWall::new(
-            id,
-            format!("Wall {id}"),
-            quantise_xz(start_xz),
-            quantise_xz(end_xz),
+        let height_mm = quantise_m(height_m).clamp(MIN_WALL_HEIGHT_MM, MAX_WALL_HEIGHT_MM);
+        let thickness_mm =
+            quantise_m(thickness_m).clamp(MIN_WALL_THICKNESS_MM, MAX_WALL_THICKNESS_MM);
+        let op = CommandOp::CreateWallRun {
+            ref_id: None,
+            name: format!("Wall {}", self.session.next_element_id()),
+            start_mm: quantise_xz(start_xz),
+            end_mm: quantise_xz(end_xz),
             height_mm,
             thickness_mm,
-        );
-        self.document.add_wall(wall);
-        self.history.push(id);
-        self.rebuild()
+            batter_mm: None,
+        };
+        match self
+            .session
+            .apply_batch(self.player_author.clone(), vec![op])
+        {
+            Ok(_) => {
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
     }
 
     /// Add a round tower and return the rebuilt scene.
     #[func]
     fn add_tower(&mut self, center_xz: Vector2, radius_m: f32, height_m: f32) -> VarDictionary {
-        let id = self.take_next_id();
-        let radius_mm = quantise_m(radius_m).max(800);
-        let height_mm = quantise_m(height_m).max(1_000);
-        let tower = RoundTower::new(
-            id,
-            format!("Tower {id}"),
-            quantise_xz(center_xz),
+        let radius_mm = quantise_m(radius_m).clamp(MIN_TOWER_RADIUS_MM, MAX_TOWER_RADIUS_MM);
+        let height_mm = quantise_m(height_m).clamp(MIN_TOWER_HEIGHT_MM, MAX_TOWER_HEIGHT_MM);
+        let op = CommandOp::CreateTower {
+            ref_id: None,
+            name: format!("Tower {}", self.session.next_element_id()),
+            centre_mm: quantise_xz(center_xz),
             radius_mm,
             height_mm,
-        );
-        self.document.add_tower(tower);
-        self.history.push(id);
-        self.rebuild()
+            batter_mm: None,
+        };
+        match self
+            .session
+            .apply_batch(self.player_author.clone(), vec![op])
+        {
+            Ok(_) => {
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
     }
 
-    /// Remove the most recently added interactive element, if any.
+    /// Compensate the most recent local batch. History is append-only: the undo
+    /// is itself a command and never truncates the log.
     #[func]
     fn undo_last(&mut self) -> VarDictionary {
-        let undone = self.history.pop();
-        if let Some(id) = undone {
-            remove_element(&mut self.document, id);
+        match self.session.undo_last(&self.player_author) {
+            Ok(undo) => {
+                let mut result = self.session_scene();
+                result.set("undone", true);
+                result.set("ok", true);
+                result.set("target_seq", undo.target_seq as i64);
+                result.set("summary", &GString::from(&undo.summary));
+                result
+            }
+            Err(error) => {
+                // Nothing changed, so skip the expensive scene rebuild and
+                // report the refusal directly to the UI.
+                let mut result = VarDictionary::new();
+                let message = GString::from(&error.to_string());
+                result.set("undone", false);
+                result.set("ok", false);
+                result.set("reason", &message);
+                result.set("error", &message);
+                result
+            }
         }
-        let mut result = self.rebuild();
-        result.set("undone", undone.is_some());
-        result
+    }
+
+    /// Serialise the session as `castle.keep.json` text.
+    #[func]
+    fn save_castle_json(&self) -> VarDictionary {
+        match self.session.to_save_json() {
+            Ok(json) => {
+                let mut result = VarDictionary::new();
+                result.set("ok", true);
+                result.set("json", &GString::from(&json));
+                result.set(
+                    "document_hash",
+                    &GString::from(&format!("{:016x}", self.session.document().document_hash())),
+                );
+                result.set("history_len", self.session.history().len() as i64);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Load a `castle.keep.json` text, replaying and verifying its command log.
+    #[func]
+    fn load_castle_json(&mut self, json: GString) -> VarDictionary {
+        match Session::from_save_json(&json.to_string()) {
+            Ok(session) => {
+                self.session = session;
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
     }
 }
 
 impl KeepBridge {
-    /// Replace the session document, reset interactive ids and rebuild.
-    fn load_document(&mut self, document: CastleDocument) -> VarDictionary {
-        let scene = build_scene(&document, &self.terrain);
-        let document_hash = document.document_hash();
-        self.document = document;
-        self.next_id = FIRST_INTERACTIVE_ID;
-        self.history.clear();
-        scene_to_dictionary(scene, &self.document, &self.terrain, document_hash)
-    }
-
     /// Rebuild the current session document into a scene dictionary.
-    fn rebuild(&self) -> VarDictionary {
-        let scene = build_scene(&self.document, &self.terrain);
-        scene_to_dictionary(
+    fn session_scene(&self) -> VarDictionary {
+        let scene = self.session.build_scene();
+        let mut result = scene_to_dictionary(
             scene,
-            &self.document,
-            &self.terrain,
-            self.document.document_hash(),
-        )
-    }
-
-    fn take_next_id(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
+            self.session.document(),
+            self.session.terrain(),
+            self.session.document().document_hash(),
+        );
+        result.set("history_len", self.session.history().len() as i64);
+        result
     }
 }
 
-/// `CastleDocument` intentionally exposes no removal API (deletion is a command
-/// the core will own later), so undo rebuilds the document without `id`.
-fn remove_element(document: &mut CastleDocument, id: u64) {
-    let mut rebuilt = CastleDocument::new();
-    for element in document.elements() {
-        if element.id() != id {
-            rebuilt.insert(element.clone());
-        }
-    }
-    for opening in document.openings() {
-        rebuilt.insert_opening(opening.clone());
-    }
-    *document = rebuilt;
+fn error_dictionary(message: &impl std::fmt::Display) -> VarDictionary {
+    let mut result = VarDictionary::new();
+    result.set("ok", false);
+    result.set("error", &GString::from(&message.to_string()));
+    result
 }
 
 fn quantise_m(value: f32) -> i64 {

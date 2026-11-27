@@ -45,6 +45,14 @@ func _initialize() -> void:
 		quit(1)
 		return
 
+	if bridge != null:
+		_check_wave2b(bridge, failures)
+
+	if not failures.is_empty():
+		_for_each_failure(failures)
+		quit(1)
+		return
+
 	_check_feel_scripts(failures)
 
 	if not failures.is_empty():
@@ -179,6 +187,204 @@ func _check_wave2(bridge: Object, failures: Array[String]) -> void:
 				int(m0b.get("chunk_count", 0)),
 				document_hash_before,
 			]
+		)
+
+
+## M1.1 Wave 2b: session-backed save/load round trip and compensating undo.
+##
+## Saves a freshly built castle, resets to a different showcase, restores the
+## save and requires identical document/layout hashes and block count. Then
+## checks that undo restores the pre-edit document while the append-only log
+## grows by one entry.
+func _check_wave2b(bridge: Object, failures: Array[String]) -> void:
+	for method in ["save_castle_json", "load_castle_json"]:
+		if not bridge.has_method(method):
+			failures.append("KeepBridge has no %s() method." % method)
+	if not failures.is_empty():
+		return
+
+	# Fresh session: known hash, empty history.
+	var base_result: Variant = bridge.call("build_m0b_showcase")
+	if not (base_result is Dictionary):
+		failures.append("build_m0b_showcase() did not return a Dictionary for the save/load test.")
+		return
+	var base: Dictionary = base_result
+	var base_hash := str(base.get("document_hash", ""))
+	var base_history := int(base.get("history_len", -1))
+	if base_history != 0:
+		failures.append(
+			"build_m0b_showcase() started with history_len %d, expected 0." % base_history
+		)
+
+	var wall_result: Variant = bridge.call(
+		"add_wall", Vector2(-6.0, -7.0), Vector2(6.0, -7.0), 7.5, 1.8
+	)
+	if not (wall_result is Dictionary) or not bool((wall_result as Dictionary).get("ok", false)):
+		failures.append("add_wall() was rejected in the save/load test: %s" % str(wall_result))
+		return
+
+	var tower_result: Variant = bridge.call("add_tower", Vector2(9.0, -12.0), 2.5, 9.0)
+	if not (tower_result is Dictionary) or not bool((tower_result as Dictionary).get("ok", false)):
+		failures.append("add_tower() was rejected in the save/load test: %s" % str(tower_result))
+		return
+	var built: Dictionary = tower_result
+	var saved_hash := str(built.get("document_hash", ""))
+	var saved_layout := str(built.get("layout_hash", ""))
+	var saved_blocks := int(built.get("block_count", -1))
+	var saved_history := int(built.get("history_len", -1))
+	if saved_history != base_history + 2:
+		failures.append(
+			"history_len after two edits is %d, expected %d."
+			% [saved_history, base_history + 2]
+		)
+
+	var save_result: Variant = bridge.call("save_castle_json")
+	if not (save_result is Dictionary):
+		failures.append("save_castle_json() did not return a Dictionary.")
+		return
+	var save_data: Dictionary = save_result
+	if not bool(save_data.get("ok", false)):
+		failures.append("save_castle_json() failed: %s" % str(save_data.get("error", "")))
+		return
+	var saved_json := str(save_data.get("json", ""))
+	if saved_json.is_empty():
+		failures.append("save_castle_json() returned an empty json payload.")
+		return
+	if str(save_data.get("document_hash", "")) != saved_hash:
+		failures.append("save_castle_json().document_hash does not match the live scene hash.")
+	if int(save_data.get("history_len", -1)) != saved_history:
+		failures.append(
+			"save_castle_json().history_len does not match the live history length."
+		)
+
+	# Reset to a different castle, then restore from the saved JSON.
+	var other_result: Variant = bridge.call("build_m0a_showcase")
+	if (
+		other_result is Dictionary
+		and str((other_result as Dictionary).get("document_hash", "")) == saved_hash
+	):
+		failures.append("build_m0a_showcase() did not reset to a different document.")
+
+	var load_result: Variant = bridge.call("load_castle_json", saved_json)
+	if not (load_result is Dictionary):
+		failures.append("load_castle_json() did not return a Dictionary.")
+		return
+	var loaded: Dictionary = load_result
+	if not bool(loaded.get("ok", false)):
+		failures.append("load_castle_json() failed: %s" % str(loaded.get("error", "")))
+		return
+	if str(loaded.get("document_hash", "")) != saved_hash:
+		failures.append(
+			"load_castle_json() restored document_hash %s, expected %s."
+			% [str(loaded.get("document_hash", "")), saved_hash]
+		)
+	if str(loaded.get("layout_hash", "")) != saved_layout:
+		failures.append(
+			"load_castle_json() restored layout_hash %s, expected %s."
+			% [str(loaded.get("layout_hash", "")), saved_layout]
+		)
+	if int(loaded.get("block_count", -1)) != saved_blocks:
+		failures.append(
+			"load_castle_json() restored block_count %d, expected %d."
+			% [int(loaded.get("block_count", -1)), saved_blocks]
+		)
+	if int(loaded.get("history_len", -1)) != saved_history:
+		failures.append(
+			"load_castle_json() restored history_len %d, expected %d."
+			% [int(loaded.get("history_len", -1)), saved_history]
+		)
+
+	# A tampered save must be rejected and must leave the live session untouched.
+	var live_before_tamper: Variant = bridge.call("save_castle_json")
+	if (
+		not (live_before_tamper is Dictionary)
+		or not bool((live_before_tamper as Dictionary).get("ok", false))
+	):
+		failures.append("save_castle_json() failed before the tampered-load test.")
+		return
+	var live_hash_before_tamper := str(
+		(live_before_tamper as Dictionary).get("document_hash", "")
+	)
+	var live_history_before_tamper := int(
+		(live_before_tamper as Dictionary).get("history_len", -1)
+	)
+
+	var tampered_value: Variant = JSON.parse_string(saved_json)
+	if not (tampered_value is Dictionary):
+		failures.append("Saved JSON did not parse for the tampered-load test.")
+	else:
+		var tampered: Dictionary = tampered_value
+		tampered["document_hash"] = int(tampered.get("document_hash", 0)) ^ 1
+		var tampered_result: Variant = bridge.call(
+			"load_castle_json", JSON.stringify(tampered)
+		)
+		if not (tampered_result is Dictionary):
+			failures.append(
+				"load_castle_json() did not return a Dictionary for a tampered save."
+			)
+		else:
+			var tampered_data: Dictionary = tampered_result
+			if bool(tampered_data.get("ok", true)):
+				failures.append("load_castle_json() accepted a tampered document_hash.")
+			if str(tampered_data.get("error", "")).is_empty():
+				failures.append(
+					"load_castle_json() returned an empty error for a tampered save."
+				)
+
+	var live_after_tamper: Variant = bridge.call("save_castle_json")
+	if (
+		not (live_after_tamper is Dictionary)
+		or not bool((live_after_tamper as Dictionary).get("ok", false))
+	):
+		failures.append("save_castle_json() failed after the rejected tampered load.")
+	else:
+		var live_after: Dictionary = live_after_tamper
+		if str(live_after.get("document_hash", "")) != live_hash_before_tamper:
+			failures.append("A rejected tampered load changed the live document_hash.")
+		if int(live_after.get("history_len", -1)) != live_history_before_tamper:
+			failures.append("A rejected tampered load changed the live history_len.")
+
+	# Compensating undo: restores the pre-edit document, appends to history.
+	var pre_edit_hash := str(loaded.get("document_hash", ""))
+	var pre_edit_layout := str(loaded.get("layout_hash", ""))
+	var pre_edit_history := int(loaded.get("history_len", 0))
+	var edit_result: Variant = bridge.call("add_tower", Vector2(24.0, -8.0), 2.0, 8.0)
+	if not (edit_result is Dictionary) or not bool((edit_result as Dictionary).get("ok", false)):
+		failures.append("add_tower() was rejected before the undo test: %s" % str(edit_result))
+		return
+	var edited: Dictionary = edit_result
+	var edited_history := int(edited.get("history_len", -1))
+	if str(edited.get("document_hash", "")) == pre_edit_hash:
+		failures.append("add_tower() did not change the document before the undo test.")
+
+	var undo_result: Variant = bridge.call("undo_last")
+	if not (undo_result is Dictionary):
+		failures.append("undo_last() did not return a Dictionary in the undo test.")
+		return
+	var undone: Dictionary = undo_result
+	if not bool(undone.get("undone", false)):
+		failures.append(
+			"undo_last() refused the compensating undo: %s" % str(undone.get("reason", ""))
+		)
+		return
+	if str(undone.get("document_hash", "")) != pre_edit_hash:
+		failures.append("undo_last() did not restore the pre-edit document_hash.")
+	if str(undone.get("layout_hash", "")) != pre_edit_layout:
+		failures.append("undo_last() did not restore the pre-edit layout_hash.")
+	if int(undone.get("history_len", -1)) != edited_history + 1:
+		failures.append(
+			"undo_last() did not append to history (history_len %d, expected %d)."
+			% [int(undone.get("history_len", -1)), edited_history + 1]
+		)
+	if int(undone.get("history_len", 0)) <= pre_edit_history:
+		failures.append("undo_last() truncated history instead of appending.")
+	if base_hash == saved_hash:
+		failures.append("save/load fixture did not change the document from its base state.")
+
+	if failures.is_empty():
+		print(
+			"M1.1 save/load + compensating undo OK: doc=%s history=%d"
+			% [saved_hash, int(undone.get("history_len", -1))]
 		)
 
 

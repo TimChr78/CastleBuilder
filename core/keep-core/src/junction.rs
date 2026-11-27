@@ -23,6 +23,8 @@
 //!   pushed a little into the tower shell so the flat tower facets never show a
 //!   gap against the true circle.
 
+use std::collections::BTreeSet;
+
 use crate::document::{BatteredWall, CastleDocument, Element, ElementId, RoundTower};
 use crate::terrain::SiteTerrain;
 use libm::{round, sqrt};
@@ -691,6 +693,86 @@ pub fn subtract_interval(allowed: &[(i64, i64)], lo: i64, hi: i64) -> Vec<(i64, 
     }
     result.retain(|(a, b)| b > a);
     result
+}
+
+/// Every other element that shares a junction with `element_id`: its footprint
+/// intersects, its run shares an endpoint, or one trims the other.
+///
+/// Undo uses this to widen the conflict scope. Removing one half of a junction
+/// silently changes the other half's masonry, so a later edit to either side
+/// must block the undo (architecture section 15.3).
+pub fn junction_partners(
+    document: &CastleDocument,
+    terrain: &SiteTerrain,
+    element_id: ElementId,
+) -> BTreeSet<ElementId> {
+    let mut partners = BTreeSet::new();
+    let Some(element) = document.get(element_id) else {
+        return partners;
+    };
+    for other in document.elements() {
+        if other.id() == element_id {
+            continue;
+        }
+        if elements_form_junction(terrain, element, other) {
+            partners.insert(other.id());
+        }
+    }
+    partners
+}
+
+/// Slack added to the touching reach so hand-dragged endpoints that leave a
+/// few hundred millimetres of mortar still count as the same junction. Mirrors
+/// the `750 mm` slack used by [`blocked_by_wall`].
+const JUNCTION_SLACK_MM: f64 = 750.0;
+
+fn elements_form_junction(terrain: &SiteTerrain, a: &Element, b: &Element) -> bool {
+    match (a, b) {
+        (Element::BatteredWall(a), Element::BatteredWall(b)) => walls_form_junction(a, b),
+        (Element::RoundTower(tower), Element::BatteredWall(wall))
+        | (Element::BatteredWall(wall), Element::RoundTower(tower)) => {
+            tower_and_wall_form_junction(terrain, tower, wall)
+        }
+        (Element::RoundTower(a), Element::RoundTower(b)) => {
+            let dx = a.centre_mm[0] as i128 - b.centre_mm[0] as i128;
+            let dz = a.centre_mm[1] as i128 - b.centre_mm[1] as i128;
+            let reach = i128::from(a.radius_mm) + i128::from(b.radius_mm);
+            dx * dx + dz * dz <= reach * reach
+        }
+    }
+}
+
+fn walls_form_junction(a: &BatteredWall, b: &BatteredWall) -> bool {
+    if endpoints_touch(a.start_mm, b.start_mm)
+        || endpoints_touch(a.start_mm, b.end_mm)
+        || endpoints_touch(a.end_mm, b.start_mm)
+        || endpoints_touch(a.end_mm, b.end_mm)
+    {
+        return true;
+    }
+    let reach = (a.thickness_mm.max(0) + b.thickness_mm.max(0)) as f64 * 0.5 + JUNCTION_SLACK_MM;
+    segment_distance(
+        [a.start_mm[0] as f64, a.start_mm[1] as f64],
+        [a.end_mm[0] as f64, a.end_mm[1] as f64],
+        [b.start_mm[0] as f64, b.start_mm[1] as f64],
+        [b.end_mm[0] as f64, b.end_mm[1] as f64],
+    ) <= reach
+}
+
+fn tower_and_wall_form_junction(
+    terrain: &SiteTerrain,
+    tower: &RoundTower,
+    wall: &BatteredWall,
+) -> bool {
+    let (foundation_y, _, _) = tower_elevations(tower, terrain);
+    let tower_reach = tower_outer_radius_at(tower, terrain, foundation_y).max(0) as f64;
+    let wall_reach = wall_half_width_at(wall, terrain, foundation_y).max(0) as f64;
+    let distance = point_segment_distance(
+        [tower.centre_mm[0] as f64, tower.centre_mm[1] as f64],
+        [wall.start_mm[0] as f64, wall.start_mm[1] as f64],
+        [wall.end_mm[0] as f64, wall.end_mm[1] as f64],
+    );
+    distance <= tower_reach + wall_reach + JUNCTION_SLACK_MM
 }
 
 /// Priority ordering for a pair of element ids, used by tests and tooling.

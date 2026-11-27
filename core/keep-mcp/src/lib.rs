@@ -9,18 +9,15 @@
 //! error case and atomic rollback can be unit tested without a subprocess. The
 //! `keep-mcp` binary is a small stdin/stdout loop around it.
 
-use std::collections::BTreeMap;
-
-use keep_core::document::{
-    BatteredWall, CastleDocument, Element, Opening, OpeningKind, RoundTower,
-};
-use keep_core::mesh::build_scene;
+use keep_core::command::AuthorId;
+use keep_core::document::{CastleDocument, Element};
 use keep_core::plan_render::{render_plan_svg, PlanView};
+use keep_core::session::Session;
 use keep_core::terrain::SiteTerrain;
 use keep_proto::{
-    validate_batch, validate_element_budget, ApplyOperationsRequest, ApplyOperationsResponse,
-    ElementListResponse, ElementSummary, GetCastleResponse, OpeningSummary, Operation,
-    RenderPlanRequest, RenderPlanResponse,
+    ApplyOperationsRequest, ApplyOperationsResponse, ElementListResponse, ElementSummary,
+    GetCastleResponse, GetHistoryResponse, HistoryEntry, OpeningSummary, RenderPlanRequest,
+    RenderPlanResponse, UndoResponse,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -29,6 +26,8 @@ use serde_json::{json, Value};
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 /// Server name reported during `initialize`.
 pub const SERVER_NAME: &str = "keep-mcp";
+/// Author identity written into the command log for offline agent edits.
+pub const OFFLINE_AUTHOR_ID: &str = "mcp-offline";
 
 /// JSON-RPC error codes used by the handler.
 mod code {
@@ -36,18 +35,16 @@ mod code {
     pub const INVALID_REQUEST: i64 = -32600;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;
+    pub const INTERNAL_ERROR: i64 = -32603;
     pub const RESOURCE_NOT_FOUND: i64 = -32002;
 }
 
-/// The offline MCP server: one castle document plus fixed terrain authority.
+/// The offline MCP server: one authoritative [`Session`] plus the agent author
+/// identity used for edits and undos.
 #[derive(Debug)]
 pub struct McpServer {
-    document: CastleDocument,
-    terrain: SiteTerrain,
-    /// Next id to hand out. Monotonic for the lifetime of the server so ids of
-    /// deleted elements are never reused, which keeps earlier tool output
-    /// unambiguous across turns.
-    next_id: u64,
+    session: Session,
+    author: AuthorId,
 }
 
 impl Default for McpServer {
@@ -66,15 +63,23 @@ impl McpServer {
             keep_core::fixtures::m0b_showcase_document()
         };
         Self {
-            next_id: max_existing_id(&document) + 1,
-            document,
-            terrain: SiteTerrain::m0a_promontory(),
+            session: Session::from_document(
+                keep_core::session::DEFAULT_SITE_ID,
+                SiteTerrain::m0a_promontory(),
+                document,
+            ),
+            author: AuthorId::agent(OFFLINE_AUTHOR_ID).expect("offline author id is valid"),
         }
     }
 
     /// Current castle document (tests and embedders).
     pub fn document(&self) -> &CastleDocument {
-        &self.document
+        self.session.document()
+    }
+
+    /// The authoritative session (tests and embedders).
+    pub fn session(&self) -> &Session {
+        &self.session
     }
 
     /// Handle one line of stdin. Returns the JSON-RPC response line, or `None`
@@ -163,6 +168,8 @@ impl McpServer {
             "apply_operations" => self
                 .tool_apply_operations(arguments)
                 .map(|value| tool_result(&value)),
+            "undo" => self.tool_undo().map(|value| tool_result(&value)),
+            "get_history" => self.tool_get_history().map(|value| tool_result(&value)),
             other => {
                 return error_response(id, code::INVALID_PARAMS, format!("unknown tool: {other}"))
             }
@@ -179,25 +186,27 @@ impl McpServer {
     }
 
     fn tool_get_castle(&self) -> Result<GetCastleResponse, String> {
-        let scene = build_scene(&self.document, &self.terrain);
+        let scene = self.session.build_scene();
+        let document = self.session.document();
         Ok(GetCastleResponse {
-            document_hash: hex_hash(self.document.document_hash()),
+            document_hash: hex_hash(document.document_hash()),
             layout_hash: hex_hash(scene.layout_hash),
-            element_count: self.document.len(),
-            opening_count: self.document.opening_count(),
+            element_count: document.len(),
+            opening_count: document.opening_count(),
             block_count: scene.block_count,
             chunk_count: scene.chunk_count(),
-            elements: element_summaries(&self.document),
-            openings: opening_summaries(&self.document),
+            elements: element_summaries(document),
+            openings: opening_summaries(document),
         })
     }
 
     fn tool_list_elements(&self) -> Result<ElementListResponse, String> {
+        let document = self.session.document();
         Ok(ElementListResponse {
-            element_count: self.document.len(),
-            opening_count: self.document.opening_count(),
-            elements: element_summaries(&self.document),
-            openings: opening_summaries(&self.document),
+            element_count: document.len(),
+            opening_count: document.opening_count(),
+            elements: element_summaries(document),
+            openings: opening_summaries(document),
         })
     }
 
@@ -213,146 +222,85 @@ impl McpServer {
                 ))
             }
         };
-        let svg = render_plan_svg(&self.document, &self.terrain, view);
+        let svg = render_plan_svg(self.session.document(), self.session.terrain(), view);
         Ok(RenderPlanResponse {
             view: view_name.to_string(),
-            document_hash: hex_hash(self.document.document_hash()),
+            document_hash: hex_hash(self.session.document().document_hash()),
             mime_type: "image/svg+xml".to_string(),
             svg,
         })
     }
 
-    /// Apply a batch atomically: all operations run against a clone first and
-    /// the live document is only replaced when the whole batch succeeds.
+    /// Apply a batch atomically through the shared session engine. Validation,
+    /// id allocation, inverse records and logging all live in `keep-core`, so
+    /// the offline sidecar enforces exactly the same rules as the game host.
     fn tool_apply_operations(
         &mut self,
         arguments: Value,
     ) -> Result<ApplyOperationsResponse, String> {
         let request: ApplyOperationsRequest = serde_json::from_value(arguments)
             .map_err(|error| format!("invalid arguments: {error}"))?;
-        validate_batch(&request.operations).map_err(|error| error.to_string())?;
+        let applied_count = request.operations.len();
+        let ops = request.operations;
 
-        let mut working = self.document.clone();
-        let mut created_ids: BTreeMap<String, u64> = BTreeMap::new();
-        let mut created_elements = 0usize;
-        let mut created_openings = 0usize;
-        let mut deleted = 0usize;
-        let mut next_id = self.next_id;
-
-        for operation in &request.operations {
-            let operation = operation.validated().map_err(|error| error.to_string())?;
-            match operation {
-                Operation::CreateWallRun {
-                    ref_id,
-                    name,
-                    start_mm,
-                    end_mm,
-                    height_mm,
-                    thickness_mm,
-                    batter_mm,
-                } => {
-                    let mut wall =
-                        BatteredWall::new(next_id, name, start_mm, end_mm, height_mm, thickness_mm);
-                    if let Some(batter_mm) = batter_mm {
-                        wall.batter_mm = batter_mm;
-                    }
-                    working.add_wall(wall);
-                    register_ref(&mut created_ids, ref_id, next_id)?;
-                    next_id += 1;
-                    created_elements += 1;
-                }
-                Operation::CreateTower {
-                    ref_id,
-                    name,
-                    centre_mm,
-                    radius_mm,
-                    height_mm,
-                    batter_mm,
-                } => {
-                    let mut tower = RoundTower::new(next_id, name, centre_mm, radius_mm, height_mm);
-                    if let Some(batter_mm) = batter_mm {
-                        tower.batter_mm = batter_mm;
-                    }
-                    working.add_tower(tower);
-                    register_ref(&mut created_ids, ref_id, next_id)?;
-                    next_id += 1;
-                    created_elements += 1;
-                }
-                Operation::AddArrowLoop {
-                    wall_id,
-                    wall_ref,
-                    t_permille,
-                    sill_height_mm,
-                    height_mm,
-                    outer_slit_mm,
-                    inner_splay_width_mm,
-                } => {
-                    let wall_id = match (wall_id, wall_ref.as_deref()) {
-                        (Some(id), _) => id,
-                        (None, Some(reference)) => *created_ids.get(reference).ok_or_else(|| {
-                            format!("unknown wall_ref '{reference}' (declare it earlier in the batch)")
-                        })?,
-                        (None, None) => {
-                            return Err("add_arrow_loop needs wall_id or wall_ref".into())
-                        }
-                    };
-                    let wall = match working.get(wall_id) {
-                        Some(Element::BatteredWall(wall)) => wall.clone(),
-                        Some(_) => return Err(format!("element {wall_id} is not a wall run")),
-                        None => return Err(format!("unknown wall_id {wall_id}")),
-                    };
-                    let opening = Opening::new(
-                        next_id,
-                        wall_id,
-                        format!("Arrow loop {next_id}"),
-                        OpeningKind::ArrowLoop,
-                        t_permille,
-                        sill_height_mm,
-                        height_mm.unwrap_or(1_500),
-                        outer_slit_mm.unwrap_or(140),
-                        inner_splay_width_mm.unwrap_or(1_100),
-                        wall.thickness_mm,
-                    );
-                    working.add_opening(opening);
-                    next_id += 1;
-                    created_openings += 1;
-                }
-                Operation::DeleteElement { id } => {
-                    if !delete_id(&mut working, id) {
-                        return Err(format!("unknown element id {id}"));
-                    }
-                    created_ids.retain(|_, value| *value != id);
-                    deleted += 1;
-                }
-            }
-        }
-
-        // Cap the document before building the scene so a long-running agent
-        // cannot exhaust sidecar memory with unbounded batches.
-        validate_element_budget(working.len(), working.opening_count())
+        let outcome = self
+            .session
+            .apply_batch(self.author.clone(), ops)
             .map_err(|error| error.to_string())?;
+        let scene = self.session.build_scene();
 
-        let scene = build_scene(&working, &self.terrain);
-        let summary = format!(
-            "Applied {} operation(s): +{} element(s), +{} opening(s), -{}; {} block(s) in {} chunk(s)",
-            request.operations.len(),
-            created_elements,
-            created_openings,
-            deleted,
-            scene.block_count,
-            scene.chunk_count()
-        );
-
-        self.document = working;
-        self.next_id = next_id;
         Ok(ApplyOperationsResponse {
-            applied_count: request.operations.len(),
-            created_ids,
-            document_hash: hex_hash(self.document.document_hash()),
+            applied_count,
+            created_ids: outcome.created_ids,
+            document_hash: hex_hash(outcome.document_hash),
             layout_hash: hex_hash(scene.layout_hash),
             block_count: scene.block_count,
             chunk_count: scene.chunk_count(),
-            summary,
+            summary: format!(
+                "Applied {applied_count} operation(s): {}; {} block(s) in {} chunk(s)",
+                outcome.summary,
+                scene.block_count,
+                scene.chunk_count()
+            ),
+        })
+    }
+
+    /// Compensate this agent's latest still-live batch.
+    fn tool_undo(&mut self) -> Result<UndoResponse, String> {
+        let outcome = self
+            .session
+            .undo_last(&self.author)
+            .map_err(|error| error.to_string())?;
+        let scene = self.session.build_scene();
+        Ok(UndoResponse {
+            seq: outcome.undo_seq,
+            compensated_seq: outcome.target_seq,
+            document_hash: hex_hash(outcome.document_hash),
+            layout_hash: hex_hash(scene.layout_hash),
+            block_count: scene.block_count,
+            chunk_count: scene.chunk_count(),
+            summary: outcome.summary,
+        })
+    }
+
+    /// Return the append-only command log with undone markers.
+    fn tool_get_history(&self) -> Result<GetHistoryResponse, String> {
+        let entries: Vec<HistoryEntry> = self
+            .session
+            .history()
+            .iter()
+            .map(|command| HistoryEntry {
+                seq: command.seq,
+                command_id: command.command_id.clone(),
+                author: command.author.to_string(),
+                summary: command.summary.clone(),
+                touched_elements: command.touched_elements.clone(),
+                undone: self.session.is_undone(command.seq),
+            })
+            .collect();
+        Ok(GetHistoryResponse {
+            count: entries.len(),
+            entries,
         })
     }
 
@@ -369,6 +317,13 @@ impl McpServer {
                     .map_err(|error| (code::INVALID_PARAMS, error.to_string()))?;
                 Ok(resource_contents(uri, "application/json", text))
             }
+            "keep://castle/save" => {
+                let text = self
+                    .session
+                    .to_save_json()
+                    .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?;
+                Ok(resource_contents(uri, "application/json", text))
+            }
             "keep://castle/plan/top" => Ok(self.resource_svg(uri, PlanView::TopPlan)),
             "keep://castle/plan/elevation" => Ok(self.resource_svg(uri, PlanView::ElevationNorth)),
             other => Err((
@@ -379,7 +334,7 @@ impl McpServer {
     }
 
     fn resource_svg(&self, uri: &str, view: PlanView) -> Value {
-        let svg = render_plan_svg(&self.document, &self.terrain, view);
+        let svg = render_plan_svg(self.session.document(), self.session.terrain(), view);
         resource_contents(uri, "image/svg+xml", svg)
     }
 }
@@ -392,7 +347,7 @@ fn initialize_result() -> Value {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Offline Keepwright castle sidecar. Use get_castle, list_elements, render_plan and apply_operations."
+        "instructions": "Offline Keepwright castle sidecar. Use get_castle, list_elements, render_plan, apply_operations, undo and get_history."
     })
 }
 
@@ -403,6 +358,12 @@ fn resources_list() -> Value {
                 "uri": "keep://castle/document",
                 "name": "Castle document",
                 "description": "Semantic castle summary with elements, openings and hashes.",
+                "mimeType": "application/json"
+            },
+            {
+                "uri": "keep://castle/save",
+                "name": "Castle save",
+                "description": "Versioned castle.keep.json save file with the initial document and command log.",
                 "mimeType": "application/json"
             },
             {
@@ -509,59 +470,6 @@ fn opening_summaries(document: &CastleDocument) -> Vec<OpeningSummary> {
             inner_splay_width_mm: opening.inner_splay_width_mm,
         })
         .collect()
-}
-
-fn register_ref(
-    created_ids: &mut BTreeMap<String, u64>,
-    ref_id: Option<String>,
-    id: u64,
-) -> Result<(), String> {
-    if let Some(reference) = ref_id {
-        keep_proto::sanitize_ref_id(&reference).map_err(|error| error.to_string())?;
-        if created_ids.insert(reference.clone(), id).is_some() {
-            return Err(format!("duplicate ref_id '{reference}' in batch"));
-        }
-    }
-    Ok(())
-}
-
-fn max_existing_id(document: &CastleDocument) -> u64 {
-    let max_element = document.elements().map(Element::id).max().unwrap_or(0);
-    let max_opening = document
-        .openings()
-        .map(|opening| opening.id)
-        .max()
-        .unwrap_or(0);
-    max_element.max(max_opening)
-}
-
-/// Delete an element (with its attached openings) or a lone opening. Returns
-/// `false` when the id is unknown so the caller can fail the batch.
-fn delete_id(document: &mut CastleDocument, id: u64) -> bool {
-    let element_exists = document.get(id).is_some();
-    let opening_exists = document.opening(id).is_some();
-    if !element_exists && !opening_exists {
-        return false;
-    }
-    let elements: Vec<Element> = document
-        .elements()
-        .filter(|element| element.id() != id)
-        .cloned()
-        .collect();
-    let openings: Vec<Opening> = document
-        .openings()
-        .filter(|opening| opening.id != id && opening.wall_id != id)
-        .cloned()
-        .collect();
-    let mut next = CastleDocument::new();
-    for element in elements {
-        next.insert(element);
-    }
-    for opening in openings {
-        next.insert_opening(opening);
-    }
-    *document = next;
-    true
 }
 
 #[cfg(test)]
@@ -699,16 +607,28 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_four_tools_with_schemas() {
+    fn tools_list_exposes_six_tools_with_schemas() {
         let mut server = server();
         let response = call(&mut server, 4, "tools/list", json!({}));
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 6);
         for tool in tools {
             assert!(tool["inputSchema"].is_object());
             assert!(tool["outputSchema"].is_object());
             assert!(tool["annotations"].is_object());
         }
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "get_castle",
+                "list_elements",
+                "render_plan",
+                "apply_operations",
+                "undo",
+                "get_history"
+            ]
+        );
     }
 
     #[test]
@@ -1325,9 +1245,11 @@ mod tests {
         let mut server = server();
         let response = call(&mut server, 5, "resources/list", json!({}));
         let resources = response["result"]["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 3);
+        assert_eq!(resources.len(), 4);
         assert_eq!(resources[0]["uri"], "keep://castle/document");
-        assert_eq!(resources[1]["mimeType"], "image/svg+xml");
+        assert_eq!(resources[1]["uri"], "keep://castle/save");
+        assert_eq!(resources[1]["mimeType"], "application/json");
+        assert_eq!(resources[2]["mimeType"], "image/svg+xml");
 
         let document = call(
             &mut server,
@@ -1379,5 +1301,120 @@ mod tests {
         let value: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["id"], 42);
         assert_eq!(value["result"], json!({}));
+    }
+
+    fn is_uuid_v7(id: &str) -> bool {
+        let groups: Vec<&str> = id.split('-').collect();
+        groups.iter().map(|group| group.len()).collect::<Vec<_>>() == [8, 4, 4, 4, 12]
+            && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+            && id.as_bytes().get(14) == Some(&b'7')
+            && matches!(id.as_bytes().get(19), Some(b'8' | b'9' | b'a' | b'b'))
+    }
+
+    #[test]
+    fn undo_restores_exact_document_and_layout_hashes() {
+        let mut server = server();
+        let before = structured(&mut server, "get_castle", json!({}));
+        let applied = structured(
+            &mut server,
+            "apply_operations",
+            json!({ "operations": [sample_wall("undoable")] }),
+        );
+        assert_ne!(applied["document_hash"], before["document_hash"]);
+
+        let undo = structured(&mut server, "undo", json!({}));
+        assert_eq!(undo["compensated_seq"], 1);
+        assert_eq!(undo["seq"], 2);
+        assert_eq!(undo["document_hash"], before["document_hash"]);
+        assert_eq!(undo["layout_hash"], before["layout_hash"]);
+        assert_eq!(undo["block_count"], before["block_count"]);
+        assert_eq!(undo["chunk_count"], before["chunk_count"]);
+        assert_eq!(server.document().len(), 3);
+    }
+
+    #[test]
+    fn undo_on_empty_history_is_a_tool_error() {
+        let mut server = McpServer::new(true);
+        let before = structured(&mut server, "get_castle", json!({}));
+        let message = tool_error_message(&mut server, "undo", json!({}));
+        assert!(message.contains("no command left to undo"), "got {message}");
+        let after = structured(&mut server, "get_castle", json!({}));
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn get_history_shows_applied_and_compensating_entries() {
+        let mut server = server();
+        structured(
+            &mut server,
+            "apply_operations",
+            json!({ "operations": [sample_wall("history")] }),
+        );
+        structured(&mut server, "undo", json!({}));
+
+        let history = structured(&mut server, "get_history", json!({}));
+        assert_eq!(history["count"], 2);
+        let entries = history["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+
+        assert_eq!(entries[0]["seq"], 1);
+        assert_eq!(entries[0]["author"], "agent:mcp-offline");
+        assert_eq!(entries[0]["summary"], "+1 wall");
+        assert_eq!(entries[0]["touched_elements"], json!([12]));
+        assert_eq!(entries[0]["undone"], true);
+        let applied_id = entries[0]["command_id"].as_str().unwrap();
+        assert!(is_uuid_v7(applied_id), "not a UUIDv7: {applied_id}");
+
+        assert_eq!(entries[1]["seq"], 2);
+        assert_eq!(entries[1]["author"], "agent:mcp-offline");
+        assert_eq!(entries[1]["summary"], "Undo command #1");
+        assert_eq!(entries[1]["touched_elements"], json!([12]));
+        assert_eq!(entries[1]["undone"], false);
+        let undo_id = entries[1]["command_id"].as_str().unwrap();
+        assert!(is_uuid_v7(undo_id), "not a UUIDv7: {undo_id}");
+        assert_ne!(applied_id, undo_id);
+    }
+
+    #[test]
+    fn get_history_on_a_fresh_server_is_empty() {
+        let mut server = McpServer::new(true);
+        let history = structured(&mut server, "get_history", json!({}));
+        assert_eq!(history["count"], 0);
+        assert_eq!(history["entries"], json!([]));
+    }
+
+    #[test]
+    fn save_resource_round_trips_through_session() {
+        let mut server = server();
+        structured(
+            &mut server,
+            "apply_operations",
+            json!({ "operations": [sample_wall("saved")] }),
+        );
+
+        let response = call(
+            &mut server,
+            12,
+            "resources/read",
+            json!({ "uri": "keep://castle/save" }),
+        );
+        let contents = &response["result"]["contents"][0];
+        assert_eq!(contents["uri"], "keep://castle/save");
+        assert_eq!(contents["mimeType"], "application/json");
+        let text = contents["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["command_log"].as_array().unwrap().len(), 1);
+
+        let loaded = Session::from_save_json(text).expect("save resource round-trips");
+        assert_eq!(
+            loaded.document().document_hash(),
+            server.document().document_hash()
+        );
+        assert_eq!(
+            loaded.build_scene().layout_hash,
+            server.session().build_scene().layout_hash
+        );
+        assert_eq!(loaded.history().len(), 1);
     }
 }

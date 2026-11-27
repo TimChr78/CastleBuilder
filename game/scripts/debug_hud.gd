@@ -10,6 +10,8 @@ signal playing_changed(playing: bool)
 signal mode_requested(mode: String)
 signal tool_requested(tool: String)
 signal undo_requested()
+signal save_requested()
+signal load_requested()
 
 const REFRESH_INTERVAL := 0.25
 
@@ -28,6 +30,8 @@ var _showcase_button: Button
 var _m0b_button: Button
 var _stress_button: Button
 var _undo_button: Button
+var _save_button: Button
+var _load_button: Button
 var _tool_status: Label
 var _tool_buttons: Dictionary = {}
 
@@ -126,6 +130,22 @@ func _build_ui() -> void:
 	_undo_button.focus_mode = Control.FOCUS_NONE
 	_undo_button.pressed.connect(_on_undo_pressed)
 	mode_row.add_child(_undo_button)
+
+	var file_row := HBoxContainer.new()
+	file_row.add_theme_constant_override("separation", 6)
+	column.add_child(file_row)
+
+	_save_button = Button.new()
+	_save_button.text = "Save"
+	_save_button.focus_mode = Control.FOCUS_NONE
+	_save_button.pressed.connect(_on_save_pressed)
+	file_row.add_child(_save_button)
+
+	_load_button = Button.new()
+	_load_button.text = "Load"
+	_load_button.focus_mode = Control.FOCUS_NONE
+	_load_button.pressed.connect(_on_load_pressed)
+	file_row.add_child(_load_button)
 
 	var front_row := HBoxContainer.new()
 	front_row.add_theme_constant_override("separation", 8)
@@ -309,6 +329,14 @@ func _on_stress_pressed() -> void:
 
 func _on_undo_pressed() -> void:
 	undo_requested.emit()
+
+
+func _on_save_pressed() -> void:
+	save_requested.emit()
+
+
+func _on_load_pressed() -> void:
+	load_requested.emit()
 
 
 func _on_tool_pressed(tool: String) -> void:

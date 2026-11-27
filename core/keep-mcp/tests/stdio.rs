@@ -94,6 +94,24 @@ fn offline_binary_completes_a_full_mcp_session() {
             }
         }),
     );
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": { "name": "undo", "arguments": {} }
+        }),
+    );
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": { "name": "get_history", "arguments": {} }
+        }),
+    );
 
     // Closing stdin ends the server loop; then collect every response line.
     drop(child.stdin.take());
@@ -105,15 +123,15 @@ fn offline_binary_completes_a_full_mcp_session() {
     let status = child.wait().expect("server exits");
     assert!(status.success());
 
-    // The notification produces no response, so exactly five requests respond.
-    assert_eq!(responses.len(), 5, "responses: {responses:#?}");
+    // The notification produces no response, so exactly seven requests respond.
+    assert_eq!(responses.len(), 7, "responses: {responses:#?}");
     for (index, response) in responses.iter().enumerate() {
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], index as u64 + 1);
     }
 
     assert_eq!(responses[0]["result"]["serverInfo"]["name"], "keep-mcp");
-    assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 4);
+    assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 6);
 
     let castle = &responses[2]["result"]["structuredContent"];
     assert_eq!(castle["element_count"], 3);
@@ -126,6 +144,20 @@ fn offline_binary_completes_a_full_mcp_session() {
     let applied = &responses[4]["result"]["structuredContent"];
     assert_eq!(applied["applied_count"], 2);
     assert_eq!(applied["created_ids"]["east"], 12);
+
+    let undo = &responses[5]["result"]["structuredContent"];
+    assert_eq!(undo["seq"], 2);
+    assert_eq!(undo["compensated_seq"], 1);
+    assert_eq!(undo["document_hash"], castle["document_hash"]);
+    assert_eq!(undo["layout_hash"], castle["layout_hash"]);
+
+    let history = &responses[6]["result"]["structuredContent"];
+    assert_eq!(history["count"], 2);
+    assert_eq!(history["entries"][0]["seq"], 1);
+    assert_eq!(history["entries"][0]["undone"], true);
+    assert_eq!(history["entries"][1]["seq"], 2);
+    assert_eq!(history["entries"][1]["summary"], "Undo command #1");
+    assert_eq!(history["entries"][1]["undone"], false);
 }
 
 #[test]

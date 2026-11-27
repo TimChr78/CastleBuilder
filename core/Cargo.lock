@@ -105,6 +105,8 @@ name = "keep-core"
 version = "0.1.0"
 dependencies = [
  "libm",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -129,6 +131,7 @@ dependencies = [
 name = "keep-proto"
 version = "0.1.0"
 dependencies = [
+ "keep-core",
  "serde",
  "serde_json",
 ]

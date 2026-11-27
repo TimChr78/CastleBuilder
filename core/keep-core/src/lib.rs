@@ -8,6 +8,7 @@
 //! Canonical ordering is established with [`std::collections::BTreeMap`] and
 //! sorted ids throughout.
 
+pub mod command;
 pub mod document;
 pub mod fixtures;
 pub mod junction;
@@ -15,6 +16,8 @@ pub mod masonry;
 pub mod mesh;
 pub mod picking;
 pub mod plan_render;
+pub mod save;
+pub mod session;
 pub mod terrain;
 
 /// Version stamped into layout hashes. Bump whenever the generator's output

@@ -9,6 +9,11 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
+use crate::command::{
+    check_dimension, sanitize_name, validate_element_budget, CommandError, CommandOp,
+};
 use crate::fnv1a_64;
 
 /// Fixed site/design seed used by the M0a fixtures.
@@ -24,7 +29,7 @@ pub enum ElementKind {
 }
 
 /// A straight curtain-wall run with vertical batter and a projecting plinth.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatteredWall {
     pub id: ElementId,
     pub name: String,
@@ -83,7 +88,7 @@ impl BatteredWall {
 }
 
 /// A cylindrical tower with batter, a projecting plinth and a wall thickness.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoundTower {
     pub id: ElementId,
     pub name: String,
@@ -124,7 +129,7 @@ impl RoundTower {
 }
 
 /// Classification of an opening cut through a wall.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum OpeningKind {
     /// Narrow outer slit opening into a wide, splayed inner embrasure.
     ArrowLoop,
@@ -137,7 +142,7 @@ pub enum OpeningKind {
 /// start, `1000` at the end). The sill height is measured above the ground at
 /// that point, not above the wall foundation, so lowering the site keeps the
 /// loop at a sensible height above the earth.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Opening {
     pub id: ElementId,
     pub wall_id: ElementId,
@@ -227,7 +232,7 @@ impl Opening {
 }
 
 /// One architectural element.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Element {
     BatteredWall(BatteredWall),
     RoundTower(RoundTower),
@@ -258,7 +263,7 @@ impl Element {
 
 /// Canonical castle document. Elements are keyed and iterated in stable id
 /// order so layout never depends on insertion order.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CastleDocument {
     elements: BTreeMap<ElementId, Element>,
     openings: BTreeMap<ElementId, Opening>,
@@ -303,6 +308,31 @@ impl CastleDocument {
         self.openings.get(&id)
     }
 
+    /// Remove an element and return it together with every opening attached to
+    /// it (in stable id order). Returns `None` when no such element exists.
+    pub fn remove_element(&mut self, id: ElementId) -> Option<(Element, Vec<Opening>)> {
+        let element = self.elements.remove(&id)?;
+        let attached: Vec<ElementId> = self
+            .openings
+            .values()
+            .filter(|opening| opening.wall_id == id)
+            .map(|opening| opening.id)
+            .collect();
+        let mut removed = Vec::with_capacity(attached.len());
+        for opening_id in attached {
+            if let Some(opening) = self.openings.remove(&opening_id) {
+                removed.push(opening);
+            }
+        }
+        Some((element, removed))
+    }
+
+    /// Remove a lone opening (for example by its own id). Returns `None` when
+    /// no such opening exists.
+    pub fn remove_opening(&mut self, id: ElementId) -> Option<Opening> {
+        self.openings.remove(&id)
+    }
+
     /// All openings in stable id order.
     pub fn openings(&self) -> impl Iterator<Item = &Opening> {
         self.openings.values()
@@ -331,6 +361,53 @@ impl CastleDocument {
 
     pub fn is_empty(&self) -> bool {
         self.elements.is_empty()
+    }
+
+    /// Validate every invariant a document must hold, regardless of how it was
+    /// produced. Save loading calls this on the untrusted `initial_document`
+    /// so a crafted file cannot inject out-of-bounds geometry, dangling
+    /// openings or forged map keys.
+    pub fn validate(&self) -> Result<(), CommandError> {
+        validate_element_budget(self.len(), self.opening_count())?;
+
+        for (key, element) in &self.elements {
+            if *key != element.id() {
+                return Err(CommandError::ElementIdMismatch {
+                    key: *key,
+                    actual: element.id(),
+                });
+            }
+            validate_element(element)?;
+        }
+
+        for (key, opening) in &self.openings {
+            if *key != opening.id {
+                return Err(CommandError::ElementIdMismatch {
+                    key: *key,
+                    actual: opening.id,
+                });
+            }
+            match self.elements.get(&opening.wall_id) {
+                Some(Element::BatteredWall(_)) => {}
+                Some(_) => return Err(CommandError::NotAWallRun(opening.wall_id)),
+                None => return Err(CommandError::UnknownWallId(opening.wall_id)),
+            }
+            sanitize_name(&opening.name)?;
+            // Reuse exactly the same opening bounds as the command engine.
+            CommandOp::AddArrowLoop {
+                wall_id: Some(opening.wall_id),
+                wall_ref: None,
+                t_permille: opening.t_permille,
+                sill_height_mm: opening.sill_height_mm,
+                height_mm: Some(opening.height_mm),
+                outer_slit_mm: Some(opening.outer_slit_mm),
+                inner_splay_width_mm: Some(opening.inner_splay_width_mm),
+            }
+            .validated()?;
+            check_dimension("splay_depth_mm", opening.splay_depth_mm, 0, i64::MAX)?;
+        }
+
+        Ok(())
     }
 
     /// Deterministic 64-bit document hash over the canonical semantic contents.
@@ -390,6 +467,56 @@ impl CastleDocument {
         }
         fnv1a_64(&bytes)
     }
+}
+
+/// Validate one element against exactly the same bounds the command engine
+/// applies to its creating operation, plus the fields a command does not carry
+/// (course height and plinth dimensions).
+fn validate_element(element: &Element) -> Result<(), CommandError> {
+    match element {
+        Element::BatteredWall(wall) => {
+            sanitize_name(&wall.name)?;
+            CommandOp::CreateWallRun {
+                ref_id: None,
+                name: wall.name.clone(),
+                start_mm: wall.start_mm,
+                end_mm: wall.end_mm,
+                height_mm: wall.height_mm,
+                thickness_mm: wall.thickness_mm,
+                batter_mm: Some(wall.batter_mm),
+            }
+            .validated()?;
+            check_dimension("course_height_mm", wall.course_height_mm, 1, i64::MAX)?;
+            check_dimension("plinth_height_mm", wall.plinth_height_mm, 0, i64::MAX)?;
+            check_dimension(
+                "plinth_projection_mm",
+                wall.plinth_projection_mm,
+                0,
+                i64::MAX,
+            )?;
+        }
+        Element::RoundTower(tower) => {
+            sanitize_name(&tower.name)?;
+            CommandOp::CreateTower {
+                ref_id: None,
+                name: tower.name.clone(),
+                centre_mm: tower.centre_mm,
+                radius_mm: tower.radius_mm,
+                height_mm: tower.height_mm,
+                batter_mm: Some(tower.batter_mm),
+            }
+            .validated()?;
+            check_dimension("course_height_mm", tower.course_height_mm, 1, i64::MAX)?;
+            check_dimension("plinth_height_mm", tower.plinth_height_mm, 0, i64::MAX)?;
+            check_dimension(
+                "plinth_projection_mm",
+                tower.plinth_projection_mm,
+                0,
+                i64::MAX,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

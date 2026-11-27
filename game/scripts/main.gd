@@ -30,6 +30,9 @@ const LOD_END := [90.0, 200.0, 0.0]
 ## Seconds for the construction front to sweep 0 → 1 once, then hold.
 const BUILD_PLAY_SECONDS := 27.0
 
+## Save slot shared by the HUD Save/Load buttons.
+const SAVE_PATH := "user://castle.keep.json"
+
 var _bridge: Object
 var _camera: Camera3D
 var _hud: CanvasLayer
@@ -203,6 +206,8 @@ func _setup_hud() -> void:
 	_hud.connect("mode_requested", Callable(self, "_on_hud_mode_requested"))
 	_hud.connect("tool_requested", Callable(self, "_on_hud_tool_requested"))
 	_hud.connect("undo_requested", Callable(self, "_on_undo_requested"))
+	_hud.connect("save_requested", Callable(self, "_on_save_requested"))
+	_hud.connect("load_requested", Callable(self, "_on_load_requested"))
 
 
 func _setup_feel() -> void:
@@ -567,7 +572,11 @@ func _on_wall_committed(
 	if not (result is Dictionary):
 		_hud.call("show_error", "KeepBridge.add_wall() did not return a Dictionary.")
 		return
-	_apply_scene(result as Dictionary, false, false)
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		_hud.call("show_error", "Wall rejected: %s" % str(data.get("error", "unknown error")))
+		return
+	_apply_scene(data, false, false)
 	_hud.call(
 		"set_tool_status",
 		"Wall added: %.1f m · H %.1f m · T %.1f m — Ctrl+Z to undo"
@@ -592,7 +601,11 @@ func _on_tower_committed(center_m: Vector2, radius_m: float, height_m: float) ->
 	if not (result is Dictionary):
 		_hud.call("show_error", "KeepBridge.add_tower() did not return a Dictionary.")
 		return
-	_apply_scene(result as Dictionary, false, false)
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		_hud.call("show_error", "Tower rejected: %s" % str(data.get("error", "unknown error")))
+		return
+	_apply_scene(data, false, false)
 	_hud.call(
 		"set_tool_status",
 		"Tower added: r %.1f m · H %.1f m — Ctrl+Z to undo" % [radius_m, height_m]
@@ -608,11 +621,93 @@ func _on_undo_requested() -> void:
 		_hud.call("show_error", "KeepBridge.undo_last() did not return a Dictionary.")
 		return
 	var data: Dictionary = result
-	_apply_scene(data, false, false)
 	if bool(data.get("undone", false)):
-		_hud.call("set_tool_status", "Undo: removed the last wall or tower")
+		_apply_scene(data, false, false)
+		_hud.call("set_tool_status", str(data.get("summary", "Undid last edit")))
 	else:
-		_hud.call("set_tool_status", "Undo: nothing to remove")
+		_hud.call(
+			"set_tool_status", "Undo refused: %s" % str(data.get("reason", "nothing to undo"))
+		)
+
+
+func _on_save_requested() -> void:
+	if _bridge == null or not _bridge.has_method("save_castle_json"):
+		_hud.call("show_error", "Cannot save: KeepBridge.save_castle_json() is unavailable.")
+		return
+	var result: Variant = _bridge.call("save_castle_json")
+	if not (result is Dictionary):
+		_hud.call("show_error", "KeepBridge.save_castle_json() did not return a Dictionary.")
+		return
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		_hud.call("show_error", "Save failed: %s" % str(data.get("error", "unknown error")))
+		return
+
+	var tmp_path := SAVE_PATH + ".tmp"
+	var file := FileAccess.open(tmp_path, FileAccess.WRITE)
+	if file == null:
+		_hud.call(
+			"show_error",
+			"Could not open %s for writing (error %d)."
+			% [tmp_path, FileAccess.get_open_error()]
+		)
+		return
+	var wrote := file.store_string(str(data.get("json", "")))
+	var write_error := file.get_error()
+	file.close()
+	if not wrote or write_error != OK:
+		_hud.call(
+			"show_error",
+			"Could not write %s (error %d)." % [tmp_path, write_error]
+		)
+		return
+
+	# Replace the live save only after the temporary file is fully written, so a
+	# crash or full disk cannot leave a truncated castle.keep.json behind.
+	var rename_error := DirAccess.rename_absolute(
+		ProjectSettings.globalize_path(tmp_path),
+		ProjectSettings.globalize_path(SAVE_PATH)
+	)
+	if rename_error != OK:
+		_hud.call(
+			"show_error",
+			"Could not replace %s (error %d)." % [SAVE_PATH, rename_error]
+		)
+		return
+	_hud.call("clear_error")
+	_hud.call("set_tool_status", "Saved castle.keep.json")
+
+
+func _on_load_requested() -> void:
+	if _bridge == null or not _bridge.has_method("load_castle_json"):
+		_hud.call("show_error", "Cannot load: KeepBridge.load_castle_json() is unavailable.")
+		return
+	if not FileAccess.file_exists(SAVE_PATH):
+		_hud.call("set_tool_status", "No save file yet")
+		return
+
+	var file := FileAccess.open(SAVE_PATH, FileAccess.READ)
+	if file == null:
+		_hud.call(
+			"show_error",
+			"Could not open %s for reading (error %d)."
+			% [SAVE_PATH, FileAccess.get_open_error()]
+		)
+		return
+	var json := file.get_as_text()
+	file.close()
+
+	var result: Variant = _bridge.call("load_castle_json", json)
+	if not (result is Dictionary):
+		_hud.call("show_error", "KeepBridge.load_castle_json() did not return a Dictionary.")
+		return
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		_hud.call("show_error", "Load failed: %s" % str(data.get("error", "unknown error")))
+		return
+	_apply_scene(data, true, true)
+	_hud.call("clear_error")
+	_hud.call("set_tool_status", "Loaded castle.keep.json")
 
 
 func _unhandled_input(event: InputEvent) -> void:

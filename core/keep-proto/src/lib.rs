@@ -1,274 +1,36 @@
 //! Versioned control-protocol types for Keepwright, shared by `keep-mcp`, the
 //! live game control server and tests.
 //!
-//! The protocol is deliberately small and JSON-shaped: agents send semantic
+//! The wire format is deliberately small and JSON-shaped: agents send semantic
 //! operations (integer millimetres, relative anchors) and receive compact
-//! summaries, hashes and rendered plan SVGs. Nothing here depends on the
-//! engine or on `keep-core`, so the schema can be reused by clients written in
-//! any language.
+//! summaries, hashes and rendered plan SVGs.
 //!
-//! Security limits live here too ([`MAX_BATCH_OPS`], [`MAX_NAME_CHARS`]) so
-//! every transport applies the same rules (architecture section 7.6).
+//! The semantic [`Operation`] type and every validation rule are re-exported
+//! from `keep-core`'s command engine, so the protocol schema, the offline
+//! sidecar and the game host share exactly one implementation. Security limits
+//! ([`MAX_BATCH_OPS`], [`MAX_NAME_CHARS`], …) are likewise single-sourced and
+//! used directly by [`tool_definitions`] (architecture section 7.6).
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Maximum number of operations accepted in one atomic batch.
-pub const MAX_BATCH_OPS: usize = 256;
-
-/// Maximum number of characters in a free-text display name.
-pub const MAX_NAME_CHARS: usize = 64;
-
-/// Maximum number of characters in a reference id.
-pub const MAX_REF_ID_CHARS: usize = 64;
-
-/// Maximum number of elements and openings a document may hold. Batches are
-/// capped well below this, but many batches could otherwise grow the document
-/// without bound and exhaust sidecar memory during scene building.
-pub const MAX_DOCUMENT_ELEMENTS: usize = 512;
-
-/// Plan coordinates are limited to ±500 m. This keeps squared distances inside
-/// `i64` and stops huge values from overflowing geometry maths.
-pub const MIN_COORD_MM: i64 = -500_000;
-/// See [`MIN_COORD_MM`].
-pub const MAX_COORD_MM: i64 = 500_000;
-
-/// Shortest accepted curtain-wall run, in millimetres.
-pub const MIN_WALL_LENGTH_MM: i128 = 500;
-/// Longest accepted curtain-wall run, in millimetres.
-pub const MAX_WALL_LENGTH_MM: i128 = 500_000;
-
-/// Wall height bounds, in millimetres (1–60 m).
-pub const MIN_WALL_HEIGHT_MM: i64 = 1_000;
-/// See [`MIN_WALL_HEIGHT_MM`].
-pub const MAX_WALL_HEIGHT_MM: i64 = 60_000;
-
-/// Wall thickness bounds, in millimetres (0.3–8 m).
-pub const MIN_WALL_THICKNESS_MM: i64 = 300;
-/// See [`MIN_WALL_THICKNESS_MM`].
-pub const MAX_WALL_THICKNESS_MM: i64 = 8_000;
-
-/// Batter bounds, in millimetres.
-pub const MAX_BATTER_MM: i64 = 3_000;
-
-/// Tower radius bounds, in millimetres (0.8–20 m).
-pub const MIN_TOWER_RADIUS_MM: i64 = 800;
-/// See [`MIN_TOWER_RADIUS_MM`].
-pub const MAX_TOWER_RADIUS_MM: i64 = 20_000;
-
-/// Tower height bounds, in millimetres (1–60 m).
-pub const MIN_TOWER_HEIGHT_MM: i64 = 1_000;
-/// See [`MIN_TOWER_HEIGHT_MM`].
-pub const MAX_TOWER_HEIGHT_MM: i64 = 60_000;
-
-/// Arrow-loop position bounds, in permille along the wall. Loops are kept away
-/// from the very ends so they always stay framed in masonry.
-pub const MIN_LOOP_T_PERMILLE: i64 = 50;
-/// See [`MIN_LOOP_T_PERMILLE`].
-pub const MAX_LOOP_T_PERMILLE: i64 = 950;
-
-/// Arrow-loop sill-height bounds, in millimetres.
-pub const MAX_LOOP_SILL_HEIGHT_MM: i64 = 20_000;
-
-/// Arrow-loop opening height bounds, in millimetres.
-pub const MIN_LOOP_HEIGHT_MM: i64 = 300;
-/// See [`MIN_LOOP_HEIGHT_MM`].
-pub const MAX_LOOP_HEIGHT_MM: i64 = 6_000;
-
-/// Arrow-loop outer slit width bounds, in millimetres.
-pub const MIN_OUTER_SLIT_MM: i64 = 60;
-/// See [`MIN_OUTER_SLIT_MM`].
-pub const MAX_OUTER_SLIT_MM: i64 = 600;
-
-/// Arrow-loop inner splay width bounds, in millimetres.
-pub const MIN_INNER_SPLAY_WIDTH_MM: i64 = 300;
-/// See [`MIN_INNER_SPLAY_WIDTH_MM`].
-pub const MAX_INNER_SPLAY_WIDTH_MM: i64 = 3_000;
+// One command engine for every transport: the wire protocol re-exports the
+// `keep-core` operation type, validation helpers and bounds instead of keeping a
+// second copy that could drift (architecture sections 7.6 and 15).
+pub use keep_core::command::{
+    sanitize_name, sanitize_ref_id, validate_batch, validate_element_budget,
+    CommandError as ProtoError, CommandOp as Operation, MAX_BATCH_OPS, MAX_BATTER_MM, MAX_COORD_MM,
+    MAX_DOCUMENT_ELEMENTS, MAX_INNER_SPLAY_WIDTH_MM, MAX_LOOP_HEIGHT_MM, MAX_LOOP_SILL_HEIGHT_MM,
+    MAX_LOOP_T_PERMILLE, MAX_NAME_CHARS, MAX_OUTER_SLIT_MM, MAX_REF_ID_CHARS, MAX_TOWER_HEIGHT_MM,
+    MAX_TOWER_RADIUS_MM, MAX_WALL_HEIGHT_MM, MAX_WALL_LENGTH_MM, MAX_WALL_THICKNESS_MM,
+    MIN_COORD_MM, MIN_INNER_SPLAY_WIDTH_MM, MIN_LOOP_HEIGHT_MM, MIN_LOOP_T_PERMILLE,
+    MIN_OUTER_SLIT_MM, MIN_TOWER_HEIGHT_MM, MIN_TOWER_RADIUS_MM, MIN_WALL_HEIGHT_MM,
+    MIN_WALL_LENGTH_MM, MIN_WALL_THICKNESS_MM,
+};
 
 /// Default view used by `render_plan` when no view is supplied.
 pub const DEFAULT_PLAN_VIEW: &str = "top_plan";
-
-/// A single semantic edit. Operations are applied atomically and in order by
-/// [`crate::ApplyOperationsRequest`] consumers.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum Operation {
-    /// Create a straight curtain-wall run between two plan points.
-    CreateWallRun {
-        /// Optional stable reference usable by later operations in the batch.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        ref_id: Option<String>,
-        name: String,
-        /// Start point `[x, z]`, integer millimetres.
-        start_mm: [i64; 2],
-        /// End point `[x, z]`, integer millimetres.
-        end_mm: [i64; 2],
-        height_mm: i64,
-        thickness_mm: i64,
-        /// Total horizontal inset per face over the full height.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        batter_mm: Option<i64>,
-    },
-    /// Create a round drum tower.
-    CreateTower {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        ref_id: Option<String>,
-        name: String,
-        /// Plan centre `[x, z]`, integer millimetres.
-        centre_mm: [i64; 2],
-        radius_mm: i64,
-        height_mm: i64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        batter_mm: Option<i64>,
-    },
-    /// Cut a splayed arrow loop through an existing wall. The wall may be given
-    /// by numeric id or by a `ref_id` created earlier in the same batch.
-    AddArrowLoop {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        wall_id: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        wall_ref: Option<String>,
-        /// Position along the wall run, `0` at the start, `1000` at the end.
-        t_permille: i64,
-        sill_height_mm: i64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        height_mm: Option<i64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        outer_slit_mm: Option<i64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        inner_splay_width_mm: Option<i64>,
-    },
-    /// Delete an element (and any openings attached to it) by id.
-    DeleteElement { id: u64 },
-}
-
-impl Operation {
-    /// Validate and normalise the operation: free-text fields are sanitised and
-    /// numeric inputs are checked against the protocol's hard bounds. The
-    /// returned operation always has a trimmed, control-character-free name and
-    /// a safe reference id where the variant has one.
-    pub fn validated(&self) -> Result<Self, ProtoError> {
-        let mut operation = self.clone();
-        match &mut operation {
-            Operation::CreateWallRun {
-                ref_id,
-                name,
-                start_mm,
-                end_mm,
-                height_mm,
-                thickness_mm,
-                batter_mm,
-            } => {
-                *name = sanitize_name(name)?;
-                validate_optional_ref_id(ref_id)?;
-                for value in start_mm.iter() {
-                    check_coordinate("start_mm", *value)?;
-                }
-                for value in end_mm.iter() {
-                    check_coordinate("end_mm", *value)?;
-                }
-                check_dimension(
-                    "height_mm",
-                    *height_mm,
-                    MIN_WALL_HEIGHT_MM,
-                    MAX_WALL_HEIGHT_MM,
-                )?;
-                check_dimension(
-                    "thickness_mm",
-                    *thickness_mm,
-                    MIN_WALL_THICKNESS_MM,
-                    MAX_WALL_THICKNESS_MM,
-                )?;
-                if let Some(batter_mm) = batter_mm {
-                    check_dimension("batter_mm", *batter_mm, 0, MAX_BATTER_MM)?;
-                }
-                check_wall_length(*start_mm, *end_mm)?;
-            }
-            Operation::CreateTower {
-                ref_id,
-                name,
-                centre_mm,
-                radius_mm,
-                height_mm,
-                batter_mm,
-            } => {
-                *name = sanitize_name(name)?;
-                validate_optional_ref_id(ref_id)?;
-                for value in centre_mm.iter() {
-                    check_coordinate("centre_mm", *value)?;
-                }
-                check_dimension(
-                    "radius_mm",
-                    *radius_mm,
-                    MIN_TOWER_RADIUS_MM,
-                    MAX_TOWER_RADIUS_MM,
-                )?;
-                check_dimension(
-                    "height_mm",
-                    *height_mm,
-                    MIN_TOWER_HEIGHT_MM,
-                    MAX_TOWER_HEIGHT_MM,
-                )?;
-                if let Some(batter_mm) = batter_mm {
-                    check_dimension("batter_mm", *batter_mm, 0, MAX_BATTER_MM)?;
-                }
-            }
-            Operation::AddArrowLoop {
-                wall_ref,
-                t_permille,
-                sill_height_mm,
-                height_mm,
-                outer_slit_mm,
-                inner_splay_width_mm,
-                ..
-            } => {
-                if let Some(wall_ref) = wall_ref {
-                    sanitize_ref_id(wall_ref)?;
-                }
-                check_dimension(
-                    "t_permille",
-                    *t_permille,
-                    MIN_LOOP_T_PERMILLE,
-                    MAX_LOOP_T_PERMILLE,
-                )?;
-                check_dimension(
-                    "sill_height_mm",
-                    *sill_height_mm,
-                    0,
-                    MAX_LOOP_SILL_HEIGHT_MM,
-                )?;
-                let height_mm = height_mm.unwrap_or(1_500);
-                check_dimension(
-                    "height_mm",
-                    height_mm,
-                    MIN_LOOP_HEIGHT_MM,
-                    MAX_LOOP_HEIGHT_MM,
-                )?;
-                let outer_slit_mm = outer_slit_mm.unwrap_or(140);
-                check_dimension(
-                    "outer_slit_mm",
-                    outer_slit_mm,
-                    MIN_OUTER_SLIT_MM,
-                    MAX_OUTER_SLIT_MM,
-                )?;
-                let inner_splay_width_mm = inner_splay_width_mm.unwrap_or(1_100);
-                check_dimension(
-                    "inner_splay_width_mm",
-                    inner_splay_width_mm,
-                    MIN_INNER_SPLAY_WIDTH_MM,
-                    MAX_INNER_SPLAY_WIDTH_MM,
-                )?;
-                sill_height_mm
-                    .checked_add(height_mm)
-                    .ok_or(ProtoError::OpeningHeightOverflow)?;
-            }
-            Operation::DeleteElement { .. } => {}
-        }
-        Ok(operation)
-    }
-}
 
 /// A whole batch of edits. Batches are atomic: either every operation applies
 /// or the document is left untouched.
@@ -288,6 +50,39 @@ pub struct ApplyOperationsResponse {
     pub block_count: usize,
     pub chunk_count: usize,
     pub summary: String,
+}
+
+/// Result of the `undo` tool: the compensating command and the restored state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndoResponse {
+    /// Sequence number of the newly appended compensating command.
+    pub seq: u64,
+    /// Sequence number of the batch that was compensated.
+    pub compensated_seq: u64,
+    pub document_hash: String,
+    pub layout_hash: String,
+    pub block_count: usize,
+    pub chunk_count: usize,
+    pub summary: String,
+}
+
+/// One entry in the append-only command history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub seq: u64,
+    pub command_id: String,
+    pub author: String,
+    pub summary: String,
+    pub touched_elements: Vec<u64>,
+    /// True when a later undo compensated this batch.
+    pub undone: bool,
+}
+
+/// Result of the `get_history` tool.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetHistoryResponse {
+    pub count: usize,
+    pub entries: Vec<HistoryEntry>,
 }
 
 /// Compact description of one element.
@@ -376,250 +171,6 @@ pub struct RenderPlanResponse {
     pub document_hash: String,
     pub mime_type: String,
     pub svg: String,
-}
-
-/// Validation failures raised by the protocol layer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProtoError {
-    BatchTooLarge {
-        count: usize,
-        max: usize,
-    },
-    TooManyElements {
-        count: usize,
-        max: usize,
-    },
-    NameEmpty,
-    NameTooLong {
-        chars: usize,
-        max: usize,
-    },
-    NameHasControlChars,
-    NameHasForbiddenChars,
-    RefIdEmpty,
-    RefIdTooLong {
-        chars: usize,
-        max: usize,
-    },
-    RefIdHasInvalidChars,
-    CoordinateOutOfRange {
-        field: &'static str,
-        value: i64,
-        min: i64,
-        max: i64,
-    },
-    DimensionOutOfRange {
-        field: &'static str,
-        value: i64,
-        min: i64,
-        max: i64,
-    },
-    WallLengthOutOfRange {
-        min_mm: i128,
-        max_mm: i128,
-    },
-    WallStartEqualsEnd,
-    OpeningHeightOverflow,
-}
-
-impl fmt::Display for ProtoError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BatchTooLarge { count, max } => {
-                write!(f, "batch has {count} operations; maximum is {max}")
-            }
-            Self::TooManyElements { count, max } => {
-                write!(
-                    f,
-                    "document would hold {count} elements/openings; maximum is {max}"
-                )
-            }
-            Self::NameEmpty => write!(f, "name must not be empty"),
-            Self::NameTooLong { chars, max } => {
-                write!(f, "name has {chars} characters; maximum is {max}")
-            }
-            Self::NameHasControlChars => write!(f, "name must not contain control characters"),
-            Self::NameHasForbiddenChars => write!(
-                f,
-                "name must not contain bidi, formatting, separator or private-use characters"
-            ),
-            Self::RefIdEmpty => write!(f, "ref_id must not be empty"),
-            Self::RefIdTooLong { chars, max } => {
-                write!(f, "ref_id has {chars} characters; maximum is {max}")
-            }
-            Self::RefIdHasInvalidChars => write!(
-                f,
-                "ref_id may only contain ASCII letters, digits, '_' and '-'"
-            ),
-            Self::CoordinateOutOfRange {
-                field,
-                value,
-                min,
-                max,
-            } => write!(
-                f,
-                "{field} coordinate {value} mm is outside {min}..={max} mm"
-            ),
-            Self::DimensionOutOfRange {
-                field,
-                value,
-                min,
-                max,
-            } => write!(f, "{field} is {value}; expected {min}..={max}"),
-            Self::WallLengthOutOfRange { min_mm, max_mm } => {
-                write!(f, "wall length must be between {min_mm} mm and {max_mm} mm")
-            }
-            Self::WallStartEqualsEnd => write!(f, "wall start_mm and end_mm must differ"),
-            Self::OpeningHeightOverflow => {
-                write!(f, "sill_height_mm plus height_mm overflows")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProtoError {}
-
-/// Reject oversized batches. Empty batches are allowed (a successful no-op).
-pub fn validate_batch(operations: &[Operation]) -> Result<(), ProtoError> {
-    if operations.len() > MAX_BATCH_OPS {
-        return Err(ProtoError::BatchTooLarge {
-            count: operations.len(),
-            max: MAX_BATCH_OPS,
-        });
-    }
-    Ok(())
-}
-
-/// Reject documents that would exceed [`MAX_DOCUMENT_ELEMENTS`]. Counts
-/// elements and openings together because both consume memory during scene
-/// building.
-pub fn validate_element_budget(
-    element_count: usize,
-    opening_count: usize,
-) -> Result<(), ProtoError> {
-    let count = element_count.saturating_add(opening_count);
-    if count > MAX_DOCUMENT_ELEMENTS {
-        return Err(ProtoError::TooManyElements {
-            count,
-            max: MAX_DOCUMENT_ELEMENTS,
-        });
-    }
-    Ok(())
-}
-
-fn is_forbidden_display_char(c: char) -> bool {
-    // C0/C1 controls, line/paragraph separators, bidi overrides and other
-    // Unicode format characters, plus private-use code points. These can be
-    // used to spoof or hide instruction-like text in names returned to agents.
-    c.is_control()
-        || matches!(c, '\u{2028}' | '\u{2029}')
-        || matches!(
-            c as u32,
-            0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0xFEFF
-        )
-        || matches!(c as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD)
-}
-
-/// Trim and validate a free-text display name.
-///
-/// Names are returned to agents, so they are length-limited and must not carry
-/// control characters, bidi overrides or invisible formatting characters that
-/// could be used to fabricate instruction-like text (architecture section 7.6).
-pub fn sanitize_name(name: &str) -> Result<String, ProtoError> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(ProtoError::NameEmpty);
-    }
-    if trimmed.chars().any(char::is_control) {
-        return Err(ProtoError::NameHasControlChars);
-    }
-    if trimmed.chars().any(is_forbidden_display_char) {
-        return Err(ProtoError::NameHasForbiddenChars);
-    }
-    let chars = trimmed.chars().count();
-    if chars > MAX_NAME_CHARS {
-        return Err(ProtoError::NameTooLong {
-            chars,
-            max: MAX_NAME_CHARS,
-        });
-    }
-    Ok(trimmed.to_string())
-}
-
-/// Validate a stable reference id.
-///
-/// Reference ids are echoed back in summaries and used as map keys, so they are
-/// limited to a conservative ASCII identifier alphabet. Control characters,
-/// bidi overrides and other invisible characters are rejected as invalid.
-pub fn sanitize_ref_id(ref_id: &str) -> Result<(), ProtoError> {
-    if ref_id.is_empty() {
-        return Err(ProtoError::RefIdEmpty);
-    }
-    let chars = ref_id.chars().count();
-    if chars > MAX_REF_ID_CHARS {
-        return Err(ProtoError::RefIdTooLong {
-            chars,
-            max: MAX_REF_ID_CHARS,
-        });
-    }
-    let valid = ref_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if !valid {
-        return Err(ProtoError::RefIdHasInvalidChars);
-    }
-    Ok(())
-}
-
-fn validate_optional_ref_id(ref_id: &Option<String>) -> Result<(), ProtoError> {
-    match ref_id {
-        Some(ref_id) => sanitize_ref_id(ref_id),
-        None => Ok(()),
-    }
-}
-
-fn check_coordinate(field: &'static str, value: i64) -> Result<(), ProtoError> {
-    if !(MIN_COORD_MM..=MAX_COORD_MM).contains(&value) {
-        return Err(ProtoError::CoordinateOutOfRange {
-            field,
-            value,
-            min: MIN_COORD_MM,
-            max: MAX_COORD_MM,
-        });
-    }
-    Ok(())
-}
-
-fn check_dimension(field: &'static str, value: i64, min: i64, max: i64) -> Result<(), ProtoError> {
-    if !(min..=max).contains(&value) {
-        return Err(ProtoError::DimensionOutOfRange {
-            field,
-            value,
-            min,
-            max,
-        });
-    }
-    Ok(())
-}
-
-/// Bound a wall run by comparing squared distances, which avoids both floating
-/// point and `i64` overflow (coordinates are already range-checked).
-fn check_wall_length(start_mm: [i64; 2], end_mm: [i64; 2]) -> Result<(), ProtoError> {
-    if start_mm == end_mm {
-        return Err(ProtoError::WallStartEqualsEnd);
-    }
-    let dx = i128::from(end_mm[0]) - i128::from(start_mm[0]);
-    let dz = i128::from(end_mm[1]) - i128::from(start_mm[1]);
-    let length_sq = dx * dx + dz * dz;
-    let min_sq = MIN_WALL_LENGTH_MM * MIN_WALL_LENGTH_MM;
-    let max_sq = MAX_WALL_LENGTH_MM * MAX_WALL_LENGTH_MM;
-    if length_sq < min_sq || length_sq > max_sq {
-        return Err(ProtoError::WallLengthOutOfRange {
-            min_mm: MIN_WALL_LENGTH_MM,
-            max_mm: MAX_WALL_LENGTH_MM,
-        });
-    }
-    Ok(())
 }
 
 fn int_pair_schema() -> serde_json::Value {
@@ -748,6 +299,59 @@ fn apply_operations_schema() -> serde_json::Value {
             "applied_count", "created_ids", "document_hash", "layout_hash",
             "block_count", "chunk_count", "summary"
         ]
+    })
+}
+
+fn undo_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "seq": { "type": "integer", "minimum": 0 },
+            "compensated_seq": { "type": "integer", "minimum": 0 },
+            "document_hash": { "type": "string" },
+            "layout_hash": { "type": "string" },
+            "block_count": { "type": "integer", "minimum": 0 },
+            "chunk_count": { "type": "integer", "minimum": 0 },
+            "summary": { "type": "string" }
+        },
+        "required": [
+            "seq", "compensated_seq", "document_hash", "layout_hash",
+            "block_count", "chunk_count", "summary"
+        ]
+    })
+}
+
+fn history_entry_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "seq": { "type": "integer", "minimum": 0 },
+            "command_id": { "type": "string" },
+            "author": { "type": "string" },
+            "summary": { "type": "string" },
+            "touched_elements": {
+                "type": "array",
+                "items": { "type": "integer", "minimum": 0 }
+            },
+            "undone": { "type": "boolean" }
+        },
+        "required": [
+            "seq", "command_id", "author", "summary", "touched_elements", "undone"
+        ]
+    })
+}
+
+fn get_history_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "entries": {
+                "type": "array",
+                "items": history_entry_schema()
+            }
+        },
+        "required": ["count", "entries"]
     })
 }
 
@@ -902,6 +506,38 @@ pub fn tool_definitions() -> serde_json::Value {
                 "readOnlyHint": false,
                 "destructiveHint": true,
                 "idempotentHint": false,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "undo",
+            "description": "Undo this agent's latest still-live batch by appending a compensating command. Refused when a later command touched the same elements.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "outputSchema": undo_schema(),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "get_history",
+            "description": "Read the append-only command history with sequence numbers, authors and undone markers. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "outputSchema": get_history_schema(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
                 "openWorldHint": false
             }
         }
@@ -1272,7 +908,9 @@ mod tests {
                 "get_castle",
                 "list_elements",
                 "render_plan",
-                "apply_operations"
+                "apply_operations",
+                "undo",
+                "get_history"
             ]
         );
         for tool in tools {
@@ -1290,6 +928,11 @@ mod tests {
             apply["inputSchema"]["properties"]["operations"]["maxItems"],
             MAX_BATCH_OPS
         );
+
+        // Undo is a destructive (compensating) write, so hosts must gate it.
+        let undo = &tools[4];
+        assert_eq!(undo["name"], "undo");
+        assert_eq!(undo["annotations"]["destructiveHint"], true);
 
         // Numeric bounds are mirrored from the Rust-side checks.
         let wall = &apply["inputSchema"]["properties"]["operations"]["items"]["oneOf"][0];
@@ -1387,5 +1030,39 @@ mod tests {
         assert_eq!(value["created_ids"]["north"], 1);
         let parsed: ApplyOperationsResponse = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, response);
+    }
+
+    #[test]
+    fn undo_and_history_responses_serialise() {
+        let undo = UndoResponse {
+            seq: 2,
+            compensated_seq: 1,
+            document_hash: "0000000000000003".into(),
+            layout_hash: "0000000000000004".into(),
+            block_count: 10,
+            chunk_count: 2,
+            summary: "Undo command #1".into(),
+        };
+        let value = serde_json::to_value(&undo).unwrap();
+        assert_eq!(value["compensated_seq"], 1);
+        assert_eq!(serde_json::from_value::<UndoResponse>(value).unwrap(), undo);
+
+        let history = GetHistoryResponse {
+            count: 1,
+            entries: vec![HistoryEntry {
+                seq: 1,
+                command_id: "018bcfe5-6800-7000-8000-000000000001".into(),
+                author: "agent:mcp-offline".into(),
+                summary: "+1 wall".into(),
+                touched_elements: vec![12],
+                undone: true,
+            }],
+        };
+        let value = serde_json::to_value(&history).unwrap();
+        assert_eq!(value["entries"][0]["undone"], true);
+        assert_eq!(
+            serde_json::from_value::<GetHistoryResponse>(value).unwrap(),
+            history
+        );
     }
 }
