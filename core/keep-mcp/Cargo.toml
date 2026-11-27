@@ -1,0 +1,21 @@
+[package]
+name = "keep-mcp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.100"
+description = "Offline stdio MCP sidecar for Keepwright (JSON-RPC 2.0, synchronous)"
+license = "MIT"
+
+[lib]
+name = "keep_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "keep-mcp"
+path = "src/main.rs"
+
+[dependencies]
+keep-core = { path = "../keep-core" }
+keep-proto = { path = "../keep-proto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

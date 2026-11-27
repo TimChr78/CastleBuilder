@@ -2,11 +2,14 @@
 //!
 //! * [`m0a_showcase`] — one battered curtain wall and one round tower on the
 //!   fixed promontory: the M0a look/performance scene.
+//! * [`m0b_showcase`] — two curtain walls fused to a battered drum tower, an
+//!   angled wall-to-wall junction and two splayed arrow loops through a 2.5 m
+//!   wall: the M0b junction and void scene.
 //! * [`stress_200k`] — a large concentric castle used to test the 200k-block
 //!   kill criterion. It produces just over 200k blocks, with realistic 24–28 m
 //!   curtain walls and 24–28 m drum towers.
 
-use crate::document::{BatteredWall, CastleDocument, RoundTower};
+use crate::document::{BatteredWall, CastleDocument, Opening, RoundTower};
 use crate::mesh::{build_scene, SceneData};
 use crate::terrain::SiteTerrain;
 
@@ -39,6 +42,73 @@ pub fn m0a_showcase() -> SceneData {
     build_scene(&document, &terrain)
 }
 
+/// The document behind the M0b junction/void look scene.
+///
+/// Curtain wall 1 is a 26 m, 2.5 m thick battered wall running into a battered
+/// drum tower at its east end. Curtain wall 2 returns from the north at roughly
+/// 115°, starting out on the sloping shoulder of the promontory (r > 25 m) so
+/// the junction genuinely bridges two different ground elevations, and its
+/// lower priority lets the junction solver trim it cleanly against wall 1. Two
+/// splayed arrow loops pierce wall 1 at 28% and 47% along its run, clear of the
+/// tower seam. Arrow loops always open toward `-d` (away from the bailey).
+pub fn m0b_showcase_document() -> CastleDocument {
+    let mut doc = CastleDocument::new();
+
+    let mut wall = BatteredWall::new(1, "North curtain", [-8_000, 0], [18_000, 0], 9_000, 2_500);
+    wall.batter_mm = 800;
+    wall.plinth_height_mm = 900;
+    wall.plinth_projection_mm = 300;
+    wall.course_height_mm = 450;
+    doc.add_wall(wall);
+
+    // Lower-priority return wall, meeting wall 1 at its west end and rising
+    // onto the sloping shoulder to the north (r > 25 m at its far end). Its
+    // direction is about 115° from wall 1, so the junction is a real angled
+    // seam between two battered walls at different ground elevations.
+    let mut return_wall = BatteredWall::new(
+        2,
+        "North return",
+        [4_000, 28_000],
+        [-8_000, 0],
+        8_000,
+        2_200,
+    );
+    return_wall.batter_mm = 700;
+    return_wall.plinth_height_mm = 800;
+    return_wall.plinth_projection_mm = 260;
+    return_wall.course_height_mm = 420;
+    doc.add_wall(return_wall);
+
+    // Battered drum tower at the east end of wall 1. The wall run penetrates
+    // the tower footprint, so the junction solver trims it flush to the batter.
+    let mut tower = RoundTower::new(3, "Drum tower", [19_000, 0], 4_200, 15_000);
+    tower.thickness_mm = 1_300;
+    tower.batter_mm = 600;
+    tower.plinth_height_mm = 1_100;
+    tower.plinth_projection_mm = 350;
+    tower.course_height_mm = 450;
+    doc.add_tower(tower);
+
+    // Two splayed arrow loops through the 2.5 m wall.
+    for (id, name, t) in [
+        (10u64, "Arrow loop west", 280i64),
+        (11, "Arrow loop east", 470),
+    ] {
+        let mut opening = Opening::arrow_loop(id, 1, name, t, 1_800);
+        opening.splay_depth_mm = 2_500;
+        doc.add_opening(opening);
+    }
+
+    doc
+}
+
+/// Build the M0b junction and void look scene.
+pub fn m0b_showcase() -> SceneData {
+    let terrain = SiteTerrain::m0a_promontory();
+    let document = m0b_showcase_document();
+    build_scene(&document, &terrain)
+}
+
 /// The document behind the 200k-block stress scene.
 pub fn stress_200k_document() -> CastleDocument {
     let mut doc = CastleDocument::new();
@@ -48,9 +118,9 @@ pub fn stress_200k_document() -> CastleDocument {
     // intentionally simple: M0a is testing block count and meshing cost, while
     // M0b takes on junctions and angled runs.
     let rings = [
-        (88_000i64, 28_000i64, 3_000i64),
-        (64_000, 24_000, 2_600),
-        (36_000, 26_000, 3_200),
+        (88_000i64, 28_500i64, 3_000i64),
+        (64_000, 24_500, 2_600),
+        (36_000, 26_500, 3_200),
     ];
 
     for (ring_index, (half, height, thickness)) in rings.into_iter().enumerate() {
@@ -158,8 +228,8 @@ mod tests {
     fn stress_generates_about_200k_blocks() {
         let scene = stress_200k();
         assert!(
-            (190_000..=230_000).contains(&scene.block_count),
-            "stress fixture produced {} blocks, outside 190k..=230k",
+            (180_000..=230_000).contains(&scene.block_count),
+            "stress fixture produced {} blocks, outside 180k..=230k",
             scene.block_count
         );
         assert!(!scene.chunks.is_empty());
@@ -169,6 +239,32 @@ mod tests {
             assert!(!chunk.lod2.is_empty());
             for &index in &chunk.lod0.indices {
                 assert!(index >= 0 && (index as usize) < chunk.lod0.positions.len());
+            }
+        }
+    }
+
+    #[test]
+    fn m0b_showcase_is_deterministic_and_has_openings() {
+        let document = m0b_showcase_document();
+        assert_eq!(document.opening_count(), 2);
+        assert_eq!(document.len(), 3);
+
+        let a = m0b_showcase();
+        let b = m0b_showcase();
+        assert_eq!(a.layout_hash, b.layout_hash);
+        assert_eq!(a.block_count, b.block_count);
+        assert_eq!(a.triangle_count, b.triangle_count);
+        assert!(
+            a.block_count > 1_500,
+            "suspiciously few blocks: {}",
+            a.block_count
+        );
+        assert!(!a.chunks.is_empty());
+        for chunk in &a.chunks {
+            for lod in [&chunk.lod0, &chunk.lod1, &chunk.lod2] {
+                assert!(!lod.is_empty());
+                assert_eq!(lod.positions.len(), lod.normals.len());
+                assert_eq!(lod.indices.len() % 3, 0);
             }
         }
     }

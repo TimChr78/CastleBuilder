@@ -31,13 +31,22 @@ var _drag_button := 0
 
 # Shadow cascades are only retuned when the view changes enough to matter;
 # otherwise tiny per-frame altitude changes make the shadow map shimmer.
-const SHADOW_UPDATE_THRESHOLD := 0.05
+# A 15% hysteresis plus coarse 25 m span quantisation means orbiting and
+# zooming never make the cascade boundaries pop or resample every frame.
+const SHADOW_UPDATE_THRESHOLD := 0.15
+const SHADOW_SPAN_STEP := 25.0
 var _last_shadow_altitude := -1.0
 var _last_shadow_distance := -1.0
+var _last_shadow_span := -1.0
 
 
 func _ready() -> void:
 	_sync_immediate()
+
+
+## Current (damped) orbit distance in metres; used by zoom-reactive audio.
+func get_view_distance() -> float:
+	return _distance
 
 
 func focus_on(point: Vector3, distance := -1.0) -> void:
@@ -141,25 +150,44 @@ func _pan_screen(relative: Vector2) -> void:
 
 ## Camera-altitude-reactive shadow tuning. Wide vistas push the cascades out,
 ## while low, close inspection keeps them tight and crisp.
+##
+## Retuning is deliberately rare: we only touch the light when the view moved
+## by more than 15% since the last update, and the shadow span itself is
+## snapped to 25 m steps (splits derive from that span). This keeps cascade
+## boundaries stable through an entire orbit/zoom gesture.
 func update_shadow_splits(sun: DirectionalLight3D) -> void:
 	if sun == null:
 		return
 	var altitude := maxf(global_position.y - 1.0, 0.0)
 
-	# Debounce: bail out unless altitude or distance moved more than 5% since
-	# the last retune. This eliminates shadow-map shimmer while zooming gently.
-	if _last_shadow_altitude >= 0.0:
+	# Debounce: outside a settled view, bail out unless altitude or distance
+	# moved more than 15% since the last retune. Once the zoom settles we allow
+	# one retune, but the quantised span below means it only actually writes
+	# when a 25 m step was crossed. This eliminates shadow-map shimmer while
+	# zooming gently and keeps cascades fixed through an orbit.
+	var settled := absf(_distance - _target_distance) <= maxf(0.25, _target_distance * 0.01)
+	if _last_shadow_altitude >= 0.0 and not settled:
 		var altitude_delta := absf(altitude - _last_shadow_altitude) / maxf(_last_shadow_altitude, 1.0)
 		var distance_delta := absf(_distance - _last_shadow_distance) / maxf(_last_shadow_distance, 1.0)
 		if altitude_delta < SHADOW_UPDATE_THRESHOLD and distance_delta < SHADOW_UPDATE_THRESHOLD:
 			return
+
+	# Coarse quantisation: the shadow distance only ever takes 25 m steps, so
+	# slow directional changes cannot resample the shadow map every frame.
+	var raw_span := clampf(80.0 + altitude * 7.0 + _distance * 0.8, 80.0, 700.0)
+	var span := clampf(roundf(raw_span / SHADOW_SPAN_STEP) * SHADOW_SPAN_STEP, 75.0, 700.0)
+	if is_equal_approx(span, _last_shadow_span):
+		return
+
 	_last_shadow_altitude = altitude
 	_last_shadow_distance = _distance
+	_last_shadow_span = span
 
-	var span := clampf(80.0 + altitude * 7.0 + _distance * 0.8, 80.0, 700.0)
 	sun.directional_shadow_max_distance = span
 
-	var near := clampf(6.0 + altitude * 0.2 + _distance * 0.03, 6.0, 40.0)
-	sun.directional_shadow_split_1 = clampf(near / span, 0.02, 0.50)
-	sun.directional_shadow_split_2 = clampf((near * 3.0) / span, 0.05, 0.80)
-	sun.directional_shadow_split_3 = clampf((near * 9.0) / span, 0.10, 0.95)
+	# Splits are a pure function of the quantised span, so they only change
+	# when the span steps — never per frame.
+	var near := clampf(span * 0.12, 10.0, 48.0)
+	sun.directional_shadow_split_1 = clampf(near / span, 0.05, 0.30)
+	sun.directional_shadow_split_2 = clampf((near * 3.0) / span, 0.15, 0.65)
+	sun.directional_shadow_split_3 = clampf((near * 7.0) / span, 0.35, 0.92)

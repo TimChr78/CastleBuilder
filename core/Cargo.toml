@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["keep-core", "keep-gd"]
+members = ["keep-core", "keep-gd", "keep-proto", "keep-mcp"]
 
 [profile.dev]
 opt-level = 2

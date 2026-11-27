@@ -1,35 +1,49 @@
 extends Node3D
-## Keepwright M0a — look and performance spike.
+## Keepwright M0a/M0b — look and feel spike.
 ##
 ## Everything is built in code (see AGENTS.md rule 5): a golden-hour
 ## WorldEnvironment, a warm low sun with tuned cascades, an orbit camera, the
 ## debug HUD and the KeepBridge GDExtension. Terrain and chunk meshes returned by
 ## keep-gd are already in world space, so they are wrapped in identity-transform
-## MeshInstance3D nodes with visibility ranges for LOD0 (0-80 m), LOD1 (80-180 m)
-## and LOD2 (180-600 m). Keeping the nodes at the origin preserves the mesh AABB
+## MeshInstance3D nodes with visibility ranges for LOD0 (0-90 m), LOD1 (90-200 m)
+## and LOD2 (200-650 m). Keeping the nodes at the origin preserves the mesh AABB
 ## at its true world position for frustum, shadow and visibility-range culling.
+##
+## M0b adds the construction theater (climbing scaffolding + rising dust), the
+## procedural generator audio and the interactive design-tool overlay.
 
 const MASONRY_SHADER := preload("res://shaders/masonry.gdshader")
 const TERRAIN_SHADER := preload("res://shaders/terrain.gdshader")
 const ORBIT_CAMERA_SCRIPT := preload("res://scripts/orbit_camera.gd")
 const DEBUG_HUD_SCRIPT := preload("res://scripts/debug_hud.gd")
+const CONSTRUCTION_FX_SCRIPT := preload("res://scripts/construction_fx.gd")
+const BUILD_AUDIO_SCRIPT := preload("res://scripts/build_audio.gd")
+const DESIGN_TOOL_SCRIPT := preload("res://scripts/design_tool.gd")
 
 # Chunk visibility ranges in metres. Keep aligned with the M0a budget. LOD0
 # extends far enough that the default framing (~50 m) always shows full detail.
-const LOD_BEGIN := [0.0, 80.0, 180.0]
-const LOD_END := [80.0, 180.0, 600.0]
-const LOD_FADE_MARGIN := [3.0, 6.0, 12.0]
+const LOD_BEGIN := [0.0, 90.0, 200.0]
+const LOD_END := [90.0, 200.0, 650.0]
+const LOD_FADE_MARGIN := [4.0, 8.0, 16.0]
+
+## Seconds for the construction front to sweep 0 → 1 once, then hold.
+const BUILD_PLAY_SECONDS := 27.0
 
 var _bridge: Object
 var _camera: Camera3D
 var _hud: CanvasLayer
 var _sun: DirectionalLight3D
+var _fx: Node3D
+var _audio: Node
+var _design_tool: Node3D
 
 var _masonry_material: ShaderMaterial
 var _terrain_material: ShaderMaterial
 var _chunk_instances: Array[MeshInstance3D] = []
 
 var _build_front := 1.0
+var _playing := false
+var _tick_timer := 0.0
 var _mode_busy := false
 
 
@@ -39,15 +53,38 @@ func _ready() -> void:
 	_setup_sun()
 	_setup_camera()
 	_setup_hud()
+	_setup_feel()
 	_setup_bridge()
 
 	if _bridge != null:
-		_rebuild("showcase")
+		_rebuild("m0b")
 
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	if _camera != null and _sun != null:
 		_camera.call("update_shadow_splits", _sun)
+
+	# Zoom-reactive procedural mix + stone-setting ticks while the build plays.
+	if _audio != null and _camera != null:
+		_audio.call("set_camera_distance", float(_camera.call("get_view_distance")))
+
+	if _playing:
+		if _build_front < 1.0:
+			_apply_build_front(
+				minf(_build_front + delta / BUILD_PLAY_SECONDS, 1.0)
+			)
+			if _hud != null:
+				_hud.call("set_build_front", _build_front)
+		# Hold the finished wall at 1.0 instead of wrapping back to bare ground.
+		if _build_front >= 1.0:
+			_playing = false
+			if _hud != null:
+				_hud.call("set_playing", false)
+		elif _build_front > 0.01 and _audio != null:
+			_tick_timer -= delta
+			if _tick_timer <= 0.0:
+				_audio.call("play_stone_tick", _build_front)
+				_tick_timer = randf_range(0.08, 0.18)
 
 
 func _make_materials() -> void:
@@ -161,7 +198,28 @@ func _setup_hud() -> void:
 	_hud.name = "DebugHud"
 	add_child(_hud)
 	_hud.connect("build_front_changed", Callable(self, "_on_hud_build_front_changed"))
+	_hud.connect("playing_changed", Callable(self, "_on_hud_playing_changed"))
 	_hud.connect("mode_requested", Callable(self, "_on_hud_mode_requested"))
+	_hud.connect("tool_requested", Callable(self, "_on_hud_tool_requested"))
+	_hud.connect("undo_requested", Callable(self, "_on_undo_requested"))
+
+
+func _setup_feel() -> void:
+	_audio = BUILD_AUDIO_SCRIPT.new()
+	_audio.name = "BuildAudio"
+	add_child(_audio)
+
+	_fx = CONSTRUCTION_FX_SCRIPT.new()
+	_fx.name = "ConstructionFx"
+	add_child(_fx)
+
+	_design_tool = DESIGN_TOOL_SCRIPT.new()
+	_design_tool.name = "DesignTool"
+	add_child(_design_tool)
+	_design_tool.connect("wall_committed", Callable(self, "_on_wall_committed"))
+	_design_tool.connect("tower_committed", Callable(self, "_on_tower_committed"))
+	_design_tool.connect("snap_feedback", Callable(self, "_on_snap_feedback"))
+	_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.NONE)
 
 
 func _setup_bridge() -> void:
@@ -188,6 +246,8 @@ func _setup_bridge() -> void:
 	_bridge = instance
 	if instance is Node:
 		add_child(instance as Node)
+	if _design_tool != null:
+		_design_tool.call("set_bridge", _bridge)
 
 
 func _rebuild(mode: String) -> void:
@@ -197,7 +257,19 @@ func _rebuild(mode: String) -> void:
 	if _mode_busy:
 		return
 
-	var method := "build_m0a_showcase" if mode == "showcase" else "build_stress_200k"
+	var method := "build_m0b_showcase"
+	var label := "M0b Showcase"
+	match mode:
+		"showcase":
+			method = "build_m0a_showcase"
+			label = "M0a Showcase"
+		"stress":
+			method = "build_stress_200k"
+			label = "200k Stress Test"
+		_:
+			method = "build_m0b_showcase"
+			label = "M0b Showcase"
+
 	if not _bridge.has_method(method):
 		_hud.call("show_error", "KeepBridge has no %s() method." % method)
 		return
@@ -213,6 +285,27 @@ func _rebuild(mode: String) -> void:
 		return
 
 	var data: Dictionary = result
+	_apply_scene(data, true, true)
+	_hud.call("set_mode_label", label)
+	_hud.call("clear_error")
+
+	var block_count := int(data.get("block_count", 0))
+	var chunk_count := int(data.get("chunk_count", 0))
+	var triangle_count := int(data.get("triangle_count", 0))
+	var layout_hash := str(data.get("layout_hash", ""))
+	var document_hash := str(data.get("document_hash", ""))
+
+	print(
+		"Keepwright: %s built in %d ms — %d blocks, %d chunks, %d tris, layout %s, doc %s"
+		% [mode, elapsed, block_count, chunk_count, triangle_count, layout_hash, document_hash]
+	)
+	_mode_busy = false
+
+
+## Apply a scene dictionary from any KeepBridge command (build or interactive
+## edit). `reset_play` restarts the construction front; `reframe` recentres the
+## orbit camera, which is desirable for a mode switch but not for every edit.
+func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 	_clear_world_meshes()
 	_spawn_terrain(data.get("terrain"))
 	_spawn_chunks(data.get("chunks"))
@@ -221,19 +314,29 @@ func _rebuild(mode: String) -> void:
 	var chunk_count := int(data.get("chunk_count", 0))
 	var triangle_count := int(data.get("triangle_count", 0))
 	var layout_hash := str(data.get("layout_hash", ""))
+	var document_hash := str(data.get("document_hash", ""))
 
-	_hud.call("set_scene_stats", block_count, chunk_count, layout_hash, triangle_count)
-	_hud.call("set_mode_label", "M0a Showcase" if mode == "showcase" else "200k Stress Test")
-	_hud.call("clear_error")
-	_hud.call("set_playing", false)
-	_hud.call("set_build_front", 1.0)
-	_apply_build_front(1.0)
-	_frame_camera(data)
+	_hud.call(
+		"set_scene_stats", block_count, chunk_count, layout_hash, triangle_count, document_hash
+	)
 
-	print("Keepwright: %s built in %d ms — %d blocks, %d chunks, %d tris, hash %s" % [
-		mode, elapsed, block_count, chunk_count, triangle_count, layout_hash
-	])
-	_mode_busy = false
+	if reset_play:
+		_hud.call("clear_error")
+		_hud.call("set_playing", false)
+		_hud.call("set_build_front", 1.0)
+		_playing = false
+		_apply_build_front(1.0)
+	else:
+		_apply_build_front(_build_front)
+
+	var bounds := _compute_masonry_bounds(data)
+	if _fx != null:
+		_fx.call("configure_bounds", bounds)
+	if _design_tool != null:
+		_design_tool.call("set_ground_height", bounds.position.y)
+
+	if reframe:
+		_frame_camera(data)
 
 
 func _spawn_terrain(mesh: Variant) -> void:
@@ -291,6 +394,29 @@ func _clear_world_meshes() -> void:
 	_chunk_instances.clear()
 
 
+## World-space bounds of the generated masonry (all LOD0 chunk meshes).
+func _compute_masonry_bounds(data: Dictionary) -> AABB:
+	var bounds := AABB()
+	var have_bounds := false
+	var chunks: Variant = data.get("chunks", null)
+	if chunks is Array:
+		for entry in (chunks as Array):
+			if not (entry is Dictionary):
+				continue
+			var mesh: Variant = (entry as Dictionary).get("lod0", null)
+			if not (mesh is ArrayMesh):
+				continue
+			var mesh_bounds: AABB = (mesh as ArrayMesh).get_aabb()
+			if not have_bounds:
+				bounds = mesh_bounds
+				have_bounds = true
+			else:
+				bounds = bounds.merge(mesh_bounds)
+	if not have_bounds:
+		bounds = AABB(Vector3(-12.0, 0.0, -12.0), Vector3(24.0, 12.0, 24.0))
+	return bounds
+
+
 func _frame_camera(data: Dictionary) -> void:
 	var focus := Vector3(0.0, 8.0, 0.0)
 	var span := 60.0
@@ -329,11 +455,125 @@ func _on_hud_build_front_changed(value: float) -> void:
 	_apply_build_front(value)
 
 
+func _on_hud_playing_changed(playing: bool) -> void:
+	_playing = playing
+	_tick_timer = 0.0
+	# Replaying a finished build starts cleanly from bare ground.
+	if playing and _build_front >= 0.99:
+		_apply_build_front(0.0)
+		if _hud != null:
+			_hud.call("set_build_front", 0.0)
+	if _fx != null:
+		_fx.call("set_build_front", _build_front, _playing)
+
+
 func _apply_build_front(value: float) -> void:
 	_build_front = clampf(value, 0.0, 1.0)
 	if _masonry_material != null:
 		_masonry_material.set_shader_parameter("build_front", _build_front)
+	if _fx != null:
+		_fx.call("set_build_front", _build_front, _playing)
 
 
 func _on_hud_mode_requested(mode: String) -> void:
 	_rebuild(mode)
+
+
+func _on_hud_tool_requested(tool: String) -> void:
+	if _design_tool == null:
+		return
+	match tool:
+		"wall":
+			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.WALL)
+			_hud.call("set_tool_status", "Tool: Draw Wall — drag LMB across the promontory")
+		"tower":
+			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.TOWER)
+			_hud.call("set_tool_status", "Tool: Place Tower — click LMB to place")
+		_:
+			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.NONE)
+			_hud.call("set_tool_status", "Tool: View — orbit around the site")
+
+
+func _on_snap_feedback() -> void:
+	if _audio != null:
+		_audio.call("play_place_thud", 1.18)
+
+
+func _on_wall_committed(
+	start_m: Vector2,
+	end_m: Vector2,
+	height_m: float,
+	thickness_m: float
+) -> void:
+	if _audio != null:
+		_audio.call("play_place_thud", 1.0)
+	var length := start_m.distance_to(end_m)
+	print(
+		"Keepwright: wall committed — %.1f m long, %.1f m high, %.1f m thick (start %s → end %s)" %
+		[length, height_m, thickness_m, str(start_m), str(end_m)]
+	)
+	if _bridge == null or not _bridge.has_method("add_wall"):
+		_hud.call(
+			"set_tool_status",
+			"Wall committed: %.1f m · H %.1f m · T %.1f m" % [length, height_m, thickness_m]
+		)
+		return
+	var result: Variant = _bridge.call("add_wall", start_m, end_m, height_m, thickness_m)
+	if not (result is Dictionary):
+		_hud.call("show_error", "KeepBridge.add_wall() did not return a Dictionary.")
+		return
+	_apply_scene(result as Dictionary, false, false)
+	_hud.call(
+		"set_tool_status",
+		"Wall added: %.1f m · H %.1f m · T %.1f m — Ctrl+Z to undo"
+		% [length, height_m, thickness_m]
+	)
+
+
+func _on_tower_committed(center_m: Vector2, radius_m: float, height_m: float) -> void:
+	if _audio != null:
+		_audio.call("play_place_thud", 0.82)
+	print(
+		"Keepwright: tower committed — centre %s, radius %.1f m, height %.1f m" %
+		[str(center_m), radius_m, height_m]
+	)
+	if _bridge == null or not _bridge.has_method("add_tower"):
+		_hud.call(
+			"set_tool_status",
+			"Tower committed: r %.1f m · H %.1f m" % [radius_m, height_m]
+		)
+		return
+	var result: Variant = _bridge.call("add_tower", center_m, radius_m, height_m)
+	if not (result is Dictionary):
+		_hud.call("show_error", "KeepBridge.add_tower() did not return a Dictionary.")
+		return
+	_apply_scene(result as Dictionary, false, false)
+	_hud.call(
+		"set_tool_status",
+		"Tower added: r %.1f m · H %.1f m — Ctrl+Z to undo" % [radius_m, height_m]
+	)
+
+
+func _on_undo_requested() -> void:
+	if _bridge == null or not _bridge.has_method("undo_last"):
+		_hud.call("show_error", "Cannot undo: KeepBridge.undo_last() is unavailable.")
+		return
+	var result: Variant = _bridge.call("undo_last")
+	if not (result is Dictionary):
+		_hud.call("show_error", "KeepBridge.undo_last() did not return a Dictionary.")
+		return
+	var data: Dictionary = result
+	_apply_scene(data, false, false)
+	if bool(data.get("undone", false)):
+		_hud.call("set_tool_status", "Undo: removed the last wall or tower")
+	else:
+		_hud.call("set_tool_status", "Undo: nothing to remove")
+
+
+func _unhandled_input(event: InputEvent) -> void:
+	if not (event is InputEventKey):
+		return
+	var key := event as InputEventKey
+	if key.pressed and not key.echo and key.ctrl_pressed and key.keycode == KEY_Z:
+		_on_undo_requested()
+		get_viewport().set_input_as_handled()

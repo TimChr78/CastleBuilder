@@ -10,13 +10,16 @@
 
 pub mod document;
 pub mod fixtures;
+pub mod junction;
 pub mod masonry;
 pub mod mesh;
+pub mod picking;
+pub mod plan_render;
 pub mod terrain;
 
 /// Version stamped into layout hashes. Bump whenever the generator's output
 /// changes, even if the document schema is unchanged.
-pub const GENERATOR_VERSION: u32 = 1;
+pub const GENERATOR_VERSION: u32 = 2;
 
 /// FNV-1a 64-bit offset basis.
 pub const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;

@@ -149,6 +149,7 @@ fn layout_hash_of(blocks: &[Block]) -> u64 {
         for exposed in block.expose {
             hash = fnv1a_64_update(hash, &[u8::from(exposed)]);
         }
+        hash = fnv1a_64_update(hash, &[block.role as u8]);
     }
     hash
 }

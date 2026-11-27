@@ -1,20 +1,23 @@
 extends CanvasLayer
-## Minimal, code-built M0a debug HUD.
+## Minimal, code-built M0b debug HUD.
 ##
 ## Shows renderer counters and build statistics, drives the construction-front
-## uniform, and switches between the showcase and the 200k stress build.
+## uniform, switches between the M0a/M0b showcase and the 200k stress build, and
+## exposes the interactive undo command.
 
 signal build_front_changed(value: float)
 signal playing_changed(playing: bool)
 signal mode_requested(mode: String)
+signal tool_requested(tool: String)
+signal undo_requested()
 
 const REFRESH_INTERVAL := 0.25
-const PLAY_RATE := 0.12
 
 var _fps_label: Label
 var _render_label: Label
 var _scene_label: Label
 var _hash_label: Label
+var _doc_hash_label: Label
 var _front_label: Label
 var _mode_label: Label
 var _warning_label: Label
@@ -22,7 +25,11 @@ var _error_label: Label
 var _slider: HSlider
 var _play_button: Button
 var _showcase_button: Button
+var _m0b_button: Button
 var _stress_button: Button
+var _undo_button: Button
+var _tool_status: Label
+var _tool_buttons: Dictionary = {}
 
 var _playing := false
 var _refresh_timer := 0.0
@@ -34,12 +41,7 @@ func _ready() -> void:
 
 
 func _process(delta: float) -> void:
-	if _playing:
-		var next_value := _slider.value + delta * PLAY_RATE
-		if next_value >= 1.0:
-			next_value = fposmod(next_value, 1.0)
-		_slider.value = next_value
-
+	# Playback is advanced by main.gd so it can hold at 1.0 instead of wrapping.
 	_refresh_timer += delta
 	if _refresh_timer >= REFRESH_INTERVAL:
 		_refresh_timer = 0.0
@@ -71,13 +73,13 @@ func _build_ui() -> void:
 	margin.add_child(column)
 
 	var title := Label.new()
-	title.text = "KEEPWRIGHT  ·  M0a"
+	title.text = "KEEPWRIGHT  ·  M0b"
 	title.add_theme_font_size_override("font_size", 17)
 	title.add_theme_color_override("font_color", Color(0.96, 0.89, 0.72))
 	column.add_child(title)
 
 	_mode_label = Label.new()
-	_mode_label.text = "M0a Showcase"
+	_mode_label.text = "M0b Showcase"
 	_mode_label.add_theme_font_size_override("font_size", 12)
 	_mode_label.add_theme_color_override("font_color", Color(0.72, 0.74, 0.66))
 	column.add_child(_mode_label)
@@ -88,10 +90,12 @@ func _build_ui() -> void:
 	_render_label = _make_stat_label("Draw calls —   Primitives —   Triangles —")
 	_scene_label = _make_stat_label("Blocks —   Chunks —   Tris —")
 	_hash_label = _make_stat_label("Layout hash —")
+	_doc_hash_label = _make_stat_label("Doc hash —")
 	column.add_child(_fps_label)
 	column.add_child(_render_label)
 	column.add_child(_scene_label)
 	column.add_child(_hash_label)
+	column.add_child(_doc_hash_label)
 
 	column.add_child(HSeparator.new())
 
@@ -105,11 +109,23 @@ func _build_ui() -> void:
 	_showcase_button.pressed.connect(_on_showcase_pressed)
 	mode_row.add_child(_showcase_button)
 
+	_m0b_button = Button.new()
+	_m0b_button.text = "M0b Showcase"
+	_m0b_button.focus_mode = Control.FOCUS_NONE
+	_m0b_button.pressed.connect(_on_m0b_pressed)
+	mode_row.add_child(_m0b_button)
+
 	_stress_button = Button.new()
 	_stress_button.text = "200k Stress Test"
 	_stress_button.focus_mode = Control.FOCUS_NONE
 	_stress_button.pressed.connect(_on_stress_pressed)
 	mode_row.add_child(_stress_button)
+
+	_undo_button = Button.new()
+	_undo_button.text = "Undo"
+	_undo_button.focus_mode = Control.FOCUS_NONE
+	_undo_button.pressed.connect(_on_undo_pressed)
+	mode_row.add_child(_undo_button)
 
 	var front_row := HBoxContainer.new()
 	front_row.add_theme_constant_override("separation", 8)
@@ -137,8 +153,37 @@ func _build_ui() -> void:
 	_front_label = _make_stat_label("Build front 100%")
 	column.add_child(_front_label)
 
+	column.add_child(HSeparator.new())
+
+	var tool_row := HBoxContainer.new()
+	tool_row.add_theme_constant_override("separation", 6)
+	column.add_child(tool_row)
+
+	var tool_group := ButtonGroup.new()
+	tool_group.allow_unpress = false
+	var tool_entries := [
+		["view", "View"],
+		["wall", "Draw Wall"],
+		["tower", "Place Tower"],
+	]
+	for entry in tool_entries:
+		var tool_id: String = entry[0]
+		var button := Button.new()
+		button.text = entry[1]
+		button.toggle_mode = true
+		button.button_group = tool_group
+		button.focus_mode = Control.FOCUS_NONE
+		button.pressed.connect(_on_tool_pressed.bind(tool_id))
+		tool_row.add_child(button)
+		_tool_buttons[tool_id] = button
+	_tool_buttons["view"].set_pressed_no_signal(true)
+
+	_tool_status = _make_stat_label("Tool: View — orbit around the site")
+	_tool_status.add_theme_color_override("font_color", Color(0.90, 0.82, 0.60))
+	column.add_child(_tool_status)
+
 	var hint := Label.new()
-	hint.text = "RMB / MMB orbit · Shift+drag pan · Wheel zoom · WASD pan"
+	hint.text = "RMB / MMB orbit · Shift+drag pan · Wheel zoom · WASD pan\nLMB drag to draw a wall · LMB to place a tower · Ctrl+Z undo"
 	hint.add_theme_font_size_override("font_size", 11)
 	hint.add_theme_color_override("font_color", Color(0.62, 0.64, 0.58))
 	column.add_child(hint)
@@ -180,13 +225,20 @@ func _refresh_render_stats() -> void:
 	]
 
 
-func set_scene_stats(block_count: int, chunk_count: int, layout_hash: String, triangle_count: int) -> void:
+func set_scene_stats(
+	block_count: int,
+	chunk_count: int,
+	layout_hash: String,
+	triangle_count: int,
+	document_hash: String = ""
+) -> void:
 	_scene_label.text = "Blocks %s   Chunks %s   Tris %s" % [
 		_format_int(block_count),
 		_format_int(chunk_count),
 		_format_int(triangle_count),
 	]
 	_hash_label.text = "Layout hash %s" % (layout_hash if not layout_hash.is_empty() else "—")
+	_doc_hash_label.text = "Doc hash %s" % (document_hash if not document_hash.is_empty() else "—")
 
 
 func set_mode_label(mode_name: String) -> void:
@@ -197,6 +249,11 @@ func set_build_front(value: float) -> void:
 	var clamped := clampf(value, 0.0, 1.0)
 	_slider.set_value_no_signal(clamped)
 	_front_label.text = "Build front %d%%" % roundi(clamped * 100.0)
+
+
+func set_tool_status(text: String) -> void:
+	if _tool_status != null:
+		_tool_status.text = text
 
 
 func set_playing(playing: bool) -> void:
@@ -233,7 +290,7 @@ func _on_slider_value_changed(value: float) -> void:
 func _on_play_toggled(pressed: bool) -> void:
 	_playing = pressed
 	_play_button.text = "Pause" if pressed else "Play"
-	if pressed and _slider.value >= 0.999:
+	if pressed and _slider.value >= 0.99:
 		_slider.value = 0.0
 	playing_changed.emit(pressed)
 
@@ -242,8 +299,20 @@ func _on_showcase_pressed() -> void:
 	mode_requested.emit("showcase")
 
 
+func _on_m0b_pressed() -> void:
+	mode_requested.emit("m0b")
+
+
 func _on_stress_pressed() -> void:
 	mode_requested.emit("stress")
+
+
+func _on_undo_pressed() -> void:
+	undo_requested.emit()
+
+
+func _on_tool_pressed(tool: String) -> void:
+	tool_requested.emit(tool)
 
 
 func _format_int(value: int) -> String:
