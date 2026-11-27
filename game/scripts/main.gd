@@ -14,6 +14,7 @@ extends Node3D
 ## procedural generator audio and the interactive design-tool overlay.
 
 const MASONRY_SHADER := preload("res://shaders/masonry.gdshader")
+const MASONRY_CUTAWAY_SHADER := preload("res://shaders/masonry_cutaway.gdshader")
 const TERRAIN_SHADER := preload("res://shaders/terrain.gdshader")
 const WATER_SHADER := preload("res://shaders/water.gdshader")
 const ORBIT_CAMERA_SCRIPT := preload("res://scripts/orbit_camera.gd")
@@ -26,6 +27,7 @@ const INTERIOR_PROPS_SCRIPT := preload("res://scripts/interior_props.gd")
 const PHOTO_MODE_SCRIPT := preload("res://scripts/photo_mode.gd")
 const CODEX_PANEL_SCRIPT := preload("res://scripts/codex_panel.gd")
 const COMMISSION_PANEL_SCRIPT := preload("res://scripts/commission_panel.gd")
+const SETTINGS_PANEL_SCRIPT := preload("res://scripts/settings_panel.gd")
 
 ## Preferred loopback port for the live MCP/JSON-RPC control server.
 const CONTROL_PORT := 17731
@@ -48,6 +50,11 @@ const TIMELAPSE_YAW_RATE := 0.28
 ## Save slot shared by the HUD Save/Load buttons.
 const SAVE_PATH := "user://castle.keep.json"
 
+## M4b proposal-ghost palettes. The amber option is the colourblind-safe
+## high-contrast choice against green terrain and blue sky.
+const GHOST_COLOR_DEFAULT := Color(0.24, 0.84, 1.0, 0.36)
+const GHOST_COLOR_HIGH_CONTRAST := Color(1.0, 0.72, 0.18, 0.42)
+
 var _bridge: Object
 var _camera: Camera3D
 var _hud: CanvasLayer
@@ -67,6 +74,7 @@ var _interior_props: Node3D
 var _photo_mode: CanvasLayer
 var _codex_panel: CanvasLayer
 var _commission_panel: CanvasLayer
+var _settings_panel: CanvasLayer
 var _sky_material: PhysicalSkyMaterial
 var _environment: Environment
 var _cutaway_mode := 0
@@ -79,10 +87,14 @@ var _terrain_tool := ""
 var _default_fov := 75.0
 
 var _masonry_material: ShaderMaterial
+var _cutaway_material: ShaderMaterial
 var _terrain_material: ShaderMaterial
 var _water_material: ShaderMaterial
 var _water_instance: MeshInstance3D
 var _chunk_instances: Array[MeshInstance3D] = []
+## Chunk meshes only (no terrain); their material is swapped for the cutaway
+## render pass while a dollhouse cut is active (M4b).
+var _masonry_instances: Array[MeshInstance3D] = []
 
 var _build_front := 1.0
 var _playing := false
@@ -110,6 +122,7 @@ func _ready() -> void:
 	_setup_photo_mode()
 	_setup_codex()
 	_setup_commission_panel()
+	_setup_settings_panel()
 
 	if _bridge != null:
 		_start_control_server()
@@ -183,11 +196,26 @@ func _make_materials() -> void:
 	_masonry_material.shader = MASONRY_SHADER
 	_masonry_material.set_shader_parameter("build_front", 1.0)
 
+	# Dollhouse pass: identical shading, but with back-face culling disabled so
+	# sliced walls show their interior. Only assigned while a cut is active.
+	_cutaway_material = ShaderMaterial.new()
+	_cutaway_material.shader = MASONRY_CUTAWAY_SHADER
+	_cutaway_material.set_shader_parameter("build_front", 1.0)
+
 	_terrain_material = ShaderMaterial.new()
 	_terrain_material.shader = TERRAIN_SHADER
 
 	_water_material = ShaderMaterial.new()
 	_water_material.shader = WATER_SHADER
+
+
+## Mirror a shared masonry uniform onto both render passes so a material swap
+## never shows a stale construction front, palette, frost or light direction.
+func _set_masonry_parameter(parameter: StringName, value: Variant) -> void:
+	if _masonry_material != null:
+		_masonry_material.set_shader_parameter(parameter, value)
+	if _cutaway_material != null:
+		_cutaway_material.set_shader_parameter(parameter, value)
 
 
 ## Retint the shared terrain material and place the water plane for a site.
@@ -413,11 +441,11 @@ func _apply_sun_time(hour: float) -> void:
 
 	# A directional light shines along its local -Z, so +Z points from the scene
 	# toward the sun; the shader's stylised bounce uses the same direction.
-	if _masonry_material != null:
-		_masonry_material.set_shader_parameter(
+	if _sun != null:
+		_set_masonry_parameter(
 			"sun_bounce_dir", _sun.global_transform.basis.z.normalized()
 		)
-		_masonry_material.set_shader_parameter("bounce_color", sun_color)
+		_set_masonry_parameter("bounce_color", sun_color)
 
 
 func _setup_camera() -> void:
@@ -454,6 +482,7 @@ func _setup_hud() -> void:
 	_hud.connect("photo_requested", Callable(self, "_on_hud_photo_requested"))
 	_hud.connect("codex_requested", Callable(self, "_on_hud_codex_requested"))
 	_hud.connect("commissions_requested", Callable(self, "_on_hud_commissions_requested"))
+	_hud.connect("settings_requested", Callable(self, "_on_hud_settings_requested"))
 
 
 func _setup_feel() -> void:
@@ -565,6 +594,83 @@ func _setup_commission_panel() -> void:
 	_refresh_commission_entries()
 
 
+## M4b: accessibility, settings and the in-game credits modal.
+func _setup_settings_panel() -> void:
+	_settings_panel = SETTINGS_PANEL_SCRIPT.new()
+	_settings_panel.name = "SettingsPanel"
+	add_child(_settings_panel)
+	_settings_panel.connect("ui_scale_changed", Callable(self, "_apply_ui_scale"))
+	_settings_panel.connect(
+		"ghost_palette_changed", Callable(self, "_apply_ghost_palette")
+	)
+	_settings_panel.connect(
+		"reduced_motion_changed", Callable(self, "_apply_reduced_motion")
+	)
+	_settings_panel.connect("mute_changed", Callable(self, "_apply_mute_setting"))
+	var loaded := bool(_settings_panel.call("load_settings"))
+	if not loaded:
+		_apply_ui_scale(float(_settings_panel.call("get_ui_scale")))
+		_apply_ghost_palette(bool(_settings_panel.call("is_high_contrast")))
+		_apply_reduced_motion(bool(_settings_panel.call("is_reduced_motion")))
+		_apply_mute_setting(bool(_settings_panel.call("is_muted")))
+
+
+func _on_hud_settings_requested() -> void:
+	_toggle_settings()
+
+
+func _toggle_settings() -> void:
+	if _settings_panel == null:
+		return
+	if not _settings_panel.visible:
+		if _photo_mode != null and _photo_mode.visible:
+			_set_photo_mode(false)
+		if _codex_panel != null and _codex_panel.visible:
+			_close_codex()
+	_settings_panel.visible = not _settings_panel.visible
+
+
+func _close_settings() -> void:
+	if _settings_panel != null:
+		_settings_panel.visible = false
+
+
+## UI scale is applied through the window so every CanvasLayer and 3D viewport
+## scales together. Guarded for headless runs and scene-tree-less instances.
+func _apply_ui_scale(scale_value: float) -> void:
+	if not is_inside_tree():
+		return
+	var window := get_window()
+	if window == null:
+		return
+	window.content_scale_factor = clampf(scale_value, 0.85, 1.5)
+
+
+## Recolour the proposal ghosts. Amber is the colourblind-safe high-contrast
+## option against green terrain and blue sky.
+func _apply_ghost_palette(high_contrast: bool) -> void:
+	if _ghost_material == null:
+		return
+	var colour := GHOST_COLOR_HIGH_CONTRAST if high_contrast else GHOST_COLOR_DEFAULT
+	_ghost_material.albedo_color = colour
+	_ghost_material.emission = Color(colour.r, colour.g, colour.b)
+
+
+## Reduced motion kills the masonry drop-sway (build_drop_height = 0) and the
+## rising dust bursts while leaving the scaffolding legible.
+func _apply_reduced_motion(enabled: bool) -> void:
+	_set_masonry_parameter("build_drop_height", 0.0 if enabled else 1.2)
+	if _fx != null and _fx.has_method("set_reduced_motion"):
+		_fx.call("set_reduced_motion", enabled)
+
+
+func _apply_mute_setting(muted: bool) -> void:
+	if _audio != null:
+		_audio.call("set_muted", muted)
+	if _hud != null:
+		_hud.call("set_muted", muted)
+
+
 func _refresh_commission_entries() -> void:
 	if _commission_panel == null or _bridge == null:
 		return
@@ -597,8 +703,7 @@ func _apply_commission_season(state: Dictionary) -> void:
 	if commission is Dictionary:
 		frost = bool((commission as Dictionary).get("frost_active", false))
 	_winter_frost = frost
-	if _masonry_material != null:
-		_masonry_material.set_shader_parameter("winter_frost", 1.0 if frost else 0.0)
+	_set_masonry_parameter("winter_frost", 1.0 if frost else 0.0)
 
 
 func _on_hud_commissions_requested() -> void:
@@ -725,6 +830,7 @@ func _fulfill_render_view(request_id: int, state: Dictionary) -> void:
 	var photo_was_visible := false
 	var codex_was_visible := false
 	var commission_was_visible := false
+	var settings_was_visible := false
 	var prev_fov := _default_fov
 	var prev_cutaway_mode := _cutaway_mode
 	if _hud != null:
@@ -742,6 +848,9 @@ func _fulfill_render_view(request_id: int, state: Dictionary) -> void:
 	if _commission_panel != null:
 		commission_was_visible = _commission_panel.visible
 		_commission_panel.visible = false
+	if _settings_panel != null:
+		settings_was_visible = _settings_panel.visible
+		_settings_panel.visible = false
 	# Capture the raw architectural form: no dollhouse cut and the default lens
 	# (M7). Both are restored after the frame is read.
 	if _cutaway_mode != 0:
@@ -776,6 +885,8 @@ func _fulfill_render_view(request_id: int, state: Dictionary) -> void:
 		_codex_panel.visible = codex_was_visible
 	if _commission_panel != null:
 		_commission_panel.visible = commission_was_visible
+	if _settings_panel != null:
+		_settings_panel.visible = settings_was_visible
 
 	if image == null or image.is_empty():
 		_render_view_busy = false
@@ -1118,9 +1229,8 @@ func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 
 	var style_id := str(data.get("style_id", "edwardian_welsh"))
 	_hud.call("set_style_selection", style_id)
-	if _masonry_material != null:
-		var palette_index := 1 if str(data.get("material_palette", "limestone")) == "red_brick" else 0
-		_masonry_material.set_shader_parameter("material_palette", palette_index)
+	var palette_index := 1 if str(data.get("material_palette", "limestone")) == "red_brick" else 0
+	_set_masonry_parameter("material_palette", palette_index)
 
 	if reset_play:
 		_hud.call("clear_error")
@@ -1135,8 +1245,7 @@ func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 	_masonry_bounds = bounds
 	_update_ground_bounds(data)
 	# Anchor the damp/moss course to the foot of this site's masonry.
-	if _masonry_material != null:
-		_masonry_material.set_shader_parameter("wet_base_y", bounds.position.y)
+	_set_masonry_parameter("wet_base_y", bounds.position.y)
 	_apply_cutaway()
 	_update_cutaway_range()
 	if _fx != null:
@@ -1210,7 +1319,7 @@ func _spawn_chunks(chunks: Variant) -> void:
 			var instance := MeshInstance3D.new()
 			instance.name = "Chunk%d_LOD%d" % [chunk_index, lod]
 			instance.mesh = mesh as ArrayMesh
-			instance.material_override = _masonry_material
+			instance.material_override = _active_masonry_material()
 			# LOD1/LOD2 shells are single quads per element face whose UV spans
 			# the whole face, so the shader recomposes coursed masonry in world
 			# space for them. Tell it which pipeline this instance needs.
@@ -1231,6 +1340,7 @@ func _spawn_chunks(chunks: Variant) -> void:
 			instance.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
 			add_child(instance)
 			_chunk_instances.append(instance)
+			_masonry_instances.append(instance)
 
 
 ## Merge the LOD meshes' world-space bounds for one chunk. LOD0 anchors the
@@ -1259,6 +1369,7 @@ func _clear_world_meshes() -> void:
 		if is_instance_valid(instance):
 			instance.queue_free()
 	_chunk_instances.clear()
+	_masonry_instances.clear()
 
 
 ## World-space bounds of the generated masonry (all LOD0 chunk meshes).
@@ -1367,6 +1478,9 @@ func _on_hud_mute_toggled(muted: bool) -> void:
 		_audio.call("set_muted", muted)
 	if _hud != null:
 		_hud.call("set_muted", muted)
+	if _settings_panel != null:
+		_settings_panel.call("set_muted", muted)
+		_settings_panel.call("save_settings")
 
 
 func _start_timelapse() -> void:
@@ -1413,7 +1527,7 @@ func _apply_build_front(value: float) -> void:
 		# visible construction front before any interactive edit.
 		_bridge.call("set_build_front_norm", _build_front)
 	if _masonry_material != null:
-		_masonry_material.set_shader_parameter("build_front", _build_front)
+		_set_masonry_parameter("build_front", _build_front)
 	if _fx != null:
 		# A time-lapse is a cinematic replay even though Play is not engaged;
 		# scaffolding and dust must climb with the front either way.
@@ -1525,11 +1639,23 @@ func _set_cutaway_position(position: float) -> void:
 
 
 func _apply_cutaway() -> void:
-	if _masonry_material != null:
-		_masonry_material.set_shader_parameter("cutaway_mode", _cutaway_mode)
-		_masonry_material.set_shader_parameter("cutaway_pos", _cutaway_pos)
+	_set_masonry_parameter("cutaway_mode", _cutaway_mode)
+	_set_masonry_parameter("cutaway_pos", _cutaway_pos)
+	# The hot-path `cull_back` shader does the normal rendering; the cutaway
+	# pass (cull_disabled + clipping) is only assigned while a cut is live.
+	var material := _active_masonry_material()
+	for instance in _masonry_instances:
+		if is_instance_valid(instance):
+			instance.material_override = material
 	if _interior_props != null:
 		_interior_props.call("set_cutaway", _cutaway_mode, _cutaway_pos)
+
+
+## Material for chunk meshes under the current cutaway state (M4b).
+func _active_masonry_material() -> ShaderMaterial:
+	if _cutaway_mode > 0 and _cutaway_material != null:
+		return _cutaway_material
+	return _masonry_material
 
 
 func _on_hud_terrain_tool_requested(kind: String) -> void:
@@ -1604,6 +1730,8 @@ func _set_photo_mode(enabled: bool) -> void:
 	if enabled:
 		if _codex_panel != null:
 			_codex_panel.visible = false
+		if _settings_panel != null:
+			_settings_panel.visible = false
 		if _commission_panel != null:
 			_commission_was_visible = _commission_panel.visible
 			_commission_panel.visible = false
@@ -1648,8 +1776,11 @@ func _on_hud_codex_requested() -> void:
 func _toggle_codex() -> void:
 	if _codex_panel == null:
 		return
-	if not _codex_panel.visible and _photo_mode != null and _photo_mode.visible:
-		_set_photo_mode(false)
+	if not _codex_panel.visible:
+		if _photo_mode != null and _photo_mode.visible:
+			_set_photo_mode(false)
+		if _settings_panel != null and _settings_panel.visible:
+			_close_settings()
 	_codex_panel.visible = not _codex_panel.visible
 
 
@@ -2158,8 +2289,15 @@ func _unhandled_input(event: InputEvent) -> void:
 			if not _text_input_focused():
 				_on_hud_codex_requested()
 				get_viewport().set_input_as_handled()
+		KEY_F10:
+			if not _text_input_focused():
+				_toggle_settings()
+				get_viewport().set_input_as_handled()
 		KEY_ESCAPE:
-			if _photo_mode != null and _photo_mode.visible:
+			if _settings_panel != null and _settings_panel.visible:
+				_close_settings()
+				get_viewport().set_input_as_handled()
+			elif _photo_mode != null and _photo_mode.visible:
 				_set_photo_mode(false)
 				get_viewport().set_input_as_handled()
 			elif _codex_panel != null and _codex_panel.visible:

@@ -6,6 +6,10 @@ rust-version = "1.100"
 description = "Engine-agnostic deterministic castle document, terrain, masonry and meshing core for Keepwright"
 license = "MIT"
 
+[[bin]]
+name = "keep-bench"
+path = "src/bin/keep_bench.rs"
+
 [dependencies]
 libm = "0.2.16"
 serde = { version = "1", features = ["derive"] }

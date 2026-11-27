@@ -101,6 +101,13 @@ func _initialize() -> void:
 		quit(1)
 		return
 
+	_check_m4(failures)
+
+	if not failures.is_empty():
+		_for_each_failure(failures)
+		quit(1)
+		return
+
 	_check_feel_scripts(failures)
 
 	if not failures.is_empty():
@@ -1177,6 +1184,159 @@ func _proposal_entry(bridge: Object, proposal_id: String) -> Dictionary:
 		if entry is Dictionary and str((entry as Dictionary).get("id", "")) == proposal_id:
 			return entry as Dictionary
 	return {}
+
+
+func _check_m4(failures: Array[String]) -> void:
+	# --- Early-Z shader split -----------------------------------------
+	var masonry_source := _read_text("res://shaders/masonry.gdshader", failures)
+	if not masonry_source.is_empty():
+		if masonry_source.find("cull_back") == -1:
+			failures.append("masonry.gdshader does not use cull_back for the hot path.")
+		if masonry_source.find("cull_disabled") != -1:
+			failures.append("masonry.gdshader still declares cull_disabled.")
+		if masonry_source.find("discard") != -1:
+			failures.append("masonry.gdshader still discards fragments in the hot path.")
+
+	var cutaway_source := _read_text("res://shaders/masonry_cutaway.gdshader", failures)
+	if not cutaway_source.is_empty():
+		if cutaway_source.find("cull_disabled") == -1:
+			failures.append("masonry_cutaway.gdshader does not use cull_disabled.")
+		if cutaway_source.find("cutaway_mode") == -1:
+			failures.append("masonry_cutaway.gdshader has no cutaway_mode uniform.")
+		if cutaway_source.find("discard") == -1:
+			failures.append("masonry_cutaway.gdshader never clips the active plane.")
+		for token in ["winter_frost", "build_front", "material_palette"]:
+			if cutaway_source.find(token) == -1:
+				failures.append(
+					"masonry_cutaway.gdshader is missing shared token \"%s\"." % token
+				)
+
+	var hud_script: Variant = load("res://scripts/debug_hud.gd")
+	if hud_script is GDScript:
+		var hud: Variant = (hud_script as GDScript).new()
+		if hud != null:
+			if not hud.has_signal("settings_requested"):
+				failures.append("DebugHud has no settings_requested signal.")
+			root.add_child(hud as CanvasLayer)
+			(hud as Node).free()
+
+	# --- Accessibility settings panel ---------------------------------
+	var settings_script: Variant = load("res://scripts/settings_panel.gd")
+	if not (settings_script is GDScript):
+		failures.append("settings_panel.gd did not load as a GDScript.")
+	else:
+		var panel: Variant = (settings_script as GDScript).new()
+		if panel == null or not (panel is CanvasLayer):
+			failures.append("SettingsPanel is not a CanvasLayer.")
+		else:
+			root.add_child(panel as CanvasLayer)
+			for signal_name in [
+				"ui_scale_changed",
+				"ghost_palette_changed",
+				"reduced_motion_changed",
+				"mute_changed",
+			]:
+				if not panel.has_signal(signal_name):
+					failures.append("SettingsPanel has no %s signal." % signal_name)
+			for method in [
+				"set_ui_scale",
+				"get_ui_scale",
+				"set_high_contrast",
+				"is_high_contrast",
+				"set_reduced_motion",
+				"is_reduced_motion",
+				"set_muted",
+				"is_muted",
+				"save_settings",
+				"load_settings",
+				"get_credits_text",
+				"open",
+				"close",
+				"is_open",
+			]:
+				if not panel.has_method(method):
+					failures.append("SettingsPanel has no %s()." % method)
+
+			panel.call("set_ui_scale", 1.3)
+			if not is_equal_approx(float(panel.call("get_ui_scale")), 1.3):
+				failures.append("SettingsPanel.set_ui_scale(1.3) did not stick.")
+			panel.call("set_high_contrast", true)
+			if not bool(panel.call("is_high_contrast")):
+				failures.append("SettingsPanel.set_high_contrast(true) did not stick.")
+			panel.call("set_reduced_motion", true)
+			if not bool(panel.call("is_reduced_motion")):
+				failures.append("SettingsPanel.set_reduced_motion(true) did not stick.")
+			panel.call("set_muted", true)
+			if not bool(panel.call("is_muted")):
+				failures.append("SettingsPanel.set_muted(true) did not stick.")
+
+			var credits := str(panel.call("get_credits_text"))
+			for token in ["AI", "CC0", "PROCEDURAL", "shader"]:
+				if credits.find(token) == -1:
+					failures.append(
+						"SettingsPanel credits text is missing \"%s\"." % token
+					)
+
+			var test_settings_path := "user://settings_test.json"
+			if not bool(panel.call("save_settings", test_settings_path)):
+				failures.append("SettingsPanel.save_settings() failed.")
+			# Wipe the in-memory state, then prove the file round-trips.
+			panel.call("set_ui_scale", 1.0)
+			panel.call("set_high_contrast", false)
+			panel.call("set_reduced_motion", false)
+			panel.call("set_muted", false)
+			if not bool(panel.call("load_settings", test_settings_path)):
+				failures.append("SettingsPanel.load_settings() failed.")
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(test_settings_path))
+			if not is_equal_approx(float(panel.call("get_ui_scale")), 1.3):
+				failures.append("SettingsPanel did not restore ui_scale from disk.")
+			if not bool(panel.call("is_high_contrast")):
+				failures.append("SettingsPanel did not restore high_contrast from disk.")
+			if not bool(panel.call("is_reduced_motion")):
+				failures.append("SettingsPanel did not restore reduced_motion from disk.")
+			if not bool(panel.call("is_muted")):
+				failures.append("SettingsPanel did not restore mute state from disk.")
+
+			panel.call("open")
+			if not bool(panel.call("is_open")):
+				failures.append("SettingsPanel.open() did not open the modal.")
+			panel.call("close")
+			if bool(panel.call("is_open")):
+				failures.append("SettingsPanel.close() did not close the modal.")
+			(panel as Node).free()
+
+	# --- main.gd wiring ------------------------------------------------
+	var main_script: Variant = load("res://scripts/main.gd")
+	if main_script is GDScript:
+		var host: Variant = (main_script as GDScript).new()
+		if host == null or not (host is Node3D):
+			failures.append("main.gd did not instantiate as a Node3D for M4b checks.")
+		else:
+			for method in [
+				"_setup_settings_panel",
+				"_toggle_settings",
+				"_close_settings",
+				"_apply_ui_scale",
+				"_apply_ghost_palette",
+				"_apply_reduced_motion",
+				"_active_masonry_material",
+			]:
+				if not host.has_method(method):
+					failures.append("main.gd has no %s()." % method)
+			(host as Node).free()
+
+	if failures.is_empty():
+		print("M4b accessibility OK: early-Z cutaway split, settings modal, persistence")
+
+
+func _read_text(path: String, failures: Array[String]) -> String:
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null:
+		failures.append("%s could not be opened for inspection." % path)
+		return ""
+	var text := file.get_as_text()
+	file.close()
+	return text
 
 
 func _check_feel_scripts(failures: Array[String]) -> void:

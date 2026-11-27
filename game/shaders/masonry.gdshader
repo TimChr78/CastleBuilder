@@ -11,18 +11,18 @@
 // The construction front is a single uniform; no per-frame vertex uploads.
 
 shader_type spatial;
-// Culling is disabled so the dollhouse cutaway can shade the inside of sliced
-// walls. With `cutaway_mode == 0` the fragment stage discards every back face,
-// so the rendered image matches `cull_back` exactly.
-render_mode blend_mix, depth_draw_opaque, cull_disabled, diffuse_burley, specular_schlick_ggx;
+// Normal rendering always uses full hardware back-face culling so the early-Z
+// pass can reject interior fragments on the 200k stress scene. The dollhouse
+// cutaway lives in masonry_cutaway.gdshader and main.gd swaps the chunk
+// material only while a cut is active (M4b).
+render_mode blend_mix, depth_draw_opaque, cull_back, diffuse_burley, specular_schlick_ggx;
 
-// --- Dollhouse cutaway (M3.1) -----------------------------------------
-// 0 = off, 1 = horizontal Y clip, 2 = vertical X clip, 3 = vertical Z clip.
-// Every face on the positive side of the plane is discarded, and the exposed
-// masonry cross-section is tinted as warm rubble-core stone.
+// --- Dollhouse cutaway parameter compatibility -------------------------
+// Declared so main.gd can mirror one shared parameter set onto both masonry
+// materials. This hot-path shader never clips or bins fragments in the
+// fragment stage; the cutaway shader owns all cut behaviour.
 uniform int cutaway_mode = 0;
 uniform float cutaway_pos = 100.0;
-// Width of the warm cross-section band around the cut plane (metres).
 uniform float cutaway_band = 0.16;
 uniform vec4 cutaway_core_color : source_color = vec4(0.42, 0.37, 0.31, 1.0);
 
@@ -190,23 +190,6 @@ void vertex() {
 }
 
 void fragment() {
-	// --- Dollhouse cutaway clip ---------------------------------------
-	// Discard everything on the positive side of the active plane, then keep
-	// the exact `cull_back` look while the dollhouse is closed by dropping back
-	// faces ourselves.
-	if (cutaway_mode == 1 && v_world_pos.y > cutaway_pos) {
-		discard;
-	}
-	if (cutaway_mode == 2 && v_world_pos.x > cutaway_pos) {
-		discard;
-	}
-	if (cutaway_mode == 3 && v_world_pos.z > cutaway_pos) {
-		discard;
-	}
-	if (cutaway_mode == 0 && !FRONT_FACING) {
-		discard;
-	}
-
 	// Narrow warm band of freshly laid mortar just behind the active lift.
 	// Disabled as soon as the build finishes so the completed wall reads calm.
 	float block_index = v_custom.r;
@@ -500,29 +483,5 @@ void fragment() {
 				EMISSION = mix(EMISSION, rime * 0.04, upward * winter_frost * 0.3);
 			}
 		}
-	}
-
-	// --- Warm masonry cross-section on the cut ------------------------
-	// Sliced blocks and every exposed back face read as a thick rubble-and-
-	// mortar core instead of a paper-thin shell, so the dollhouse looks carved
-	// rather than deleted.
-	if (cutaway_mode > 0) {
-		float cut_distance = 1e6;
-		if (cutaway_mode == 1) {
-			cut_distance = abs(v_world_pos.y - cutaway_pos);
-		} else if (cutaway_mode == 2) {
-			cut_distance = abs(v_world_pos.x - cutaway_pos);
-		} else {
-			cut_distance = abs(v_world_pos.z - cutaway_pos);
-		}
-		float slice = 1.0 - smoothstep(0.0, max(cutaway_band, 1e-3), cut_distance);
-		float interior = FRONT_FACING ? 0.0 : 1.0;
-		float core = max(slice, interior);
-		float core_grain = fbm3(v_world_pos * 7.0 + vec3(3.7, 1.3, 9.1));
-		vec3 rubble = cutaway_core_color.rgb * (0.78 + 0.44 * core_grain);
-		ALBEDO = mix(ALBEDO, rubble, core * 0.88);
-		ROUGHNESS = mix(ROUGHNESS, 0.96, core);
-		SPECULAR = mix(SPECULAR, 0.10, core);
-		EMISSION = mix(EMISSION, rubble * 0.10, core);
 	}
 }

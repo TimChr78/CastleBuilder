@@ -40,6 +40,7 @@ var _elements: Array = []
 var _has_elements := false
 var _front := 1.0
 var _playing := false
+var _reduced_motion := false
 var _last_lift_count := -1
 
 var _mmi: MultiMeshInstance3D
@@ -111,6 +112,14 @@ func is_scaffold_visible() -> bool:
 
 func is_dust_emitting() -> bool:
 	return _dust != null and _dust.emitting
+
+
+## M4b accessibility: reduced motion suppresses the rising dust bursts while
+## keeping the scaffold readable. Scaffolding itself is static, so only the
+## particle burst needs disabling.
+func set_reduced_motion(enabled: bool) -> void:
+	_reduced_motion = enabled
+	_update_dust()
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +496,7 @@ func _update_dust() -> void:
 	var active := (
 		(_has_bounds or _has_elements)
 		and _playing
+		and not _reduced_motion
 		and _front > 0.01
 		and _front < STRIKE_THRESHOLD
 	)

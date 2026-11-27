@@ -12,6 +12,16 @@
       "ai_generated": false
     },
     {
+      "path": "game/shaders/masonry_cutaway.gdshader",
+      "kind": "procedural_shader",
+      "source": "Self-made dollhouse cutaway variant of the masonry shader with disabled back-face culling, clipped walls and warm rubble-core cross-sections.",
+      "author": "TimChr78",
+      "licence": "self-made",
+      "url": "https://github.com/TimChr78/CastleBuilder",
+      "shipped": true,
+      "ai_generated": false
+    },
+    {
       "path": "game/shaders/terrain.gdshader",
       "kind": "procedural_shader",
       "source": "Self-made procedural terrain shader with height/slope blending, biome tinting and cliff detail.",

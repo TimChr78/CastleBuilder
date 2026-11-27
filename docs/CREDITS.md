@@ -11,6 +11,7 @@ Keepwright ships only procedural, self-made, MIT, CC0-1.0, or CC-BY-4.0 assets. 
 | Asset | Path | Author | Licence | Source |
 | --- | --- | --- | --- | --- |
 | masonry.gdshader | `game/shaders/masonry.gdshader` | TimChr78 | self-made | [github.com/TimChr78/CastleBuilder](https://github.com/TimChr78/CastleBuilder) |
+| masonry_cutaway.gdshader | `game/shaders/masonry_cutaway.gdshader` | TimChr78 | self-made | [github.com/TimChr78/CastleBuilder](https://github.com/TimChr78/CastleBuilder) |
 | terrain.gdshader | `game/shaders/terrain.gdshader` | TimChr78 | self-made | [github.com/TimChr78/CastleBuilder](https://github.com/TimChr78/CastleBuilder) |
 | water.gdshader | `game/shaders/water.gdshader` | TimChr78 | self-made | [github.com/TimChr78/CastleBuilder](https://github.com/TimChr78/CastleBuilder) |
 
@@ -34,6 +35,6 @@ Keepwright ships only procedural, self-made, MIT, CC0-1.0, or CC-BY-4.0 assets. 
 
 | Licence | Shipped entries |
 | --- | ---: |
-| self-made | 9 |
+| self-made | 10 |
 
 Manifest schema version 1.
