@@ -285,6 +285,11 @@ fn score_defensive(
     findings: &mut Vec<HistorianFinding>,
 ) -> u32 {
     let source = source_for(style, HistorianCategory::Defensive);
+    // Sample the ground the player actually built on, with ditches and sculpts
+    // applied, so the relief bonus reflects the visible surface (M3.1 M9).
+    let ditches: Vec<&crate::document::Ditch> = document.ditches().collect();
+    let sculpts: Vec<&crate::document::TerrainSculpt> = document.terrain_sculpts().collect();
+    let effective_terrain = terrain.with_earthworks(&ditches, &sculpts);
     let mut flankers: Vec<[i64; 2]> = Vec::new();
     for element in document.elements() {
         match element {
@@ -399,7 +404,7 @@ fn score_defensive(
             (20_000, 20_000),
             (-20_000, 20_000),
         ] {
-            let h = terrain.height_mm(centre[0] + dx, centre[1] + dz);
+            let h = effective_terrain.height_mm(centre[0] + dx, centre[1] + dz);
             min_h = min_h.min(h);
             max_h = max_h.max(h);
         }
@@ -424,7 +429,7 @@ fn element_centroid(document: &CastleDocument) -> Option<[i64; 2]> {
             Element::Gatehouse(gatehouse) => gatehouse.centre_mm,
             Element::Keep(keep) => keep.centre_mm,
             Element::Range(range) => range.centre_mm,
-            Element::Ditch(_) => continue,
+            Element::Ditch(_) | Element::TerrainSculpt(_) => continue,
         };
         sum[0] += point[0] as i128;
         sum[1] += point[1] as i128;

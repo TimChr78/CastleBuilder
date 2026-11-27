@@ -127,7 +127,7 @@ pub fn generate_blocks(document: &CastleDocument, terrain: &SiteTerrain) -> Vec<
             Element::Gatehouse(gatehouse) => layout_gatehouse(gatehouse, terrain, &mut blocks),
             Element::Keep(keep) => layout_keep(keep, terrain, &mut blocks),
             Element::Range(range) => layout_range(range, document, terrain, &mut blocks),
-            Element::Ditch(_) => {}
+            Element::Ditch(_) | Element::TerrainSculpt(_) => {}
         }
     }
 
@@ -2398,7 +2398,7 @@ fn range_roof_blocked(
                     return true;
                 }
             }
-            Element::Range(_) | Element::Ditch(_) => {}
+            Element::Range(_) | Element::Ditch(_) | Element::TerrainSculpt(_) => {}
         }
     }
     false
@@ -3195,7 +3195,8 @@ mod tests {
                 Element::Gatehouse(_)
                 | Element::Ditch(_)
                 | Element::Keep(_)
-                | Element::Range(_) => {}
+                | Element::Range(_)
+                | Element::TerrainSculpt(_) => {}
             }
         }
 

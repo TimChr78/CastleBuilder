@@ -256,6 +256,10 @@ pub fn snap_point(
                 consider(wall.start_mm, SnapKind::WallEndpoint, wall.id);
                 consider(wall.end_mm, SnapKind::WallEndpoint, wall.id);
             }
+            // A terrain sculpt is ground, not masonry. Snapping its centre as a
+            // `TowerCentre` would yank walls to the middle of a hill, so it is
+            // deliberately not a snap target (M3.1 H1).
+            Element::TerrainSculpt(_) => {}
         }
     }
 

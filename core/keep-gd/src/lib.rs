@@ -28,11 +28,12 @@ use keep_core::command::{
     MAX_WALL_THICKNESS_MM, MIN_TOWER_HEIGHT_MM, MIN_TOWER_RADIUS_MM, MIN_WALL_HEIGHT_MM,
     MIN_WALL_THICKNESS_MM,
 };
-use keep_core::document::{CastleDocument, Element, RangeKind, TowerPlan};
+use keep_core::document::{CastleDocument, Element, RangeKind, TerrainBrushKind, TowerPlan};
 use keep_core::historian::{assess_historian, HistorianCategory, HistorianReport};
+use keep_core::interior::{build_interior_props, SectionPlane};
 use keep_core::mesh::{ChunkMeshData, SceneData};
 use keep_core::picking::SnapKind;
-use keep_core::plan_render::{render_plan_svg, PlanView};
+use keep_core::plan_render::{render_plan_svg_with_section, PlanView};
 use keep_core::proposal::{
     ActivityEntry, AgentParticipant, AgentPermission, AgentRequest, AgentState, Proposal,
     ProposalStatus, RequestStatus, MAX_ACTIVITY_ENTRIES,
@@ -187,6 +188,33 @@ impl KeepBridge {
         sites
     }
 
+    /// Describe every historical codex entry (M3.1).
+    #[func]
+    fn list_codex_entries(&self) -> Array<VarDictionary> {
+        let mut entries: Array<VarDictionary> = Array::new();
+        for entry in keep_core::codex::list_codex_entries() {
+            let mut item = VarDictionary::new();
+            item.set("id", &GString::from(&entry.id));
+            item.set("title", &GString::from(&entry.title));
+            item.set("category", &GString::from(&entry.category));
+            item.set("period", &GString::from(&entry.period));
+            item.set("summary", &GString::from(&entry.summary));
+            item.set("body", &GString::from(&entry.body));
+            let mut citations: Array<GString> = Array::new();
+            for citation in &entry.citations {
+                citations.push(&GString::from(citation));
+            }
+            item.set("citations", &citations);
+            let mut related: Array<GString> = Array::new();
+            for style_id in &entry.related_style_ids {
+                related.push(&GString::from(style_id));
+            }
+            item.set("related_style_ids", &related);
+            entries.push(&item);
+        }
+        entries
+    }
+
     /// Build the fixed M0a look scene (one battered wall, one round tower).
     #[func]
     fn build_m0a_showcase(&mut self) -> VarDictionary {
@@ -224,7 +252,7 @@ impl KeepBridge {
     #[func]
     fn pick_terrain(&self, ray_origin: Vector3, ray_dir: Vector3) -> VarDictionary {
         let hit = keep_core::picking::pick_terrain(
-            self.session.terrain(),
+            &self.session.effective_terrain(),
             [ray_origin.x, ray_origin.y, ray_origin.z],
             [ray_dir.x, ray_dir.y, ray_dir.z],
         );
@@ -487,6 +515,46 @@ impl KeepBridge {
             end_mm: quantise_xz(end_xz),
             width_mm: quantise_m(width_m),
             depth_mm: quantise_m(depth_m),
+        };
+        match self
+            .session
+            .apply_batch(self.player_author.clone(), vec![op])
+        {
+            Ok(_) => {
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Sculpt the site terrain with an authoritative brush (M3.1).
+    ///
+    /// `centre_xz`, `radius_m` and `delta_m` are metres; everything is
+    /// quantised to integer millimetres so the edit hashes and undoes exactly
+    /// like any other command. `flatten` treats `delta_m` as the target
+    /// elevation and `smooth` as a strength in metres (0.65 ≈ 65%).
+    #[func]
+    fn sculpt_terrain(
+        &mut self,
+        kind: GString,
+        centre_xz: Vector2,
+        radius_m: f32,
+        delta_m: f32,
+    ) -> VarDictionary {
+        let brush = terrain_brush_from_key(&kind.to_string());
+        let op = CommandOp::SculptTerrain {
+            ref_id: None,
+            name: format!(
+                "{} {}",
+                terrain_brush_name(brush),
+                self.session.next_element_id()
+            ),
+            kind: brush,
+            centre_mm: quantise_xz(centre_xz),
+            radius_mm: quantise_m(radius_m),
+            delta_mm: quantise_m(delta_m),
         };
         match self
             .session
@@ -1213,8 +1281,20 @@ impl KeepBridge {
                         ))
                     }
                 };
-                let svg =
-                    render_plan_svg(self.session.document(), self.session.terrain(), plan_view);
+                let section = match params.get("section") {
+                    None | Some(Value::Null) => SectionPlane::Off,
+                    Some(value) => {
+                        serde_json::from_value::<SectionPlane>(value.clone()).map_err(|error| {
+                            RpcError::new(-32_602, format!("invalid section: {error}"))
+                        })?
+                    }
+                };
+                let svg = render_plan_svg_with_section(
+                    self.session.document(),
+                    self.session.terrain(),
+                    plan_view,
+                    section,
+                );
                 self.session.record_activity(
                     format!("agent:{CONTROL_AGENT_ID}"),
                     method,
@@ -1222,6 +1302,7 @@ impl KeepBridge {
                 );
                 json!({
                     "view": view,
+                    "section": section,
                     "document_hash": format!(
                         "{:016x}",
                         self.session.document().document_hash()
@@ -1726,6 +1807,7 @@ fn scene_to_dictionary(
     let historian = assess_historian(document, terrain, style);
     result.set("chunks", &chunks);
     result.set("elements", &elements_array(document, terrain));
+    result.set("interior_props", &interior_props_array(document, terrain));
     result.set("site_id", &GString::from(site_id));
     result.set("style_id", &GString::from(&style.id));
     result.set("material_palette", &GString::from(&style.material_palette));
@@ -1742,6 +1824,29 @@ fn scene_to_dictionary(
     let document_hash = GString::from(&format!("{document_hash:016x}"));
     result.set("document_hash", &document_hash);
     result
+}
+
+/// Deterministic dollhouse furniture for every keep and roofed range (M3.1).
+/// Positions are world-space metres; the UI builder owns all mesh generation.
+fn interior_props_array(document: &CastleDocument, terrain: &SiteTerrain) -> Array<VarDictionary> {
+    let mut props: Array<VarDictionary> = Array::new();
+    for prop in build_interior_props(document, terrain) {
+        let mut entry = VarDictionary::new();
+        entry.set("kind", &GString::from(prop.kind.kind_name()));
+        entry.set("room_type", &GString::from(&prop.room_type));
+        entry.set(
+            "position",
+            Vector3::new(
+                mm_to_m(prop.pos_mm[0]),
+                mm_to_m(prop.pos_mm[1]),
+                mm_to_m(prop.pos_mm[2]),
+            ),
+        );
+        entry.set("yaw_deg", i64::from(prop.yaw_deg));
+        entry.set("element_id", prop.element_id as i64);
+        props.push(&entry);
+    }
+    props
 }
 
 /// Per-element plan footprints in metres for the construction FX layer. Each
@@ -1830,7 +1935,7 @@ fn elements_array(document: &CastleDocument, terrain: &SiteTerrain) -> Array<Var
                     range.wall_height_mm as f32 / 1000.0,
                 );
             }
-            Element::Ditch(_) => {}
+            Element::Ditch(_) | Element::TerrainSculpt(_) => {}
         }
     }
     elements
@@ -1988,6 +2093,25 @@ fn tower_plan_from_key(key: &str) -> TowerPlan {
         "square" => TowerPlan::Square,
         "d_shaped" | "d-shaped" | "dshaped" => TowerPlan::DShaped,
         _ => TowerPlan::Round,
+    }
+}
+
+/// Map the UI's brush key to the authoritative terrain brush kind.
+fn terrain_brush_from_key(key: &str) -> TerrainBrushKind {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "lower" | "dig" => TerrainBrushKind::Lower,
+        "flatten" | "level" => TerrainBrushKind::Flatten,
+        "smooth" | "blend" => TerrainBrushKind::Smooth,
+        _ => TerrainBrushKind::Raise,
+    }
+}
+
+fn terrain_brush_name(kind: TerrainBrushKind) -> &'static str {
+    match kind {
+        TerrainBrushKind::Raise => "Raise",
+        TerrainBrushKind::Lower => "Lower",
+        TerrainBrushKind::Flatten => "Flatten",
+        TerrainBrushKind::Smooth => "Smooth",
     }
 }
 

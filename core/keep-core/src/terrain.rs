@@ -6,7 +6,7 @@
 //! every consumer (masonry, mesh AO, picking later) sees exactly the same
 //! ground, and so sampling is cheap enough to bake vertex AO at 200k blocks.
 
-use crate::document::{Ditch, CASTLE_SEED};
+use crate::document::{Ditch, TerrainBrushKind, TerrainSculpt, CASTLE_SEED};
 use libm::{cos, floor, round, sin, sqrt};
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,11 @@ pub const DEFAULT_CELL_MM: i64 = 1_000;
 pub const DEFAULT_RESOLUTION: usize = 241;
 /// Default south-west origin of the height grid.
 pub const DEFAULT_ORIGIN_MM: i64 = -120_000;
+
+/// Lowest terrain height a sculpt may produce, in millimetres.
+pub const MIN_HEIGHT_MM: i64 = -25_000;
+/// Highest terrain height a sculpt may produce, in millimetres.
+pub const MAX_HEIGHT_MM: i64 = 45_000;
 
 /// Curated site metadata is authored as data under `sites/` and compiled in.
 const M0A_PROMONTORY_SITE_JSON: &str = include_str!("../../../sites/m0a_promontory.json");
@@ -222,27 +227,49 @@ impl SiteTerrain {
     /// original terrain is never mutated, which makes ditches trivially
     /// reversible when the document undoes the earthwork.
     pub fn with_ditches(&self, ditches: &[&Ditch]) -> SiteTerrain {
-        if ditches.is_empty() {
+        self.with_earthworks(ditches, &[])
+    }
+
+    /// Return a copy of this terrain with authoritative sculpts and ditches
+    /// applied.
+    ///
+    /// Sculpts are applied first in stable [`TerrainSculpt::id`] order, then the
+    /// ditches are carved into the result. Keeping the two passes separate means
+    /// a ditch always reads as a fresh cut through whatever ground the player
+    /// sculpted. The original terrain is never mutated, so undo is trivially
+    /// reversible.
+    pub fn with_earthworks(&self, ditches: &[&Ditch], sculpts: &[&TerrainSculpt]) -> SiteTerrain {
+        if ditches.is_empty() && sculpts.is_empty() {
             return self.clone();
         }
-        let mut carved = self.clone();
-        for iz in 0..self.res {
-            let z_mm = self.origin_mm + iz as i64 * self.cell_mm;
-            for ix in 0..self.res {
-                let x_mm = self.origin_mm + ix as i64 * self.cell_mm;
-                let mut cut = 0i64;
-                for ditch in ditches {
-                    cut = cut.max(ditch_cut_mm(ditch, x_mm, z_mm));
-                }
-                if cut > 0 {
-                    let index = iz * self.res + ix;
-                    carved.heights_mm[index] -= cut;
-                    // A ditch exposes soil and scree, not the bedrock face.
-                    carved.bedrock[index] = 0;
+        let mut modified = self.clone();
+        if !sculpts.is_empty() {
+            let mut ordered: Vec<&TerrainSculpt> = sculpts.to_vec();
+            ordered.sort_by_key(|sculpt| sculpt.id);
+            for sculpt in ordered {
+                apply_terrain_sculpt(&mut modified, sculpt);
+            }
+        }
+        if !ditches.is_empty() {
+            for iz in 0..self.res {
+                let z_mm = self.origin_mm + iz as i64 * self.cell_mm;
+                for ix in 0..self.res {
+                    let x_mm = self.origin_mm + ix as i64 * self.cell_mm;
+                    let mut cut = 0i64;
+                    for ditch in ditches {
+                        cut = cut.max(ditch_cut_mm(ditch, x_mm, z_mm));
+                    }
+                    if cut > 0 {
+                        let index = iz * self.res + ix;
+                        modified.heights_mm[index] =
+                            (modified.heights_mm[index] - cut).clamp(MIN_HEIGHT_MM, MAX_HEIGHT_MM);
+                        // A ditch exposes soil and scree, not the bedrock face.
+                        modified.bedrock[index] = 0;
+                    }
                 }
             }
         }
-        carved
+        modified
     }
 
     /// Build a regular-grid heightfield mesh. One shared vertex per grid point
@@ -419,6 +446,74 @@ fn ditch_cut_mm(ditch: &Ditch, x_mm: i64, z_mm: i64) -> i64 {
     round(cut.max(0.0)) as i64
 }
 
+/// Apply one terrain sculpt to a cached height grid in place.
+///
+/// The falloff is the smooth raised-cosine `0.5 * (1 + cos(pi * d / r))`, so
+/// the brush meets the surrounding ground with no hard seam. All trigonometry
+/// goes through `libm` so the result is identical on every platform.
+fn apply_terrain_sculpt(terrain: &mut SiteTerrain, sculpt: &TerrainSculpt) {
+    let radius = sculpt.radius_mm.max(1) as f64;
+    let cx = sculpt.centre_mm[0] as f64;
+    let cz = sculpt.centre_mm[1] as f64;
+    let res = terrain.res;
+    let snapshot = if sculpt.kind == TerrainBrushKind::Smooth {
+        Some(terrain.heights_mm.clone())
+    } else {
+        None
+    };
+
+    for iz in 0..res {
+        let z_mm = terrain.origin_mm + iz as i64 * terrain.cell_mm;
+        for ix in 0..res {
+            let x_mm = terrain.origin_mm + ix as i64 * terrain.cell_mm;
+            let dx = x_mm as f64 - cx;
+            let dz = z_mm as f64 - cz;
+            let distance = libm::sqrt(dx * dx + dz * dz);
+            if distance >= radius {
+                continue;
+            }
+            let falloff = 0.5 * (1.0 + libm::cos(std::f64::consts::PI * distance / radius));
+            let index = iz * res + ix;
+            let current = terrain.heights_mm[index];
+            let sculpted = match sculpt.kind {
+                TerrainBrushKind::Raise => {
+                    current + libm::round(sculpt.delta_mm as f64 * falloff) as i64
+                }
+                TerrainBrushKind::Lower => {
+                    current - libm::round(sculpt.delta_mm as f64 * falloff) as i64
+                }
+                TerrainBrushKind::Flatten => {
+                    let target = sculpt.delta_mm as f64;
+                    current + libm::round((target - current as f64) * falloff) as i64
+                }
+                TerrainBrushKind::Smooth => {
+                    let heights = snapshot.as_ref().expect("smooth snapshot");
+                    let mean = neighbourhood_mean(heights, res, ix, iz);
+                    let strength = sculpt.delta_mm as f64 / 1000.0;
+                    current + libm::round((mean - current as f64) * strength * falloff) as i64
+                }
+            };
+            terrain.heights_mm[index] = sculpted.clamp(MIN_HEIGHT_MM, MAX_HEIGHT_MM);
+        }
+    }
+}
+
+/// Mean of the 3×3 neighbourhood around `(ix, iz)`, ignoring the snapshot out
+/// of bounds by clamping to the grid edge.
+fn neighbourhood_mean(heights: &[i64], res: usize, ix: usize, iz: usize) -> f64 {
+    let mut sum = 0i64;
+    let mut count = 0i64;
+    for dz in -1i64..=1 {
+        for dx in -1i64..=1 {
+            let sample_x = (ix as i64 + dx).clamp(0, res as i64 - 1) as usize;
+            let sample_z = (iz as i64 + dz).clamp(0, res as i64 - 1) as usize;
+            sum += heights[sample_z * res + sample_x];
+            count += 1;
+        }
+    }
+    sum as f64 / count as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +618,91 @@ mod tests {
         );
         assert!(!carved.bedrock_mask(0, 5_000));
         assert_eq!(carved.with_ditches(&[]).heights_mm, carved.heights_mm);
+    }
+
+    #[test]
+    fn raise_and_lower_sculpts_apply_in_id_order_and_are_deterministic() {
+        let terrain = SiteTerrain::with_grid(7, -30_000, 1_000, 61);
+        let before = terrain.height_mm(0, 0);
+        let raise = TerrainSculpt::new(1, "Raise", TerrainBrushKind::Raise, [0, 0], 12_000, 3_000);
+        let lower = TerrainSculpt::new(2, "Lower", TerrainBrushKind::Lower, [0, 0], 12_000, 2_000);
+
+        let a = terrain.with_earthworks(&[], &[&raise, &lower]);
+        let b = terrain.with_earthworks(&[], &[&lower, &raise]);
+        assert_eq!(
+            a.heights_mm, b.heights_mm,
+            "id order must not depend on slice order"
+        );
+        assert_eq!(a.height_mm(0, 0), before + 1_000);
+        assert_eq!(
+            a.height_mm(30_000, 30_000),
+            terrain.height_mm(30_000, 30_000)
+        );
+        assert_eq!(terrain.height_mm(0, 0), before, "original is untouched");
+    }
+
+    #[test]
+    fn flatten_sculpt_reaches_its_target_at_the_centre_and_falls_off_smoothly() {
+        let terrain = SiteTerrain::with_grid(7, -30_000, 1_000, 61);
+        let flatten = TerrainSculpt::new(
+            1,
+            "Flatten",
+            TerrainBrushKind::Flatten,
+            [0, 0],
+            10_000,
+            12_000,
+        );
+        let flattened = terrain.with_earthworks(&[], &[&flatten]);
+        assert_eq!(flattened.height_mm(0, 0), 12_000);
+        // At the brush rim the ground is unchanged.
+        assert_eq!(flattened.height_mm(10_000, 0), terrain.height_mm(10_000, 0));
+        // Part way out it is blended between the original and the target.
+        let original = terrain.height_mm(5_000, 0);
+        let blended = flattened.height_mm(5_000, 0);
+        assert!(blended > original.min(12_000) && blended < original.max(12_000));
+    }
+
+    #[test]
+    fn smooth_sculpt_softens_the_centre_toward_the_neighbourhood_mean() {
+        let mut terrain = SiteTerrain::with_grid(7, -5_000, 1_000, 11);
+        let centre = 5 * 11 + 5;
+        let spike = terrain.heights_mm[centre] + 6_000;
+        terrain.heights_mm[centre] = spike;
+        let smooth =
+            TerrainSculpt::new(1, "Smooth", TerrainBrushKind::Smooth, [0, 0], 3_000, 1_000);
+        let smoothed = terrain.with_earthworks(&[], &[&smooth]);
+        assert!(smoothed.height_mm(0, 0) < spike);
+        assert_eq!(
+            smoothed.heights_mm,
+            terrain.with_earthworks(&[], &[&smooth]).heights_mm
+        );
+    }
+
+    #[test]
+    fn sculpted_heights_are_clamped_to_the_supported_range() {
+        let terrain = SiteTerrain::with_grid(7, -5_000, 1_000, 11);
+        let sculpts: Vec<TerrainSculpt> = (0..20)
+            .map(|id| TerrainSculpt::new(id, "Dig", TerrainBrushKind::Lower, [0, 0], 5_000, 10_000))
+            .collect();
+        let refs: Vec<&TerrainSculpt> = sculpts.iter().collect();
+        let lowered = terrain.with_earthworks(&[], &refs);
+        assert!(lowered
+            .heights_mm
+            .iter()
+            .all(|&height| (MIN_HEIGHT_MM..=MAX_HEIGHT_MM).contains(&height)));
+        assert_eq!(lowered.height_mm(0, 0), MIN_HEIGHT_MM);
+    }
+
+    #[test]
+    fn sculpts_are_applied_before_ditches() {
+        let terrain = SiteTerrain::with_grid(7, -10_000, 1_000, 21);
+        let raise = TerrainSculpt::new(1, "Raise", TerrainBrushKind::Raise, [0, 0], 6_000, 2_000);
+        let ditch = Ditch::new(2, "Ditch", [0, -10_000], [0, 10_000], 2_000, 1_000);
+        let both = terrain.with_earthworks(&[&ditch], &[&raise]);
+        let sculpted = terrain.with_earthworks(&[], &[&raise]);
+        assert_eq!(
+            both.height_mm(0, 0),
+            (sculpted.height_mm(0, 0) - 1_000).clamp(MIN_HEIGHT_MM, MAX_HEIGHT_MM)
+        );
     }
 }

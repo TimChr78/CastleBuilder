@@ -8,10 +8,12 @@
 //! Canonical ordering is established with [`std::collections::BTreeMap`] and
 //! sorted ids throughout.
 
+pub mod codex;
 pub mod command;
 pub mod document;
 pub mod fixtures;
 pub mod historian;
+pub mod interior;
 pub mod junction;
 pub mod masonry;
 pub mod mesh;

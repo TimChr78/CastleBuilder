@@ -22,6 +22,9 @@ const CONSTRUCTION_FX_SCRIPT := preload("res://scripts/construction_fx.gd")
 const BUILD_AUDIO_SCRIPT := preload("res://scripts/build_audio.gd")
 const DESIGN_TOOL_SCRIPT := preload("res://scripts/design_tool.gd")
 const AGENT_PANEL_SCRIPT := preload("res://scripts/agent_panel.gd")
+const INTERIOR_PROPS_SCRIPT := preload("res://scripts/interior_props.gd")
+const PHOTO_MODE_SCRIPT := preload("res://scripts/photo_mode.gd")
+const CODEX_PANEL_SCRIPT := preload("res://scripts/codex_panel.gd")
 
 ## Preferred loopback port for the live MCP/JSON-RPC control server.
 const CONTROL_PORT := 17731
@@ -59,6 +62,20 @@ var _ghost_visibility: Dictionary = {}
 var _control_token := ""
 var _control_url := ""
 
+var _interior_props: Node3D
+var _photo_mode: CanvasLayer
+var _codex_panel: CanvasLayer
+var _sky_material: PhysicalSkyMaterial
+var _environment: Environment
+var _cutaway_mode := 0
+var _cutaway_pos := 100.0
+var _masonry_bounds := AABB(Vector3(-12.0, 0.0, -12.0), Vector3(24.0, 12.0, 24.0))
+var _ground_min_y := 0.0
+var _ground_max_y := 0.0
+var _ground_median_y := 0.0
+var _terrain_tool := ""
+var _default_fov := 75.0
+
 var _masonry_material: ShaderMaterial
 var _terrain_material: ShaderMaterial
 var _water_material: ShaderMaterial
@@ -84,6 +101,9 @@ func _ready() -> void:
 	_setup_feel()
 	_setup_bridge()
 	_setup_agent_layer()
+	_setup_interior_props()
+	_setup_photo_mode()
+	_setup_codex()
 
 	if _bridge != null:
 		_start_control_server()
@@ -255,8 +275,10 @@ func _setup_environment() -> void:
 
 	var sky := Sky.new()
 	sky.sky_material = sky_material
+	_sky_material = sky_material
 
 	var environment := Environment.new()
+	_environment = environment
 	environment.background_mode = Environment.BG_SKY
 	environment.sky = sky
 	environment.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
@@ -324,10 +346,54 @@ func _setup_sun() -> void:
 	_sun.sky_mode = DirectionalLight3D.SKY_MODE_LIGHT_AND_SKY
 	add_child(_sun)
 
-	# Align the shader's stylised bounce fill with the real sun. A directional
-	# light shines along its local -Z, so +Z points from the scene toward the sun.
+	# Adopt the photo-mode lighting rig at the default golden-hour time so the
+	# startup look, the time-of-day slider and the born-in-code shaders agree.
+	_apply_sun_time(16.5)
+
+
+## Position the sun, retint the sky/fog and realign the masonry bounce fill for
+## an hour between 06:00 and 20:30 (M3.1 photo mode).
+func _apply_sun_time(hour: float) -> void:
+	if _sun == null:
+		return
+	var t := clampf((hour - 6.0) / 14.5, 0.0, 1.0)
+	# A low, fast-setting arc: high and steady around noon, dropping to a warm
+	# horizon at dawn and dusk.
+	var arc := sin(PI * t)
+	var elevation := 5.0 + 40.0 * pow(maxf(arc, 0.0), 7.0)
+	var azimuth := lerpf(-20.0, 66.0, t)
+	_sun.rotation_degrees = Vector3(-elevation, azimuth, 0.0)
+
+	# 1.0 at midday, falling to 0.0 at the ends of the day.
+	var midday := clampf(1.0 - absf(hour - 13.25) / 7.25, 0.0, 1.0)
+	var sun_color := Color(1.0, 0.64, 0.40)
+	sun_color = sun_color.lerp(Color(1.0, 0.78, 0.50), smoothstep(0.0, 0.45, midday))
+	sun_color = sun_color.lerp(Color(1.0, 0.95, 0.88), smoothstep(0.55, 1.0, midday))
+	_sun.light_color = sun_color
+	_sun.light_energy = lerpf(1.15, 2.6, midday)
+
+	if _sky_material != null:
+		_sky_material.mie_color = sun_color
+		_sky_material.rayleigh_color = (
+			Color(0.22, 0.32, 0.56).lerp(Color(0.30, 0.42, 0.62), midday)
+		)
+		_sky_material.turbidity = lerpf(7.0, 4.6, midday)
+	if _environment != null:
+		_environment.fog_light_color = sun_color.lerp(Color(0.58, 0.58, 0.56), 0.4)
+		_environment.fog_light_energy = lerpf(0.45, 0.35, midday)
+		_environment.ambient_light_energy = lerpf(0.34, 0.58, midday)
+		_environment.tonemap_exposure = lerpf(0.96, 1.06, midday)
+		_environment.volumetric_fog_albedo = (
+			sun_color.lerp(Color(0.90, 0.85, 0.78), 0.5)
+		)
+
+	# A directional light shines along its local -Z, so +Z points from the scene
+	# toward the sun; the shader's stylised bounce uses the same direction.
 	if _masonry_material != null:
-		_masonry_material.set_shader_parameter("sun_bounce_dir", _sun.global_transform.basis.z.normalized())
+		_masonry_material.set_shader_parameter(
+			"sun_bounce_dir", _sun.global_transform.basis.z.normalized()
+		)
+		_masonry_material.set_shader_parameter("bounce_color", sun_color)
 
 
 func _setup_camera() -> void:
@@ -356,6 +422,13 @@ func _setup_hud() -> void:
 	_hud.connect("undo_requested", Callable(self, "_on_undo_requested"))
 	_hud.connect("save_requested", Callable(self, "_on_save_requested"))
 	_hud.connect("load_requested", Callable(self, "_on_load_requested"))
+	_hud.connect("cutaway_mode_requested", Callable(self, "_on_hud_cutaway_mode_requested"))
+	_hud.connect(
+		"cutaway_position_changed", Callable(self, "_on_hud_cutaway_position_changed")
+	)
+	_hud.connect("terrain_tool_requested", Callable(self, "_on_hud_terrain_tool_requested"))
+	_hud.connect("photo_requested", Callable(self, "_on_hud_photo_requested"))
+	_hud.connect("codex_requested", Callable(self, "_on_hud_codex_requested"))
 
 
 func _setup_feel() -> void:
@@ -409,6 +482,45 @@ func _setup_bridge() -> void:
 		add_child(instance as Node)
 	if _design_tool != null:
 		_design_tool.call("set_bridge", _bridge)
+
+
+## Procedural furniture for the dollhouse cutaway (M3.1).
+func _setup_interior_props() -> void:
+	_interior_props = INTERIOR_PROPS_SCRIPT.new()
+	_interior_props.name = "InteriorProps"
+	add_child(_interior_props)
+
+
+## Photo-mode overlay (M3.1): time of day, FOV and clean PNG capture.
+func _setup_photo_mode() -> void:
+	_photo_mode = PHOTO_MODE_SCRIPT.new()
+	_photo_mode.name = "PhotoMode"
+	add_child(_photo_mode)
+	_photo_mode.connect("sun_time_changed", Callable(self, "_on_photo_sun_time_changed"))
+	_photo_mode.connect("fov_changed", Callable(self, "_on_photo_fov_changed"))
+	_photo_mode.connect("capture_requested", Callable(self, "_on_photo_capture_requested"))
+	_photo_mode.connect("exit_requested", Callable(self, "_on_photo_exit_requested"))
+	if _camera != null:
+		_default_fov = _camera.fov
+
+
+## In-game historical codex (M3.1), fed by the bridge's codex entries.
+func _setup_codex() -> void:
+	_codex_panel = CODEX_PANEL_SCRIPT.new()
+	_codex_panel.name = "CodexPanel"
+	add_child(_codex_panel)
+	_codex_panel.connect("close_requested", Callable(self, "_close_codex"))
+	_refresh_codex_entries()
+
+
+func _refresh_codex_entries() -> void:
+	if _codex_panel == null or _bridge == null:
+		return
+	if not _bridge.has_method("list_codex_entries"):
+		return
+	var entries: Variant = _bridge.call("list_codex_entries")
+	if entries is Array:
+		_codex_panel.call("set_entries", entries)
 
 
 ## Build the in-game agent panel and the proposal ghost overlay root.
@@ -522,12 +634,30 @@ func _fulfill_render_view(request_id: int, state: Dictionary) -> void:
 
 	var hud_was_visible := false
 	var panel_was_visible := false
+	var photo_was_visible := false
+	var codex_was_visible := false
+	var prev_fov := _default_fov
+	var prev_cutaway_mode := _cutaway_mode
 	if _hud != null:
 		hud_was_visible = _hud.visible
 		_hud.visible = false
 	if _agent_panel != null:
 		panel_was_visible = _agent_panel.visible
 		_agent_panel.visible = false
+	if _photo_mode != null:
+		photo_was_visible = _photo_mode.visible
+		_photo_mode.visible = false
+	if _codex_panel != null:
+		codex_was_visible = _codex_panel.visible
+		_codex_panel.visible = false
+	# Capture the raw architectural form: no dollhouse cut and the default lens
+	# (M7). Both are restored after the frame is read.
+	if _cutaway_mode != 0:
+		_cutaway_mode = 0
+		_apply_cutaway()
+	if _camera != null:
+		prev_fov = _camera.fov
+		_camera.fov = _default_fov
 
 	# Let the renderer present one frame without the overlays before we read it.
 	await RenderingServer.frame_post_draw
@@ -539,10 +669,19 @@ func _fulfill_render_view(request_id: int, state: Dictionary) -> void:
 
 	if moved_camera and _camera != null:
 		_camera.call("set_orbit_view", prev_yaw_deg, prev_pitch_deg, prev_distance_m)
+	if _camera != null:
+		_camera.fov = prev_fov
+	if _cutaway_mode != prev_cutaway_mode:
+		_cutaway_mode = prev_cutaway_mode
+		_apply_cutaway()
 	if _hud != null:
 		_hud.visible = hud_was_visible
 	if _agent_panel != null:
 		_agent_panel.visible = panel_was_visible
+	if _photo_mode != null:
+		_photo_mode.visible = photo_was_visible
+	if _codex_panel != null:
+		_codex_panel.visible = codex_was_visible
 
 	if image == null or image.is_empty():
 		_render_view_busy = false
@@ -835,6 +974,14 @@ func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 	_spawn_terrain(data.get("terrain"))
 	_spawn_chunks(data.get("chunks"))
 
+	# Dollhouse furniture is derived pure data; rebuild it for every scene edit.
+	if _interior_props != null:
+		var props: Variant = data.get("interior_props", [])
+		if props is Array:
+			_interior_props.call("build_props", props)
+		else:
+			_interior_props.call("clear_props")
+
 	var block_count := int(data.get("block_count", 0))
 	var chunk_count := int(data.get("chunk_count", 0))
 	var triangle_count := int(data.get("triangle_count", 0))
@@ -868,9 +1015,13 @@ func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 		_apply_build_front(_build_front)
 
 	var bounds := _compute_masonry_bounds(data)
+	_masonry_bounds = bounds
+	_update_ground_bounds(data)
 	# Anchor the damp/moss course to the foot of this site's masonry.
 	if _masonry_material != null:
 		_masonry_material.set_shader_parameter("wet_base_y", bounds.position.y)
+	_apply_cutaway()
+	_update_cutaway_range()
 	if _fx != null:
 		var elements: Variant = data.get("elements", [])
 		if elements is Array and not (elements as Array).is_empty():
@@ -1145,7 +1296,242 @@ func _on_hud_mode_requested(mode: String) -> void:
 	_rebuild(mode)
 
 
+# ---------------------------------------------------------------------------
+# M3.1: cutaway, terrain brushes, photo mode and the codex
+# ---------------------------------------------------------------------------
+
+func _on_hud_cutaway_mode_requested(mode: int) -> void:
+	_set_cutaway_mode(mode)
+
+
+func _on_hud_cutaway_position_changed(position: float) -> void:
+	_set_cutaway_position(position)
+
+
+func _default_storey_cut_y() -> float:
+	if _masonry_bounds.size.y > 0.5:
+		return _masonry_bounds.position.y + minf(5.5, _masonry_bounds.size.y * 0.45)
+	return _ground_max_y + 2.0
+
+
+func _set_cutaway_mode(mode: int) -> void:
+	var clamped := clampi(mode, 0, 3)
+	var changed := clamped != _cutaway_mode
+	_cutaway_mode = clamped
+	match clamped:
+		1:
+			# Horizontal plane: default to mid-first-storey of the castle so
+			# the slice opens the masonry cleanly on every site elevation.
+			if changed:
+				_cutaway_pos = _default_storey_cut_y()
+			_update_cutaway_range()
+		2, 3:
+			if changed:
+				_cutaway_pos = 0.0
+			_update_cutaway_range()
+		_:
+			_cutaway_pos = 100.0
+			if _hud != null:
+				var low := minf(_ground_min_y - 2.0, _masonry_bounds.position.y - 1.0)
+				var high := maxf(
+					_ground_max_y + 24.0,
+					_masonry_bounds.position.y + _masonry_bounds.size.y + 4.0
+				)
+				_hud.call(
+					"set_cutaway_range", low, high, clampf(_default_storey_cut_y(), low, high)
+				)
+	if _hud != null:
+		_hud.call("set_cutaway_mode", clamped)
+	_apply_cutaway()
+
+
+## Sample the terrain surface to learn its true vertical range so the cutaway
+## slider always spans the loaded site. Uses a bounded stride so a large terrain
+## mesh never stalls an edit.
+func _update_ground_bounds(data: Dictionary) -> void:
+	var terrain: Variant = data.get("terrain", null)
+	if terrain is ArrayMesh:
+		var arrays: Array = (terrain as ArrayMesh).surface_get_arrays(0)
+		if arrays.size() > Mesh.ARRAY_VERTEX:
+			var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+			if not verts.is_empty():
+				var stride := maxi(1, verts.size() / 2048)
+				var heights := PackedFloat32Array()
+				var index := 0
+				while index < verts.size():
+					heights.append(verts[index].y)
+					index += stride
+				heights.sort()
+				_ground_min_y = heights[0]
+				_ground_max_y = heights[heights.size() - 1]
+				_ground_median_y = heights[heights.size() / 2]
+				return
+	# Fall back to the masonry foot when the terrain mesh is unavailable.
+	_ground_min_y = _masonry_bounds.position.y
+	_ground_max_y = _masonry_bounds.position.y
+	_ground_median_y = _masonry_bounds.position.y
+
+
+## Push a mode-appropriate slider range to the HUD. Horizontal cuts follow the
+## site relief; vertical sections use a generous ±80 m window.
+func _update_cutaway_range() -> void:
+	if _hud == null:
+		return
+	match _cutaway_mode:
+		1:
+			var low := minf(_ground_min_y - 2.0, _masonry_bounds.position.y - 1.0)
+			var high := maxf(
+				_ground_max_y + 24.0,
+				_masonry_bounds.position.y + _masonry_bounds.size.y + 4.0
+			)
+			_cutaway_pos = clampf(_cutaway_pos, low, high)
+			_hud.call("set_cutaway_range", low, high, _cutaway_pos)
+		2, 3:
+			_cutaway_pos = clampf(_cutaway_pos, -80.0, 80.0)
+			_hud.call("set_cutaway_range", -80.0, 80.0, _cutaway_pos)
+
+
+func _set_cutaway_position(position: float) -> void:
+	_cutaway_pos = position
+	_apply_cutaway()
+
+
+func _apply_cutaway() -> void:
+	if _masonry_material != null:
+		_masonry_material.set_shader_parameter("cutaway_mode", _cutaway_mode)
+		_masonry_material.set_shader_parameter("cutaway_pos", _cutaway_pos)
+	if _interior_props != null:
+		_interior_props.call("set_cutaway", _cutaway_mode, _cutaway_pos)
+
+
+func _on_hud_terrain_tool_requested(kind: String) -> void:
+	_terrain_tool = kind
+	if _design_tool != null:
+		_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.NONE)
+	if _hud != null:
+		_hud.call(
+			"set_tool_status",
+			"Terrain: %s — LMB on the ground (Ctrl+Z undoes)" % kind.capitalize()
+		)
+
+
+## Apply the armed terrain brush at the ground point under a screen position.
+func _sculpt_at_screen_position(screen_position: Vector2) -> void:
+	if _bridge == null or not _bridge.has_method("sculpt_terrain"):
+		return
+	if not _bridge.has_method("pick_terrain"):
+		return
+	var camera := get_viewport().get_camera_3d()
+	if camera == null:
+		return
+	var from := camera.project_ray_origin(screen_position)
+	var direction := camera.project_ray_normal(screen_position)
+	var hit: Variant = _bridge.call("pick_terrain", from, direction)
+	if not (hit is Dictionary) or not bool((hit as Dictionary).get("hit", false)):
+		return
+	var point: Variant = (hit as Dictionary).get("point", null)
+	if not (point is Vector3):
+		return
+	var ground: Vector3 = point
+
+	var delta := 1.5
+	match _terrain_tool:
+		"flatten":
+			delta = ground.y
+		"smooth":
+			delta = 0.65
+	var result: Variant = _bridge.call(
+		"sculpt_terrain", _terrain_tool, Vector2(ground.x, ground.z), 8.0, delta
+	)
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_hud.call("show_error", "Sculpt rejected: %s" % _dictionary_error(result))
+		return
+	_apply_scene(result as Dictionary, false, false)
+	if _audio != null:
+		_audio.call("play_place_thud", 0.62)
+	_hud.call("clear_error")
+	_hud.call(
+		"set_tool_status",
+		"Terrain %s at %.1f, %.1f m — Ctrl+Z to undo"
+		% [_terrain_tool, ground.x, ground.z]
+	)
+
+
+func _on_hud_photo_requested() -> void:
+	_set_photo_mode(not _photo_mode.visible)
+
+
+func _on_photo_exit_requested() -> void:
+	_set_photo_mode(false)
+
+
+func _set_photo_mode(enabled: bool) -> void:
+	if _photo_mode == null:
+		return
+	_photo_mode.visible = enabled
+	if _hud != null:
+		_hud.visible = not enabled
+	if _agent_panel != null:
+		_agent_panel.visible = not enabled
+	if enabled:
+		if _codex_panel != null:
+			_codex_panel.visible = false
+		if _camera != null:
+			_camera.fov = float(_photo_mode.call("get_fov"))
+		_apply_sun_time(float(_photo_mode.call("get_sun_time")))
+	else:
+		if _camera != null:
+			_camera.fov = _default_fov
+		# Keep the chosen sun time: the scene stays photogenic after exiting.
+
+
+func _on_photo_sun_time_changed(hour: float) -> void:
+	_apply_sun_time(hour)
+
+
+func _on_photo_fov_changed(fov: float) -> void:
+	if _camera != null:
+		_camera.fov = fov
+
+
+func _on_photo_capture_requested() -> void:
+	if _photo_mode == null:
+		return
+	# Hide the whole photo overlay (not just its bar) for a full frame so it can
+	# never leak into the PNG, then capture and restore it (M3.1 M8).
+	var was_visible := _photo_mode.visible
+	_photo_mode.visible = false
+	await get_tree().process_frame
+	await RenderingServer.frame_post_draw
+	var path := str(_photo_mode.call("capture_photo"))
+	_photo_mode.visible = was_visible
+	print("Keepwright: photo saved — %s" % path)
+
+
+func _on_hud_codex_requested() -> void:
+	_toggle_codex()
+
+
+func _toggle_codex() -> void:
+	if _codex_panel == null:
+		return
+	if not _codex_panel.visible and _photo_mode != null and _photo_mode.visible:
+		_set_photo_mode(false)
+	_codex_panel.visible = not _codex_panel.visible
+
+
+func _close_codex() -> void:
+	if _codex_panel != null:
+		_codex_panel.visible = false
+
+
+func _text_input_focused() -> bool:
+	var focused := get_viewport().gui_get_focus_owner()
+	return focused is LineEdit or focused is TextEdit
+
+
 func _on_hud_tool_requested(tool: String) -> void:
+	_terrain_tool = ""
 	if _design_tool == null:
 		return
 	match tool:
@@ -1523,9 +1909,40 @@ func _on_load_requested() -> void:
 
 
 func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventMouseButton:
+		var mouse := event as InputEventMouseButton
+		if (
+			_terrain_tool != ""
+			and mouse.button_index == MOUSE_BUTTON_LEFT
+			and mouse.pressed
+		):
+			_sculpt_at_screen_position(mouse.position)
+			get_viewport().set_input_as_handled()
+		return
 	if not (event is InputEventKey):
 		return
 	var key := event as InputEventKey
-	if key.pressed and not key.echo and key.ctrl_pressed and key.keycode == KEY_Z:
+	if not key.pressed or key.echo:
+		return
+	if key.ctrl_pressed and key.keycode == KEY_Z:
 		_on_undo_requested()
 		get_viewport().set_input_as_handled()
+		return
+	if key.ctrl_pressed or key.alt_pressed:
+		return
+	match key.keycode:
+		KEY_P:
+			if not _text_input_focused():
+				_on_hud_photo_requested()
+				get_viewport().set_input_as_handled()
+		KEY_C:
+			if not _text_input_focused():
+				_on_hud_codex_requested()
+				get_viewport().set_input_as_handled()
+		KEY_ESCAPE:
+			if _photo_mode != null and _photo_mode.visible:
+				_set_photo_mode(false)
+				get_viewport().set_input_as_handled()
+			elif _codex_panel != null and _codex_panel.visible:
+				_close_codex()
+				get_viewport().set_input_as_handled()

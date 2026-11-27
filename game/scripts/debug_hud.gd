@@ -18,6 +18,11 @@ signal fix_requested(fix_json: String)
 signal undo_requested()
 signal save_requested()
 signal load_requested()
+signal cutaway_mode_requested(mode: int)
+signal cutaway_position_changed(position: float)
+signal terrain_tool_requested(kind: String)
+signal photo_requested()
+signal codex_requested()
 
 const REFRESH_INTERVAL := 0.25
 const MAX_ASSESSMENT_FINDINGS := 3
@@ -46,10 +51,17 @@ var _save_button: Button
 var _load_button: Button
 var _tool_status: Label
 var _tool_buttons: Dictionary = {}
+var _cutaway_buttons: Dictionary = {}
+var _cutaway_slider: HSlider
+var _cutaway_value_label: Label
+var _cutaway_mode := 0
 var _assessment_label: Label
 var _historian_label: Label
 var _assessment_findings: VBoxContainer
 var _style_buttons: Dictionary = {}
+var _stats_panel: Panel
+var _stats_scroll: ScrollContainer
+var _stats_column: VBoxContainer
 
 var _playing := false
 var _speed_multiplier := 1.0
@@ -59,8 +71,13 @@ var _refresh_timer := 0.0
 
 
 func _ready() -> void:
-	layer = 100
+	# Keep the HUD below AgentPanel (20), PhotoMode (30) and CodexPanel (40) so
+	# the modal codex always draws in front of every HUD (M3.1 H4).
+	layer = 10
 	_build_ui()
+	if get_viewport() != null:
+		get_viewport().size_changed.connect(_update_hud_size)
+	_update_hud_size.call_deferred()
 
 
 func _process(delta: float) -> void:
@@ -78,22 +95,42 @@ func _build_ui() -> void:
 	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(root)
 
-	var panel := PanelContainer.new()
+	# The stats panel is a plain Control (not a PanelContainer) so an explicit
+	# size can clamp it. Its content lives in a vertical ScrollContainer, which
+	# keeps 3+ findings and error lines usable on a 900 px screen instead of
+	# running off the bottom (M3.1 H4).
+	var panel := Panel.new()
 	panel.name = "StatsPanel"
 	panel.position = Vector2(14.0, 14.0)
+	panel.size = Vector2(360.0, 420.0)
 	panel.mouse_filter = Control.MOUSE_FILTER_STOP
 	root.add_child(panel)
+	_stats_panel = panel
 
 	var margin := MarginContainer.new()
+	margin.name = "StatsMargin"
+	margin.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	margin.add_theme_constant_override("margin_left", 14)
 	margin.add_theme_constant_override("margin_right", 14)
 	margin.add_theme_constant_override("margin_top", 12)
 	margin.add_theme_constant_override("margin_bottom", 12)
 	panel.add_child(margin)
 
+	var scroll := ScrollContainer.new()
+	scroll.name = "StatsScroll"
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
+	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	margin.add_child(scroll)
+	_stats_scroll = scroll
+
 	var column := VBoxContainer.new()
+	column.name = "StatsColumn"
 	column.add_theme_constant_override("separation", 4)
-	margin.add_child(column)
+	column.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(column)
+	_stats_column = column
 
 	var title := Label.new()
 	title.text = "KEEPWRIGHT  ·  M1"
@@ -225,6 +262,61 @@ func _build_ui() -> void:
 	_load_button.pressed.connect(_on_load_pressed)
 	file_row.add_child(_load_button)
 
+	var photo_button := Button.new()
+	photo_button.text = "Photo"
+	photo_button.focus_mode = Control.FOCUS_NONE
+	photo_button.pressed.connect(func() -> void: photo_requested.emit())
+	file_row.add_child(photo_button)
+
+	var codex_button := Button.new()
+	codex_button.text = "Codex"
+	codex_button.focus_mode = Control.FOCUS_NONE
+	codex_button.pressed.connect(func() -> void: codex_requested.emit())
+	file_row.add_child(codex_button)
+
+	# Dollhouse cutaway: a plane sweep with a floor-height slider (M3.1).
+	var cutaway_row := HBoxContainer.new()
+	cutaway_row.add_theme_constant_override("separation", 6)
+	column.add_child(cutaway_row)
+
+	var cutaway_label := Label.new()
+	cutaway_label.text = "Cutaway"
+	cutaway_label.add_theme_font_size_override("font_size", 11)
+	cutaway_label.add_theme_color_override("font_color", Color(0.62, 0.64, 0.58))
+	cutaway_row.add_child(cutaway_label)
+
+	var cutaway_group := ButtonGroup.new()
+	cutaway_group.allow_unpress = false
+	for entry in [[0, "Off"], [1, "Storey"], [2, "Sec X"], [3, "Sec Z"]]:
+		var cutaway_button := Button.new()
+		cutaway_button.text = entry[1]
+		cutaway_button.toggle_mode = true
+		cutaway_button.button_group = cutaway_group
+		cutaway_button.focus_mode = Control.FOCUS_NONE
+		cutaway_button.pressed.connect(_on_cutaway_mode_pressed.bind(entry[0]))
+		cutaway_row.add_child(cutaway_button)
+		_cutaway_buttons[int(entry[0])] = cutaway_button
+	_cutaway_buttons[0].set_pressed_no_signal(true)
+
+	var cutaway_slider_row := HBoxContainer.new()
+	cutaway_slider_row.add_theme_constant_override("separation", 8)
+	column.add_child(cutaway_slider_row)
+
+	_cutaway_slider = HSlider.new()
+	_cutaway_slider.min_value = -2.0
+	_cutaway_slider.max_value = 24.0
+	_cutaway_slider.step = 0.05
+	_cutaway_slider.value = 6.0
+	_cutaway_slider.editable = false
+	_cutaway_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_cutaway_slider.custom_minimum_size = Vector2(190.0, 0.0)
+	_cutaway_slider.focus_mode = Control.FOCUS_NONE
+	_cutaway_slider.value_changed.connect(_on_cutaway_slider_changed)
+	cutaway_slider_row.add_child(_cutaway_slider)
+
+	_cutaway_value_label = _make_stat_label("Cut —")
+	cutaway_slider_row.add_child(_cutaway_value_label)
+
 	var front_row := HBoxContainer.new()
 	front_row.add_theme_constant_override("separation", 8)
 	column.add_child(front_row)
@@ -323,6 +415,23 @@ func _build_ui() -> void:
 		_tool_buttons[tool_id] = button
 	_tool_buttons["view"].set_pressed_no_signal(true)
 
+	# Terrain brushes share the tool group so only one edit tool is armed.
+	for entry in [
+		["raise", "Raise"],
+		["lower", "Lower"],
+		["flatten", "Flatten"],
+		["smooth", "Smooth"],
+	]:
+		var brush_id: String = entry[0]
+		var brush_button := Button.new()
+		brush_button.text = entry[1]
+		brush_button.toggle_mode = true
+		brush_button.button_group = tool_group
+		brush_button.focus_mode = Control.FOCUS_NONE
+		brush_button.pressed.connect(_on_terrain_tool_pressed.bind(brush_id))
+		tool_row.add_child(brush_button)
+		_tool_buttons[brush_id] = brush_button
+
 	_tool_status = _make_stat_label("Tool: View — orbit around the site")
 	_tool_status.add_theme_color_override("font_color", Color(0.90, 0.82, 0.60))
 	column.add_child(_tool_status)
@@ -349,7 +458,8 @@ func _build_ui() -> void:
 	hint.text = (
 		"RMB / MMB orbit · Shift+drag pan · Wheel zoom\n"
 		+ "WASD/Arrows pan · Q/E orbit · R/F tilt · +/- zoom · Home reset\n"
-		+ "LMB drag: wall/ditch · LMB click: tower/gatehouse · Ctrl+Z undo"
+		+ "LMB drag: wall/ditch · LMB click: tower/gatehouse · Ctrl+Z undo\n"
+		+ "Raise/Lower/Flatten/Smooth: LMB sculpts ground · P photo · C codex"
 	)
 	hint.add_theme_font_size_override("font_size", 11)
 	hint.add_theme_color_override("font_color", Color(0.62, 0.64, 0.58))
@@ -370,6 +480,22 @@ func _build_ui() -> void:
 	_error_label.custom_minimum_size = Vector2(330.0, 0.0)
 	_error_label.visible = false
 	column.add_child(_error_label)
+
+
+## Recompute the stats panel height so it always fits the current window but
+## never exceeds 840 px. The vertical ScrollContainer handles any overflow from
+## assessment findings or error lines (M3.1 H4).
+func _update_hud_size() -> void:
+	if _stats_panel == null or _stats_column == null:
+		return
+	var viewport_height := 900.0
+	if get_viewport() != null:
+		viewport_height = get_viewport().get_visible_rect().size.y
+	var max_height := minf(viewport_height - 28.0, 840.0)
+	var column_min := _stats_column.get_combined_minimum_size()
+	var desired_width := maxf(column_min.x + 28.0, 360.0)
+	var desired_height := minf(maxf(column_min.y + 24.0, 120.0), max_height)
+	_stats_panel.size = Vector2(desired_width, desired_height)
 
 
 func _make_stat_label(initial_text: String) -> Label:
@@ -435,12 +561,14 @@ func set_assessment(data: Dictionary) -> void:
 			_assessment_label.text = "Structure: %d/100 ✓" % score
 		_assessment_label.add_theme_color_override("font_color", Color(0.62, 0.88, 0.54))
 		if not has_findings:
+			_update_hud_size.call_deferred()
 			return
 	else:
 		_assessment_label.text = "Structure: %d/100 ✗" % score
 		_assessment_label.add_theme_color_override("font_color", Color(1.0, 0.55, 0.42))
 
 	if not (findings is Array):
+		_update_hud_size.call_deferred()
 		return
 	var shown := 0
 	for entry in (findings as Array):
@@ -484,6 +612,7 @@ func set_assessment(data: Dictionary) -> void:
 			row.add_child(fix_button)
 
 		_assessment_findings.add_child(row)
+	_update_hud_size.call_deferred()
 
 
 ## Compact historian readout shown directly under the structural score.
@@ -506,6 +635,41 @@ func set_style_selection(style_id: String) -> void:
 	if _style_buttons.has(style_id):
 		var button: Button = _style_buttons[style_id]
 		button.set_pressed_no_signal(true)
+
+
+## Reflect the active dollhouse cutaway mode and enable the plane slider only
+## while a cut is active.
+func set_cutaway_mode(mode: int) -> void:
+	_cutaway_mode = mode
+	if _cutaway_buttons.has(mode):
+		var button: Button = _cutaway_buttons[mode]
+		button.set_pressed_no_signal(true)
+	if _cutaway_slider != null:
+		_cutaway_slider.editable = mode > 0
+	if _cutaway_value_label != null:
+		_cutaway_value_label.text = "Cut —" if mode == 0 else _format_cutaway_value()
+
+
+## Set the slider's usable range and current value without re-emitting, so the
+## vertical and horizontal planes can use their own sensible bounds.
+func set_cutaway_range(min_value: float, max_value: float, value: float) -> void:
+	if _cutaway_slider == null:
+		return
+	_cutaway_slider.min_value = min_value
+	_cutaway_slider.max_value = max_value
+	_cutaway_slider.set_value_no_signal(clampf(value, min_value, max_value))
+	if _cutaway_value_label != null:
+		_cutaway_value_label.text = _format_cutaway_value()
+
+
+func get_cutaway_mode() -> int:
+	return _cutaway_mode
+
+
+func get_cutaway_position() -> float:
+	if _cutaway_slider == null:
+		return 0.0
+	return _cutaway_slider.value
 
 
 func set_build_front(value: float) -> void:
@@ -563,16 +727,19 @@ func is_muted() -> bool:
 func show_error(message: String) -> void:
 	_error_label.text = message
 	_error_label.visible = true
+	_update_hud_size.call_deferred()
 
 
 func clear_error() -> void:
 	_error_label.text = ""
 	_error_label.visible = false
+	_update_hud_size.call_deferred()
 
 
 func show_warning(message: String) -> void:
 	_warning_label.text = message
 	_warning_label.visible = true
+	_update_hud_size.call_deferred()
 
 
 func clear_warning() -> void:
@@ -655,6 +822,26 @@ func _on_load_pressed() -> void:
 
 func _on_tool_pressed(tool: String) -> void:
 	tool_requested.emit(tool)
+
+
+func _on_terrain_tool_pressed(kind: String) -> void:
+	terrain_tool_requested.emit(kind)
+
+
+func _on_cutaway_mode_pressed(mode: int) -> void:
+	cutaway_mode_requested.emit(mode)
+
+
+func _on_cutaway_slider_changed(value: float) -> void:
+	if _cutaway_value_label != null:
+		_cutaway_value_label.text = _format_cutaway_value()
+	cutaway_position_changed.emit(value)
+
+
+func _format_cutaway_value() -> String:
+	if _cutaway_slider == null:
+		return "Cut —"
+	return "Cut %.1f m" % _cutaway_slider.value
 
 
 func _format_int(value: int) -> String:

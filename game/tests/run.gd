@@ -85,6 +85,14 @@ func _initialize() -> void:
 		quit(1)
 		return
 
+	if bridge != null:
+		_check_m3_1(bridge, failures)
+
+	if not failures.is_empty():
+		_for_each_failure(failures)
+		quit(1)
+		return
+
 	_check_feel_scripts(failures)
 
 	if not failures.is_empty():
@@ -1408,6 +1416,296 @@ func _check_visual_polish(failures: Array[String]) -> void:
 
 	if failures.is_empty():
 		print("M1.4 visual polish OK: 16x AF, LOD0 band-limit, speed/time-lapse, mute, clean capture")
+
+
+## M3.1: authoritative terrain sculpting, dollhouse interior props, the
+## historical codex and the three new UI scripts (interior props, photo mode,
+## codex panel).
+func _check_m3_1(bridge: Object, failures: Array[String]) -> void:
+	for method in ["sculpt_terrain", "list_codex_entries"]:
+		if not bridge.has_method(method):
+			failures.append("KeepBridge has no %s() method." % method)
+	if not failures.is_empty():
+		return
+
+	var base_result: Variant = bridge.call("build_m2_baltic")
+	if not (base_result is Dictionary):
+		failures.append("build_m2_baltic(M3.1) did not return a Dictionary.")
+		return
+	var base_data: Dictionary = base_result
+
+	# 1. Dollhouse furniture covers every furnished room type in M2.
+	var props: Variant = base_data.get("interior_props", null)
+	if not (props is Array):
+		failures.append("scene dictionary is missing \"interior_props\" as an Array.")
+	elif (props as Array).is_empty():
+		failures.append("build_m2_baltic() returned no interior_props.")
+	else:
+		var rooms := {}
+		var valid_kinds := [
+			"table", "bench", "bed", "altar", "cauldron", "barrel", "chest"
+		]
+		var index := 0
+		for entry in (props as Array):
+			if not (entry is Dictionary):
+				failures.append("interior_props[%d] is not a Dictionary." % index)
+				break
+			var prop: Dictionary = entry
+			for key in ["kind", "room_type", "position", "yaw_deg", "element_id"]:
+				if not prop.has(key):
+					failures.append(
+						"interior_props[%d] is missing \"%s\"." % [index, key]
+					)
+			var position: Variant = prop.get("position", null)
+			if position is Vector3:
+				rooms[str(prop.get("room_type", ""))] = true
+			else:
+				failures.append("interior_props[%d].position is not a Vector3." % index)
+			if not valid_kinds.has(str(prop.get("kind", ""))):
+				failures.append(
+					"interior_props[%d] has unknown kind \"%s\"."
+					% [index, str(prop.get("kind", ""))]
+				)
+			index += 1
+			if index >= 400:
+				break
+		for room in ["great_hall", "chapel", "kitchen", "undercroft", "solar"]:
+			if not rooms.has(room):
+				failures.append("interior_props is missing room type \"%s\"." % room)
+
+	# 2. Sculpting is authoritative: the rendered terrain rises, hashes into the
+	# document and Ctrl+Z restores both the surface and the hash. Picking reads
+	# the raw site terrain (sculpts are derived earthworks), so the mesh itself
+	# is the honest probe here.
+	var before_hash := str(base_data.get("document_hash", ""))
+	var probe := Vector2(0.0, 24.0)
+	var before_height := _terrain_mesh_height(base_data, probe)
+	if is_nan(before_height):
+		failures.append("build_m2_baltic() terrain mesh has no vertices near the sculpt probe.")
+	else:
+		var sculpt: Variant = bridge.call("sculpt_terrain", "raise", probe, 8.0, 1.5)
+		if not (sculpt is Dictionary) or not bool((sculpt as Dictionary).get("ok", false)):
+			var sculpt_error := "did not return a Dictionary"
+			if sculpt is Dictionary:
+				sculpt_error = str((sculpt as Dictionary).get("error", "unknown error"))
+			failures.append("sculpt_terrain(raise) failed: %s" % sculpt_error)
+		else:
+			var sculpt_data: Dictionary = sculpt
+			if str(sculpt_data.get("document_hash", "")) == before_hash:
+				failures.append("sculpt_terrain() did not change the document hash.")
+			var raised := _terrain_mesh_height(sculpt_data, probe)
+			if is_nan(raised) or raised <= before_height + 0.2:
+				failures.append(
+					"sculpt_terrain(raise) did not raise the terrain (%.2f -> %.2f)."
+					% [before_height, raised]
+				)
+			var undo: Variant = bridge.call("undo_last")
+			if not (undo is Dictionary) or not bool((undo as Dictionary).get("undone", false)):
+				failures.append("undo_last() did not reverse the terrain sculpt.")
+			else:
+				var undo_data: Dictionary = undo
+				if str(undo_data.get("document_hash", "")) != before_hash:
+					failures.append(
+						"undo_last() did not restore the pre-sculpt document hash."
+					)
+				var restored := _terrain_mesh_height(undo_data, probe)
+				if not is_nan(restored) and absf(restored - before_height) > 0.2:
+					failures.append(
+						"undo_last() did not restore the terrain height (%.2f vs %.2f)."
+						% [restored, before_height]
+					)
+
+	# 3. Codex data contract: eight entries with titles and citations.
+	var entries: Variant = bridge.call("list_codex_entries")
+	if not (entries is Array):
+		failures.append("list_codex_entries() did not return an Array.")
+	elif (entries as Array).size() != 8:
+		failures.append(
+			"list_codex_entries() returned %d entries, expected 8."
+			% (entries as Array).size()
+		)
+	else:
+		for entry in (entries as Array):
+			if not (entry is Dictionary):
+				failures.append("A codex entry is not a Dictionary.")
+				break
+			var item: Dictionary = entry
+			if str(item.get("title", "")).strip_edges().is_empty():
+				failures.append(
+					"Codex entry \"%s\" has an empty title." % str(item.get("id", ""))
+				)
+			var citations: Variant = item.get("citations", null)
+			if not (citations is Array) or (citations as Array).is_empty():
+				failures.append(
+					"Codex entry \"%s\" has no citations." % str(item.get("id", ""))
+				)
+			if not (item.get("related_style_ids", null) is Array):
+				failures.append(
+					"Codex entry \"%s\" has no related_style_ids array."
+					% str(item.get("id", ""))
+				)
+
+	# 4. The new UI scripts build and run headlessly.
+	_check_interior_props_script(failures)
+	_check_photo_mode_script(failures)
+	_check_codex_panel_script(entries, failures)
+	_check_m3_1_main_methods(failures)
+
+	if failures.is_empty():
+		print(
+			"M3.1 OK: interior props (5 rooms), terrain sculpt+undo, 8 codex entries, "
+			+ "photo/codex/cutaway UI"
+		)
+
+
+## Highest terrain-mesh vertex (metres) within `radius` of an XZ point.
+func _terrain_mesh_height(data: Dictionary, point_xz: Vector2, radius: float = 2.0) -> float:
+	var terrain: Variant = data.get("terrain", null)
+	if not (terrain is ArrayMesh):
+		return NAN
+	var mesh: ArrayMesh = terrain
+	if mesh.get_surface_count() == 0:
+		return NAN
+	var arrays: Array = mesh.surface_get_arrays(0)
+	var vertices: Variant = arrays[Mesh.ARRAY_VERTEX]
+	if not (vertices is PackedVector3Array):
+		return NAN
+	var best := -INF
+	for vertex in (vertices as PackedVector3Array):
+		if Vector2(vertex.x, vertex.z).distance_to(point_xz) <= radius:
+			best = maxf(best, vertex.y)
+	if best == -INF:
+		return NAN
+	return best
+
+
+func _check_interior_props_script(failures: Array[String]) -> void:
+	var script: Variant = load("res://scripts/interior_props.gd")
+	if not (script is GDScript):
+		failures.append("interior_props.gd did not load as a GDScript.")
+		return
+	var builder: Variant = (script as GDScript).new()
+	if builder == null or not (builder is Node3D):
+		failures.append("InteriorProps is not a Node3D.")
+		return
+	root.add_child(builder as Node3D)
+	for method in ["build_props", "set_cutaway", "get_prop_count", "get_room_types"]:
+		if not builder.has_method(method):
+			failures.append("InteriorProps has no %s()." % method)
+	var sample := [
+		{
+			"kind": "table",
+			"room_type": "great_hall",
+			"position": Vector3(0.0, 1.0, 0.0),
+			"yaw_deg": 0,
+			"element_id": 30,
+		},
+		{
+			"kind": "bed",
+			"room_type": "solar",
+			"position": Vector3(0.0, 6.0, 0.0),
+			"yaw_deg": 90,
+			"element_id": 20,
+		},
+	]
+	builder.call("build_props", sample)
+	if int(builder.call("get_prop_count")) != 2:
+		failures.append("InteriorProps.get_prop_count() != 2 after build_props().")
+	builder.call("set_cutaway", 0, 100.0)
+	if bool(builder.call("is_props_visible")):
+		failures.append("InteriorProps is visible with the cutaway off.")
+	builder.call("set_cutaway", 1, 3.0)
+	if not bool(builder.call("is_props_visible")):
+		failures.append("InteriorProps did not become visible with a cutaway.")
+	if int(builder.call("get_visible_prop_count")) != 1:
+		failures.append("InteriorProps did not hide the prop above the cut plane.")
+	(builder as Node).free()
+
+
+func _check_photo_mode_script(failures: Array[String]) -> void:
+	var script: Variant = load("res://scripts/photo_mode.gd")
+	if not (script is GDScript):
+		failures.append("photo_mode.gd did not load as a GDScript.")
+		return
+	var photo: Variant = (script as GDScript).new()
+	if photo == null or not (photo is CanvasLayer):
+		failures.append("PhotoMode is not a CanvasLayer.")
+		return
+	root.add_child(photo as CanvasLayer)
+	for signal_name in [
+		"sun_time_changed", "fov_changed", "capture_requested", "exit_requested"
+	]:
+		if not photo.has_signal(signal_name):
+			failures.append("PhotoMode has no %s signal." % signal_name)
+	for method in ["set_sun_time", "get_sun_time", "set_fov", "get_fov", "capture_photo"]:
+		if not photo.has_method(method):
+			failures.append("PhotoMode has no %s()." % method)
+	photo.call("set_sun_time", 7.5)
+	if not is_equal_approx(float(photo.call("get_sun_time")), 7.5):
+		failures.append("PhotoMode.set_sun_time(7.5) did not stick.")
+	photo.call("set_fov", 62.0)
+	if not is_equal_approx(float(photo.call("get_fov")), 62.0):
+		failures.append("PhotoMode.set_fov(62) did not stick.")
+	if not (photo.call("capture_photo") is String):
+		failures.append("PhotoMode.capture_photo() did not return a String.")
+	(photo as Node).free()
+
+
+func _check_codex_panel_script(entries: Variant, failures: Array[String]) -> void:
+	var script: Variant = load("res://scripts/codex_panel.gd")
+	if not (script is GDScript):
+		failures.append("codex_panel.gd did not load as a GDScript.")
+		return
+	var panel: Variant = (script as GDScript).new()
+	if panel == null or not (panel is CanvasLayer):
+		failures.append("CodexPanel is not a CanvasLayer.")
+		return
+	root.add_child(panel as CanvasLayer)
+	if not panel.has_signal("close_requested"):
+		failures.append("CodexPanel has no close_requested signal.")
+	for method in ["set_entries", "select_entry", "get_selected_id", "open", "close"]:
+		if not panel.has_method(method):
+			failures.append("CodexPanel has no %s()." % method)
+	if entries is Array:
+		panel.call("set_entries", entries)
+		if int(panel.call("get_entry_count")) != (entries as Array).size():
+			failures.append("CodexPanel.get_entry_count() does not match the entries.")
+		if not (entries as Array).is_empty():
+			var first: Variant = (entries as Array)[0]
+			if first is Dictionary:
+				var first_id := str((first as Dictionary).get("id", ""))
+				panel.call("select_entry", first_id)
+				if str(panel.call("get_selected_id")) != first_id:
+					failures.append("CodexPanel.select_entry() did not stick.")
+	panel.call("open")
+	if not bool(panel.call("is_open")):
+		failures.append("CodexPanel.open() did not open the panel.")
+	panel.call("close")
+	if bool(panel.call("is_open")):
+		failures.append("CodexPanel.close() did not close the panel.")
+	(panel as Node).free()
+
+
+func _check_m3_1_main_methods(failures: Array[String]) -> void:
+	var script: Variant = load("res://scripts/main.gd")
+	if not (script is GDScript):
+		failures.append("main.gd did not load as a GDScript.")
+		return
+	var host: Variant = (script as GDScript).new()
+	if host == null or not (host is Node3D):
+		failures.append("main.gd did not instantiate as a Node3D.")
+		return
+	for method in [
+		"_apply_sun_time",
+		"_set_cutaway_mode",
+		"_set_cutaway_position",
+		"_sculpt_at_screen_position",
+		"_set_photo_mode",
+		"_toggle_codex",
+	]:
+		if not host.has_method(method):
+			failures.append("main.gd has no %s()." % method)
+	(host as Node).free()
 
 
 ## Contract for the construction-FX element footprints emitted by keep-gd.

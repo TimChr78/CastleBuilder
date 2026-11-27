@@ -42,8 +42,11 @@ pub use keep_core::command::{
 // The structural assessment, style packs and curated sites are the same types
 // the core and the game host use, so the wire protocol never carries a drifting
 // copy of the validation vocabulary (architecture sections 6.1 and 7.6).
+pub use keep_core::codex::CodexEntry;
 pub use keep_core::document::RangeKind;
+pub use keep_core::document::TerrainBrushKind;
 pub use keep_core::historian::{HistorianFinding, HistorianReport};
+pub use keep_core::interior::{SectionAxis, SectionPlane};
 pub use keep_core::proposal::{
     ActivityEntry, AgentParticipant, AgentPermission, AgentRequest, AgentState, Proposal,
     ProposalStatus, RequestStatus,
@@ -151,6 +154,25 @@ pub struct ListStylesResponse {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GetStyleResponse {
     pub style: StylePack,
+}
+
+/// Result of the `list_codex` tool and the `keep://codex` resource.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexListResponse {
+    pub count: usize,
+    pub entries: Vec<CodexEntry>,
+}
+
+/// Arguments for the `get_codex_entry` tool.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexEntryArgs {
+    pub id: String,
+}
+
+/// Result of the `get_codex_entry` tool and the `keep://codex/{id}` resource.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexEntryResponse {
+    pub entry: CodexEntry,
 }
 
 /// Result of the `get_site` tool: the active site plus every curated site.
@@ -421,6 +443,23 @@ pub fn element_summaries(document: &CastleDocument) -> Vec<ElementSummary> {
                 passage_height_mm: None,
                 depth_mm: Some(ditch.depth_mm),
             },
+            Element::TerrainSculpt(sculpt) => ElementSummary {
+                id: sculpt.id,
+                kind: "terrain_sculpt".to_string(),
+                name: sculpt.name.clone(),
+                height_mm: 0,
+                thickness_mm: 0,
+                start_mm: None,
+                end_mm: None,
+                centre_mm: Some(sculpt.centre_mm),
+                radius_mm: Some(sculpt.radius_mm),
+                length_mm: None,
+                plan: None,
+                orientation_deg: None,
+                passage_width_mm: None,
+                passage_height_mm: None,
+                depth_mm: Some(sculpt.delta_mm),
+            },
             Element::Keep(keep) => ElementSummary {
                 id: keep.id,
                 kind: "keep".to_string(),
@@ -511,6 +550,9 @@ pub struct RenderPlanRequest {
     /// empty arguments object renders the top plan as documented.
     #[serde(default = "default_plan_view")]
     pub view: String,
+    /// Optional dollhouse cutaway plane. Omitted means no section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<SectionPlane>,
 }
 
 fn default_plan_view() -> String {
@@ -521,6 +563,7 @@ impl Default for RenderPlanRequest {
     fn default() -> Self {
         Self {
             view: default_plan_view(),
+            section: None,
         }
     }
 }
@@ -856,6 +899,67 @@ fn get_style_schema() -> serde_json::Value {
             "style": style_pack_schema()
         },
         "required": ["style"]
+    })
+}
+
+fn codex_entry_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "title": { "type": "string" },
+            "category": { "type": "string" },
+            "period": { "type": "string" },
+            "summary": { "type": "string" },
+            "body": { "type": "string" },
+            "citations": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "related_style_ids": {
+                "type": "array",
+                "items": { "type": "string" }
+            }
+        },
+        "required": [
+            "id", "title", "category", "period", "summary", "body",
+            "citations", "related_style_ids"
+        ]
+    })
+}
+
+fn list_codex_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "entries": {
+                "type": "array",
+                "items": codex_entry_schema()
+            }
+        },
+        "required": ["count", "entries"]
+    })
+}
+
+fn codex_entry_args_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string", "minLength": 1 }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    })
+}
+
+fn codex_entry_response_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "entry": codex_entry_schema()
+        },
+        "required": ["entry"]
     })
 }
 
@@ -1232,6 +1336,29 @@ fn operation_schema() -> serde_json::Value {
                 },
                 "required": ["op", "id"],
                 "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "op": { "const": "sculpt_terrain" },
+                    "ref_id": ref_id,
+                    "name": { "type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS },
+                    "kind": { "type": "string", "enum": ["raise", "lower", "flatten", "smooth"] },
+                    "centre_mm": int_pair_schema(),
+                    "radius_mm": {
+                        "type": "integer",
+                        "minimum": keep_core::command::MIN_SCULPT_RADIUS_MM,
+                        "maximum": keep_core::command::MAX_SCULPT_RADIUS_MM
+                    },
+                    "delta_mm": {
+                        "type": "integer",
+                        "minimum": keep_core::command::MIN_FLATTEN_TARGET_MM,
+                        "maximum": keep_core::command::MAX_FLATTEN_TARGET_MM,
+                        "description": "Raise/lower height delta, flatten target elevation or smooth strength in permille. Bounds depend on kind."
+                    }
+                },
+                "required": ["op", "name", "kind", "centre_mm", "radius_mm", "delta_mm"],
+                "additionalProperties": false
             }
         ]
     })
@@ -1284,6 +1411,38 @@ pub fn tool_definitions() -> serde_json::Value {
                         "type": "string",
                         "enum": ["top_plan", "elevation_north"],
                         "default": "top_plan"
+                    },
+                    "section": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "mode": { "const": "off" }
+                                },
+                                "required": ["mode"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "mode": { "const": "horizontal" },
+                                    "y_mm": { "type": "integer" }
+                                },
+                                "required": ["mode", "y_mm"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "mode": { "const": "vertical" },
+                                    "axis": { "type": "string", "enum": ["x", "z"] },
+                                    "pos_mm": { "type": "integer" }
+                                },
+                                "required": ["mode", "axis", "pos_mm"],
+                                "additionalProperties": false
+                            }
+                        ],
+                        "description": "Optional dollhouse cutaway plane. Omit to render with no section."
                     }
                 },
                 "additionalProperties": false
@@ -1570,6 +1729,34 @@ pub fn tool_definitions() -> serde_json::Value {
             "description": "Read recent session activity (requests, proposals, agents and tool use), optionally limited to the newest `limit` entries (default 50, max 200). Read-only.",
             "inputSchema": ACTIVITY_FEED_ARGS_SCHEMA(),
             "outputSchema": ACTIVITY_FEED_RESPONSE_SCHEMA(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "list_codex",
+            "description": "List every historical codex entry compiled into this build, in reading order. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "outputSchema": list_codex_schema(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "get_codex_entry",
+            "description": "Read one historical codex entry by id, including its body, citations and related style packs. Read-only.",
+            "inputSchema": codex_entry_args_schema(),
+            "outputSchema": codex_entry_response_schema(),
             "annotations": {
                 "readOnlyHint": true,
                 "destructiveHint": false,
@@ -1921,16 +2108,163 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<RenderPlanRequest>(json!({})).unwrap(),
             RenderPlanRequest {
-                view: "top_plan".into()
+                view: "top_plan".into(),
+                section: None,
             }
         );
         assert_eq!(RenderPlanRequest::default().view, "top_plan");
+        assert_eq!(RenderPlanRequest::default().section, None);
         assert_eq!(
             serde_json::from_value::<RenderPlanRequest>(json!({ "view": "elevation_north" }))
                 .unwrap()
                 .view,
             "elevation_north"
         );
+    }
+
+    #[test]
+    fn render_plan_request_accepts_horizontal_and_vertical_sections() {
+        let horizontal: RenderPlanRequest = serde_json::from_value(json!({
+            "view": "top_plan",
+            "section": { "mode": "horizontal", "y_mm": 4_000 }
+        }))
+        .unwrap();
+        assert_eq!(
+            horizontal.section,
+            Some(SectionPlane::Horizontal { y_mm: 4_000 })
+        );
+
+        let vertical: RenderPlanRequest = serde_json::from_value(json!({
+            "view": "top_plan",
+            "section": { "mode": "vertical", "axis": "z", "pos_mm": -2_500 }
+        }))
+        .unwrap();
+        assert_eq!(
+            vertical.section,
+            Some(SectionPlane::Vertical {
+                axis: SectionAxis::Z,
+                pos_mm: -2_500
+            })
+        );
+
+        let off: RenderPlanRequest =
+            serde_json::from_value(json!({ "section": { "mode": "off" } })).unwrap();
+        assert_eq!(off.section, Some(SectionPlane::Off));
+
+        // Omitted section round-trips as `None` and is not serialised.
+        let omitted = serde_json::to_value(RenderPlanRequest::default()).unwrap();
+        assert!(omitted.get("section").is_none());
+    }
+
+    #[test]
+    fn sculpt_terrain_operation_schema_documents_the_brush() {
+        let schema = operation_schema();
+        let one_of = schema["oneOf"].as_array().expect("oneOf array");
+        let sculpt = one_of
+            .iter()
+            .find(|entry| entry["properties"]["op"]["const"] == "sculpt_terrain")
+            .expect("sculpt_terrain schema");
+        assert_eq!(
+            sculpt["properties"]["kind"]["enum"],
+            json!(["raise", "lower", "flatten", "smooth"])
+        );
+        assert_eq!(
+            sculpt["properties"]["radius_mm"]["minimum"],
+            keep_core::command::MIN_SCULPT_RADIUS_MM
+        );
+        assert_eq!(
+            sculpt["properties"]["radius_mm"]["maximum"],
+            keep_core::command::MAX_SCULPT_RADIUS_MM
+        );
+        assert_eq!(
+            sculpt["required"],
+            json!(["op", "name", "kind", "centre_mm", "radius_mm", "delta_mm"])
+        );
+        assert_eq!(sculpt["additionalProperties"], false);
+        assert_eq!(sculpt["properties"]["centre_mm"]["minItems"], 2);
+
+        // The wire operation itself round-trips through the same schema.
+        let operation: Operation = serde_json::from_value(json!({
+            "op": "sculpt_terrain",
+            "ref_id": "mound",
+            "name": "Mound",
+            "kind": "raise",
+            "centre_mm": [0, 0],
+            "radius_mm": 6_000,
+            "delta_mm": 1_500
+        }))
+        .unwrap();
+        assert!(matches!(
+            operation,
+            Operation::SculptTerrain {
+                kind: TerrainBrushKind::Raise,
+                radius_mm: 6_000,
+                delta_mm: 1_500,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn codex_schemas_and_wire_types_round_trip() {
+        let list = list_codex_schema();
+        assert_eq!(list["properties"]["count"]["type"], "integer");
+        assert_eq!(
+            list["properties"]["entries"]["items"]["required"],
+            json!([
+                "id",
+                "title",
+                "category",
+                "period",
+                "summary",
+                "body",
+                "citations",
+                "related_style_ids"
+            ])
+        );
+
+        assert_eq!(codex_entry_args_schema()["required"], json!(["id"]));
+        assert_eq!(codex_entry_args_schema()["additionalProperties"], false);
+        assert_eq!(codex_entry_response_schema()["required"], json!(["entry"]));
+
+        let entry = keep_core::codex::find_codex_entry("baltic_brick").expect("codex entry");
+        let response = CodexEntryResponse {
+            entry: entry.clone(),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["entry"]["id"], "baltic_brick");
+        assert_eq!(
+            serde_json::from_value::<CodexEntryResponse>(value).unwrap(),
+            response
+        );
+
+        let list_response = CodexListResponse {
+            count: 1,
+            entries: vec![entry],
+        };
+        let value = serde_json::to_value(&list_response).unwrap();
+        assert_eq!(value["count"], 1);
+        assert_eq!(
+            serde_json::from_value::<CodexListResponse>(value).unwrap(),
+            list_response
+        );
+
+        assert_eq!(
+            serde_json::from_value::<CodexEntryArgs>(json!({ "id": "baltic_brick" })).unwrap(),
+            CodexEntryArgs {
+                id: "baltic_brick".into()
+            }
+        );
+
+        for schema in [
+            list_codex_schema(),
+            codex_entry_args_schema(),
+            codex_entry_response_schema(),
+        ] {
+            let text = serde_json::to_string(&schema).unwrap();
+            let reparsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(reparsed, schema);
+        }
     }
 
     #[test]
@@ -1959,7 +2293,9 @@ mod tests {
                 "list_requests",
                 "ack_request",
                 "reply_request",
-                "get_activity_feed"
+                "get_activity_feed",
+                "list_codex",
+                "get_codex_entry"
             ]
         );
         for tool in tools {
@@ -2272,6 +2608,28 @@ mod tests {
                 .unwrap()
                 .contains(&json!("historian_before"))
         );
+
+        // M3.1 codex reads are pure reads, so hosts may auto-approve them.
+        assert_eq!(tools[19]["name"], "list_codex");
+        assert_eq!(tools[19]["annotations"]["readOnlyHint"], true);
+        assert_eq!(
+            tools[19]["outputSchema"]["properties"]["entries"]["items"]["properties"]["citations"]
+                ["type"],
+            "array"
+        );
+        assert_eq!(tools[20]["name"], "get_codex_entry");
+        assert_eq!(tools[20]["annotations"]["readOnlyHint"], true);
+        assert_eq!(tools[20]["inputSchema"]["required"], json!(["id"]));
+
+        // The render_plan input schema documents the optional section plane.
+        let section = &tools[2]["inputSchema"]["properties"]["section"];
+        let modes: Vec<&str> = section["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|branch| branch["properties"]["mode"]["const"].as_str().unwrap())
+            .collect();
+        assert_eq!(modes, vec!["off", "horizontal", "vertical"]);
 
         // Round-trip every tool definition through JSON to make sure it is
         // actually serialisable and stable.

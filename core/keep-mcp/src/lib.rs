@@ -10,10 +10,11 @@
 //! error case and atomic rollback can be unit tested without a subprocess. The
 //! `keep-mcp` binary is a small stdin/stdout loop around it.
 
+use keep_core::codex::{find_codex_entry, list_codex_entries};
 use keep_core::command::AuthorId;
 use keep_core::document::CastleDocument;
 use keep_core::historian::assess_historian;
-use keep_core::plan_render::{render_plan_svg, PlanView};
+use keep_core::plan_render::{render_plan_svg, render_plan_svg_with_section, PlanView};
 use keep_core::proposal::AgentPermission;
 use keep_core::session::Session;
 use keep_core::style::StylePack;
@@ -21,12 +22,12 @@ use keep_core::terrain::SiteTerrain;
 use keep_core::validate::validate_structure;
 use keep_proto::{
     AckRequestArgs, ActivityFeedArgs, ActivityFeedResponse, ApplyOperationsRequest,
-    ApplyOperationsResponse, AssessmentResponse, BeginProposalRequest, ElementListResponse,
-    GetCastleResponse, GetHistoryResponse, GetSiteResponse, GetStyleResponse, HistoryEntry,
-    ListProposalsResponse, ListStylesResponse, ProposalResponse, RenderPlanRequest,
-    RenderPlanResponse, RenderViewRequest, RenderViewResponse, ReplyRequestArgs,
-    RequestListResponse, RequestResponse, StageProposalOpsRequest, SubmitProposalRequest,
-    UndoResponse,
+    ApplyOperationsResponse, AssessmentResponse, BeginProposalRequest, CodexEntryArgs,
+    CodexEntryResponse, CodexListResponse, ElementListResponse, GetCastleResponse,
+    GetHistoryResponse, GetSiteResponse, GetStyleResponse, HistoryEntry, ListProposalsResponse,
+    ListStylesResponse, ProposalResponse, RenderPlanRequest, RenderPlanResponse, RenderViewRequest,
+    RenderViewResponse, ReplyRequestArgs, RequestListResponse, RequestResponse, SectionPlane,
+    StageProposalOpsRequest, SubmitProposalRequest, UndoResponse,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -239,6 +240,7 @@ impl McpServer {
             "tools/list" => Ok(json!({ "tools": keep_proto::tool_definitions() })),
             "tools/call" => return Some(self.handle_tool_call(id, &params)),
             "resources/list" => Ok(resources_list()),
+            "resources/templates/list" => Ok(resources_templates_list()),
             "resources/read" => self.handle_resource_read(&params),
             _ => {
                 return Some(error_response(
@@ -295,6 +297,10 @@ impl McpServer {
                 .tool_get_style(arguments)
                 .map(|value| tool_result(&value)),
             "get_site" => self.tool_get_site().map(|value| tool_result(&value)),
+            "list_codex" => self.tool_list_codex().map(|value| tool_result(&value)),
+            "get_codex_entry" => self
+                .tool_get_codex_entry(arguments)
+                .map(|value| tool_result(&value)),
             "begin_proposal" => self
                 .tool_begin_proposal(arguments)
                 .map(|value| tool_result(&value)),
@@ -440,6 +446,14 @@ impl McpServer {
                     .map_err(|error| format!("invalid render_view response: {error}"))?;
                 Ok(image_tool_result(&response))
             }
+            // The codex is static reference data compiled into keep-core, so it
+            // is answered locally in live mode too. Forwarding it made these
+            // calls fail against a game that has no such control method
+            // (M3.1 H2).
+            "list_codex" => self.tool_list_codex().map(|value| tool_result(&value)),
+            "get_codex_entry" => self
+                .tool_get_codex_entry(arguments)
+                .map(|value| tool_result(&value)),
             _ => self
                 .call_live(name, arguments)
                 .map(|value| tool_result(&value)),
@@ -492,7 +506,12 @@ impl McpServer {
                 ))
             }
         };
-        let svg = render_plan_svg(self.session.document(), self.session.terrain(), view);
+        let svg = render_plan_svg_with_section(
+            self.session.document(),
+            self.session.terrain(),
+            view,
+            request.section.unwrap_or(SectionPlane::Off),
+        );
         let response = RenderPlanResponse {
             view: view_name.to_string(),
             document_hash: hex_hash(self.session.document().document_hash()),
@@ -644,6 +663,28 @@ impl McpServer {
         })
     }
 
+    /// Every historical codex entry, in stable reading order.
+    fn tool_list_codex(&self) -> Result<CodexListResponse, String> {
+        let entries = list_codex_entries();
+        Ok(CodexListResponse {
+            count: entries.len(),
+            entries,
+        })
+    }
+
+    /// One historical codex entry by id.
+    fn tool_get_codex_entry(&self, arguments: Value) -> Result<CodexEntryResponse, String> {
+        let args: CodexEntryArgs = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        let entry = find_codex_entry(&args.id).ok_or_else(|| {
+            format!(
+                "unknown codex id '{}'",
+                truncate_message_field(&args.id, 64)
+            )
+        })?;
+        Ok(CodexEntryResponse { entry })
+    }
+
     /// Begin a draft proposal overlay owned by this agent.
     fn tool_begin_proposal(&mut self, arguments: Value) -> Result<ProposalResponse, String> {
         let request: BeginProposalRequest = serde_json::from_value(arguments)
@@ -740,6 +781,11 @@ impl McpServer {
         let Some(uri) = params.get("uri").and_then(Value::as_str) else {
             return Err((code::INVALID_PARAMS, "missing resource uri".into()));
         };
+        // The codex is compiled into keep-core, so serve it locally in both
+        // modes instead of asking the running game (M3.1 H2).
+        if uri == "keep://codex" || uri.starts_with("keep://codex/") {
+            return self.read_codex_resource(uri);
+        }
         if self.is_live() {
             return self.handle_live_resource_read(uri);
         }
@@ -802,6 +848,31 @@ impl McpServer {
                 format!("unknown resource: {other}"),
             )),
         }
+    }
+
+    /// Serve a codex resource from the compiled `keep-core` data. Works in both
+    /// offline and live mode because the codex never depends on the running
+    /// game (M3.1 H2).
+    fn read_codex_resource(&self, uri: &str) -> Result<Value, (i64, String)> {
+        if uri == "keep://codex" {
+            let codex = self
+                .tool_list_codex()
+                .map_err(|message| (code::INTERNAL_ERROR, message))?;
+            let text = serde_json::to_string_pretty(&codex)
+                .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?;
+            return Ok(resource_contents(uri, "application/json", text));
+        }
+        let id = &uri["keep://codex/".len()..];
+        let entry = find_codex_entry(id).ok_or_else(|| {
+            (
+                code::RESOURCE_NOT_FOUND,
+                format!("unknown codex entry: {}", truncate_message_field(id, 64)),
+            )
+        })?;
+        let response = CodexEntryResponse { entry };
+        let text = serde_json::to_string_pretty(&response)
+            .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?;
+        Ok(resource_contents(uri, "application/json", text))
     }
 
     /// Serve a resource from the running game (M1.3 H4). The offline dummy
@@ -882,7 +953,7 @@ fn initialize_result() -> Value {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Keepwright castle sidecar. Use get_castle, list_elements, render_plan, apply_operations, undo and get_history, plus get_assessment (optional style_id), list_styles, get_style and get_site for structural, historical and style reads. Use begin_proposal, stage_proposal_ops and submit_proposal to propose edits for the human to accept in-game (list_proposals shows their status). Use list_requests, ack_request and reply_request to work the player request inbox, and get_activity_feed for recent session activity. render_view needs live mode; render_plan works offline."
+        "instructions": "Keepwright castle sidecar. Use get_castle, list_elements, render_plan, apply_operations, undo and get_history, plus get_assessment (optional style_id), list_styles, get_style, get_site, list_codex and get_codex_entry for structural, historical, style and codex reads. Use begin_proposal, stage_proposal_ops and submit_proposal to propose edits for the human to accept in-game (list_proposals shows their status). Use list_requests, ack_request and reply_request to work the player request inbox, and get_activity_feed for recent session activity. render_view needs live mode; render_plan works offline."
     })
 }
 
@@ -932,6 +1003,12 @@ fn resources_list() -> Value {
                 "mimeType": "application/json"
             },
             {
+                "uri": "keep://codex",
+                "name": "Historical codex",
+                "description": "Every historical codex entry with its category, period, summary, body, citations and related style packs.",
+                "mimeType": "application/json"
+            },
+            {
                 "uri": "keep://styles/edwardian_welsh",
                 "name": "Edwardian Welsh style pack",
                 "description": "Curated dimension, slenderness, batter, plinth and flanking rules with source notes.",
@@ -941,6 +1018,19 @@ fn resources_list() -> Value {
                 "uri": "keep://styles/baltic_brick",
                 "name": "Baltic brick style pack",
                 "description": "Curated brick dimension, slenderness, batter, plinth and flanking rules with source notes.",
+                "mimeType": "application/json"
+            }
+        ]
+    })
+}
+
+fn resources_templates_list() -> Value {
+    json!({
+        "resourceTemplates": [
+            {
+                "uriTemplate": "keep://codex/{id}",
+                "name": "Historical codex entry",
+                "description": "One historical codex entry by stable snake_case id, with body, citations and related style packs.",
                 "mimeType": "application/json"
             }
         ]
@@ -1175,11 +1265,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_nineteen_tools_with_schemas() {
+    fn tools_list_exposes_twenty_one_tools_with_schemas() {
         let mut server = server();
         let response = call(&mut server, 4, "tools/list", json!({}));
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 21);
         for tool in tools {
             assert!(tool["inputSchema"].is_object());
             assert!(tool["outputSchema"].is_object());
@@ -1207,7 +1297,9 @@ mod tests {
                 "list_requests",
                 "ack_request",
                 "reply_request",
-                "get_activity_feed"
+                "get_activity_feed",
+                "list_codex",
+                "get_codex_entry"
             ]
         );
     }
@@ -1329,6 +1421,183 @@ mod tests {
         assert!(message.contains("invalid view"));
         let after = structured(&mut server, "get_castle", json!({}));
         assert_eq!(before["document_hash"], after["document_hash"]);
+    }
+
+    #[test]
+    fn render_plan_accepts_horizontal_and_vertical_sections() {
+        let mut server = server();
+        let off = structured(&mut server, "render_plan", json!({ "view": "top_plan" }));
+
+        let horizontal = structured(
+            &mut server,
+            "render_plan",
+            json!({
+                "view": "top_plan",
+                "section": { "mode": "horizontal", "y_mm": 4_000 }
+            }),
+        );
+        assert_eq!(horizontal["view"], "top_plan");
+        assert_eq!(horizontal["mime_type"], "image/svg+xml");
+        assert!(horizontal["svg"].as_str().unwrap().starts_with("<svg "));
+        assert!(horizontal["svg"]
+            .as_str()
+            .unwrap()
+            .trim_end()
+            .ends_with("</svg>"));
+        assert_ne!(
+            horizontal["svg"], off["svg"],
+            "horizontal section should change the drawing"
+        );
+
+        let vertical = structured(
+            &mut server,
+            "render_plan",
+            json!({
+                "view": "top_plan",
+                "section": { "mode": "vertical", "axis": "z", "pos_mm": 0 }
+            }),
+        );
+        assert_eq!(vertical["view"], "top_plan");
+        assert_eq!(vertical["mime_type"], "image/svg+xml");
+        assert!(vertical["svg"].as_str().unwrap().starts_with("<svg "));
+        assert_ne!(
+            vertical["svg"], off["svg"],
+            "vertical section should change the drawing"
+        );
+    }
+
+    #[test]
+    fn apply_operations_supports_sculpt_terrain() {
+        let mut server = McpServer::new(true);
+        let applied = structured(
+            &mut server,
+            "apply_operations",
+            json!({
+                "operations": [{
+                    "op": "sculpt_terrain",
+                    "ref_id": "mound",
+                    "name": "Test mound",
+                    "kind": "raise",
+                    "centre_mm": [0, 0],
+                    "radius_mm": 6_000,
+                    "delta_mm": 1_500
+                }]
+            }),
+        );
+        assert_eq!(applied["applied_count"], 1);
+        assert_eq!(applied["created_ids"]["mound"], 1);
+
+        let castle = structured(&mut server, "get_castle", json!({}));
+        let sculpt = castle["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["kind"] == "terrain_sculpt")
+            .expect("sculpt summarised");
+        assert_eq!(sculpt["name"], "Test mound");
+        assert_eq!(sculpt["centre_mm"], json!([0, 0]));
+        assert_eq!(sculpt["radius_mm"], 6_000);
+        assert_eq!(sculpt["depth_mm"], 1_500);
+
+        // Invalid brush bounds are refused atomically.
+        let before = structured(&mut server, "get_castle", json!({}));
+        let message = tool_error_message(
+            &mut server,
+            "apply_operations",
+            json!({
+                "operations": [{
+                    "op": "sculpt_terrain",
+                    "name": "Too small",
+                    "kind": "raise",
+                    "centre_mm": [0, 0],
+                    "radius_mm": 100,
+                    "delta_mm": 1_500
+                }]
+            }),
+        );
+        assert!(message.contains("radius_mm"), "got {message}");
+        let after = structured(&mut server, "get_castle", json!({}));
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn list_codex_and_get_codex_entry_serve_the_catalogue() {
+        let mut server = server();
+        let list = structured(&mut server, "list_codex", json!({}));
+        let entries = list["entries"].as_array().unwrap();
+        assert_eq!(list["count"], entries.len());
+        assert_eq!(entries.len(), 8);
+        assert_eq!(entries[0]["id"], "battered_plinth");
+        assert_eq!(entries[0]["category"], "Masonry");
+        assert!(!entries[0]["citations"].as_array().unwrap().is_empty());
+
+        let entry = structured(
+            &mut server,
+            "get_codex_entry",
+            json!({ "id": "baltic_brick" }),
+        );
+        assert_eq!(entry["entry"]["id"], "baltic_brick");
+        assert_eq!(
+            entry["entry"]["title"],
+            "Teutonic Baltic Brick Gothic (1280–1410)"
+        );
+        assert!(entry["entry"]["body"].as_str().unwrap().len() > 100);
+        assert!(entry["entry"]["related_style_ids"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("baltic_brick")));
+
+        let message =
+            tool_error_message(&mut server, "get_codex_entry", json!({ "id": "unknown" }));
+        assert!(message.contains("unknown codex id"), "got {message}");
+        let message = tool_error_message(&mut server, "get_codex_entry", json!({}));
+        assert!(message.contains("invalid arguments"), "got {message}");
+    }
+
+    #[test]
+    fn codex_resources_serve_the_catalogue_and_one_entry() {
+        let mut server = server();
+        let response = call(
+            &mut server,
+            50,
+            "resources/read",
+            json!({ "uri": "keep://codex" }),
+        );
+        let contents = &response["result"]["contents"][0];
+        assert_eq!(contents["mimeType"], "application/json");
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["count"], 8);
+        assert_eq!(parsed["entries"][0]["id"], "battered_plinth");
+
+        let response = call(
+            &mut server,
+            51,
+            "resources/read",
+            json!({ "uri": "keep://codex/baltic_brick" }),
+        );
+        let contents = &response["result"]["contents"][0];
+        assert_eq!(contents["uri"], "keep://codex/baltic_brick");
+        assert_eq!(contents["mimeType"], "application/json");
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["entry"]["id"], "baltic_brick");
+        assert_eq!(
+            parsed["entry"]["title"],
+            "Teutonic Baltic Brick Gothic (1280–1410)"
+        );
+
+        let response = call(
+            &mut server,
+            52,
+            "resources/read",
+            json!({ "uri": "keep://codex/not_a_real_entry" }),
+        );
+        assert_eq!(response["error"]["code"], code::RESOURCE_NOT_FOUND);
+
+        // The template is advertised for clients that enumerate them.
+        let response = call(&mut server, 53, "resources/templates/list", json!({}));
+        let templates = response["result"]["resourceTemplates"].as_array().unwrap();
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0]["uriTemplate"], "keep://codex/{id}");
     }
 
     #[test]
@@ -1884,7 +2153,7 @@ mod tests {
         let mut server = server();
         let response = call(&mut server, 5, "resources/list", json!({}));
         let resources = response["result"]["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 9);
+        assert_eq!(resources.len(), 10);
         assert_eq!(resources[0]["uri"], "keep://castle/document");
         assert_eq!(resources[1]["uri"], "keep://castle/save");
         assert_eq!(resources[1]["mimeType"], "application/json");
@@ -1892,8 +2161,9 @@ mod tests {
         assert_eq!(resources[4]["uri"], "keep://castle/assessment");
         assert_eq!(resources[5]["uri"], "keep://session/requests");
         assert_eq!(resources[6]["uri"], "keep://session/activity");
-        assert_eq!(resources[7]["uri"], "keep://styles/edwardian_welsh");
-        assert_eq!(resources[8]["uri"], "keep://styles/baltic_brick");
+        assert_eq!(resources[7]["uri"], "keep://codex");
+        assert_eq!(resources[8]["uri"], "keep://styles/edwardian_welsh");
+        assert_eq!(resources[9]["uri"], "keep://styles/baltic_brick");
         assert_eq!(resources[4]["mimeType"], "application/json");
 
         let document = call(
@@ -2987,6 +3257,40 @@ mod tests {
     }
 
     #[test]
+    fn live_render_plan_forwards_the_section_plane() {
+        let mock = spawn_mock(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "view": "top_plan",
+                "document_hash": "0123456789abcdef",
+                "mime_type": "image/svg+xml",
+                "svg": "<svg></svg>"
+            }
+        })]);
+        let requests = Arc::clone(&mock.requests);
+        let mut server = McpServer::live(&mock.url, "token", AgentPermission::DirectEdit).unwrap();
+        let plan = structured(
+            &mut server,
+            "render_plan",
+            json!({
+                "view": "top_plan",
+                "section": { "mode": "vertical", "axis": "x", "pos_mm": 1_000 }
+            }),
+        );
+        assert_eq!(plan["svg"], "<svg></svg>");
+        mock.finish();
+
+        let requests = requests.lock().unwrap();
+        let request = &requests[0];
+        assert!(request.contains("\"method\":\"render_plan\""));
+        assert!(request.contains("\"section\""));
+        assert!(request.contains("\"mode\":\"vertical\""));
+        assert!(request.contains("\"axis\":\"x\""));
+        assert!(request.contains("\"pos_mm\":1000"));
+    }
+
+    #[test]
     fn live_mode_rejects_non_loopback_urls() {
         for url in [
             "http://example.com:8765",
@@ -3281,6 +3585,64 @@ mod tests {
         );
         let message = response["error"]["message"].as_str().unwrap();
         assert!(message.contains("--offline mode"), "got {message}");
+    }
+
+    #[test]
+    fn live_codex_tools_and_resources_answer_locally_without_the_http_backend() {
+        // Port 1 refuses connections immediately, so any accidental forwarding
+        // to the game control server would surface as a tool error here.
+        let mut server =
+            McpServer::live("http://127.0.0.1:1", "token", AgentPermission::DirectEdit).unwrap();
+
+        let listed = structured(&mut server, "list_codex", json!({}));
+        assert_eq!(listed["count"], 8);
+        assert_eq!(listed["entries"].as_array().unwrap().len(), 8);
+
+        let entry = structured(
+            &mut server,
+            "get_codex_entry",
+            json!({ "id": "baltic_brick" }),
+        );
+        assert_eq!(entry["entry"]["id"], "baltic_brick");
+
+        let list = call(
+            &mut server,
+            40,
+            "resources/read",
+            json!({ "uri": "keep://codex" }),
+        );
+        let contents = &list["result"]["contents"][0];
+        assert_eq!(contents["mimeType"], "application/json");
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["entries"].as_array().unwrap().len(), 8);
+
+        let one = call(
+            &mut server,
+            41,
+            "resources/read",
+            json!({ "uri": "keep://codex/baltic_brick" }),
+        );
+        let contents = &one["result"]["contents"][0];
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["entry"]["id"], "baltic_brick");
+    }
+
+    #[test]
+    fn live_codex_error_message_truncates_untrusted_ids() {
+        let mut server =
+            McpServer::live("http://127.0.0.1:1", "token", AgentPermission::DirectEdit).unwrap();
+        let long_id = "x".repeat(200);
+        let response = call(
+            &mut server,
+            42,
+            "resources/read",
+            json!({ "uri": format!("keep://codex/{long_id}") }),
+        );
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(
+            message.len() < 128,
+            "unknown-id message must be truncated, got {message}"
+        );
     }
 
     #[test]

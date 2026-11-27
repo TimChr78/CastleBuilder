@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::{
     validate_element, BatteredWall, CastleDocument, Ditch, Element, ElementId, Gatehouse, Keep,
-    Opening, OpeningKind, Range, RangeKind, RoundTower, TowerPlan,
+    Opening, OpeningKind, Range, RangeKind, RoundTower, TerrainBrushKind, TerrainSculpt, TowerPlan,
 };
 
 // ---------------------------------------------------------------------------
@@ -165,6 +165,27 @@ pub const MAX_RANGE_WALL_HEIGHT_MM: i64 = 30_000;
 pub const MIN_ROOF_PITCH_DEG: i64 = 5;
 /// Steepest accepted pitched roof, in degrees.
 pub const MAX_ROOF_PITCH_DEG: i64 = 70;
+
+/// Terrain sculpt radius bounds, in millimetres.
+pub const MIN_SCULPT_RADIUS_MM: i64 = 2_000;
+/// See [`MIN_SCULPT_RADIUS_MM`].
+pub const MAX_SCULPT_RADIUS_MM: i64 = 30_000;
+/// Sculpt centres must stay inside the curated site, in millimetres.
+pub const MIN_SCULPT_COORD_MM: i64 = -110_000;
+/// See [`MIN_SCULPT_COORD_MM`].
+pub const MAX_SCULPT_COORD_MM: i64 = 110_000;
+/// Raise/lower delta bounds, in millimetres.
+pub const MIN_SCULPT_DELTA_MM: i64 = 250;
+/// See [`MIN_SCULPT_DELTA_MM`].
+pub const MAX_SCULPT_DELTA_MM: i64 = 10_000;
+/// Flatten target-elevation bounds, in millimetres.
+pub const MIN_FLATTEN_TARGET_MM: i64 = -15_000;
+/// See [`MIN_FLATTEN_TARGET_MM`].
+pub const MAX_FLATTEN_TARGET_MM: i64 = 25_000;
+/// Smooth strength bounds, in permille.
+pub const MIN_SMOOTH_STRENGTH_PERMILLE: i64 = 100;
+/// See [`MIN_SMOOTH_STRENGTH_PERMILLE`].
+pub const MAX_SMOOTH_STRENGTH_PERMILLE: i64 = 1_000;
 
 // ---------------------------------------------------------------------------
 // Authors
@@ -339,6 +360,16 @@ pub enum CommandOp {
         roof_pitch_deg: Option<i32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation_deg: Option<i32>,
+    },
+    /// Sculpt the site terrain with an authoritative brush.
+    SculptTerrain {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        name: String,
+        kind: TerrainBrushKind,
+        centre_mm: [i64; 2],
+        radius_mm: i64,
+        delta_mm: i64,
     },
     /// Modify one existing element. Only the fields that are `Some` change.
     ModifyElement {
@@ -625,6 +656,57 @@ impl CommandOp {
                     MIN_ORIENTATION_DEG,
                     MAX_ORIENTATION_DEG,
                 )?;
+            }
+            Self::SculptTerrain {
+                ref_id,
+                name,
+                kind,
+                centre_mm,
+                radius_mm,
+                delta_mm,
+            } => {
+                *name = sanitize_name(name)?;
+                validate_optional_ref_id(ref_id)?;
+                for value in centre_mm.iter() {
+                    check_dimension(
+                        "centre_mm",
+                        *value,
+                        MIN_SCULPT_COORD_MM,
+                        MAX_SCULPT_COORD_MM,
+                    )?;
+                }
+                check_dimension(
+                    "radius_mm",
+                    *radius_mm,
+                    MIN_SCULPT_RADIUS_MM,
+                    MAX_SCULPT_RADIUS_MM,
+                )?;
+                match kind {
+                    TerrainBrushKind::Raise | TerrainBrushKind::Lower => {
+                        check_dimension(
+                            "delta_mm",
+                            *delta_mm,
+                            MIN_SCULPT_DELTA_MM,
+                            MAX_SCULPT_DELTA_MM,
+                        )?;
+                    }
+                    TerrainBrushKind::Flatten => {
+                        check_dimension(
+                            "delta_mm",
+                            *delta_mm,
+                            MIN_FLATTEN_TARGET_MM,
+                            MAX_FLATTEN_TARGET_MM,
+                        )?;
+                    }
+                    TerrainBrushKind::Smooth => {
+                        check_dimension(
+                            "delta_mm",
+                            *delta_mm,
+                            MIN_SMOOTH_STRENGTH_PERMILLE,
+                            MAX_SMOOTH_STRENGTH_PERMILLE,
+                        )?;
+                    }
+                }
             }
             Self::ModifyElement {
                 height_mm,
@@ -1176,6 +1258,7 @@ pub(crate) fn execute_batch(
     let mut created_ditches = 0usize;
     let mut created_keeps = 0usize;
     let mut created_ranges = 0usize;
+    let mut created_sculpts = 0usize;
     let mut created_openings = 0usize;
     let mut modified = 0usize;
     let mut deleted = 0usize;
@@ -1381,6 +1464,28 @@ pub(crate) fn execute_batch(
                     .ok_or(CommandError::IdOverflow)?;
                 created_ranges += 1;
             }
+            CommandOp::SculptTerrain {
+                ref_id,
+                name,
+                kind,
+                centre_mm,
+                radius_mm,
+                delta_mm,
+            } => {
+                let sculpt =
+                    TerrainSculpt::new(next_element_id, name, kind, centre_mm, radius_mm, delta_mm);
+                let id = sculpt.id;
+                inverse
+                    .created_elements
+                    .push(Element::TerrainSculpt(sculpt.clone()));
+                document.add_terrain_sculpt(sculpt);
+                register_ref(&mut created_ids, ref_id, id)?;
+                touched.insert(id);
+                next_element_id = next_element_id
+                    .checked_add(1)
+                    .ok_or(CommandError::IdOverflow)?;
+                created_sculpts += 1;
+            }
             CommandOp::ModifyElement {
                 id,
                 height_mm,
@@ -1403,6 +1508,7 @@ pub(crate) fn execute_batch(
                         Element::Ditch(_) => "ditch",
                         Element::Keep(_) => "keep",
                         Element::Range(_) => "range",
+                        Element::TerrainSculpt(_) => "terrain_sculpt",
                     },
                 };
                 match &previous {
@@ -1466,6 +1572,26 @@ pub(crate) fn execute_batch(
                         }
                         if plan.is_some() {
                             return Err(invalid("plan"));
+                        }
+                    }
+                    Element::TerrainSculpt(_) => {
+                        if height_mm.is_some() {
+                            return Err(invalid("height_mm"));
+                        }
+                        if thickness_mm.is_some() {
+                            return Err(invalid("thickness_mm"));
+                        }
+                        if batter_mm.is_some() {
+                            return Err(invalid("batter_mm"));
+                        }
+                        if plinth_height_mm.is_some() {
+                            return Err(invalid("plinth_height_mm"));
+                        }
+                        if plan.is_some() {
+                            return Err(invalid("plan"));
+                        }
+                        if orientation_deg.is_some() {
+                            return Err(invalid("orientation_deg"));
                         }
                     }
                 }
@@ -1539,6 +1665,7 @@ pub(crate) fn execute_batch(
                             range.orientation_deg = orientation_deg;
                         }
                     }
+                    Element::TerrainSculpt(_) => {}
                 }
                 // Re-validate the resulting element against the same bounds a
                 // create command would enforce, including cross-field invariants
@@ -1626,6 +1753,7 @@ pub(crate) fn execute_batch(
         created_ditches,
         created_keeps,
         created_ranges,
+        created_sculpts,
         created_openings,
         modified,
         deleted,
@@ -1721,6 +1849,7 @@ fn batch_summary(
     ditches: usize,
     keeps: usize,
     ranges: usize,
+    sculpts: usize,
     openings: usize,
     modified: usize,
     deleted: usize,
@@ -1743,6 +1872,9 @@ fn batch_summary(
     }
     if ranges > 0 {
         parts.push(format!("+{ranges} range{}", plural(ranges)));
+    }
+    if sculpts > 0 {
+        parts.push(format!("+{sculpts} terrain sculpt{}", plural(sculpts)));
     }
     if openings > 0 {
         parts.push(format!("+{openings} arrow loop{}", plural(openings)));
@@ -1871,6 +2003,138 @@ mod tests {
             tall.validated(),
             Err(CommandError::DimensionOutOfRange {
                 field: "height_mm",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn sculpt_terrain_ops_validate_apply_hash_and_undo_cleanly() {
+        use crate::terrain::SiteTerrain;
+
+        let base = CastleDocument::new();
+        let op = CommandOp::SculptTerrain {
+            ref_id: Some("mound".into()),
+            name: "Motte mound".into(),
+            kind: TerrainBrushKind::Raise,
+            centre_mm: [0, 0],
+            radius_mm: 10_000,
+            delta_mm: 2_000,
+        };
+        assert!(op.validated().is_ok());
+        let value = serde_json::to_value(&op).unwrap();
+        assert_eq!(value["op"], "sculpt_terrain");
+        assert_eq!(serde_json::from_value::<CommandOp>(value).unwrap(), op);
+
+        let applied = execute_batch(&base, 1, &[op]).expect("sculpt applies");
+        assert_eq!(applied.document.terrain_sculpts().count(), 1);
+        assert_ne!(base.document_hash(), applied.document.document_hash());
+        assert_eq!(applied.touched_elements, vec![1]);
+
+        let terrain = SiteTerrain::m0a_promontory();
+        let sculpts: Vec<&TerrainSculpt> = applied.document.terrain_sculpts().collect();
+        let raised = terrain.with_earthworks(&[], &sculpts);
+        assert!(raised.height_mm(0, 0) > terrain.height_mm(0, 0));
+
+        // Undo restores the exact document and therefore the exact hash.
+        let mut restored = applied.document.clone();
+        applied.inverse.apply(&mut restored);
+        assert_eq!(restored, base);
+        assert_eq!(restored.document_hash(), base.document_hash());
+
+        // Delete + inverse also round-trips a sculpt.
+        let deleted = execute_batch(
+            &applied.document,
+            applied.next_element_id,
+            &[CommandOp::DeleteElement { id: 1 }],
+        )
+        .expect("sculpt deletes");
+        assert_eq!(deleted.document.terrain_sculpts().count(), 0);
+        let mut undeleted = deleted.document.clone();
+        deleted.inverse.apply(&mut undeleted);
+        assert_eq!(undeleted, applied.document);
+    }
+
+    #[test]
+    fn sculpt_terrain_bounds_depend_on_the_brush_kind() {
+        let base = CommandOp::SculptTerrain {
+            ref_id: None,
+            name: "Brush".into(),
+            kind: TerrainBrushKind::Raise,
+            centre_mm: [0, 0],
+            radius_mm: 8_000,
+            delta_mm: 1_000,
+        };
+        assert!(base.validated().is_ok());
+
+        let mut invalid = base.clone();
+        if let CommandOp::SculptTerrain {
+            radius_mm,
+            centre_mm,
+            ..
+        } = &mut invalid
+        {
+            *radius_mm = MIN_SCULPT_RADIUS_MM - 1;
+            centre_mm[0] = MAX_SCULPT_COORD_MM + 1;
+        }
+        assert!(matches!(
+            invalid.validated(),
+            Err(CommandError::DimensionOutOfRange {
+                field: "centre_mm",
+                ..
+            })
+        ));
+        if let CommandOp::SculptTerrain {
+            centre_mm,
+            radius_mm,
+            ..
+        } = &mut invalid
+        {
+            centre_mm[0] = 0;
+            *radius_mm = MIN_SCULPT_RADIUS_MM - 1;
+        }
+        assert!(matches!(
+            invalid.validated(),
+            Err(CommandError::DimensionOutOfRange {
+                field: "radius_mm",
+                ..
+            })
+        ));
+
+        let mut raise = base.clone();
+        if let CommandOp::SculptTerrain { delta_mm, .. } = &mut raise {
+            *delta_mm = MIN_SCULPT_DELTA_MM - 1;
+        }
+        assert!(matches!(
+            raise.validated(),
+            Err(CommandError::DimensionOutOfRange {
+                field: "delta_mm",
+                ..
+            })
+        ));
+
+        let mut flatten = base.clone();
+        if let CommandOp::SculptTerrain { kind, delta_mm, .. } = &mut flatten {
+            *kind = TerrainBrushKind::Flatten;
+            *delta_mm = MIN_FLATTEN_TARGET_MM - 1;
+        }
+        assert!(matches!(
+            flatten.validated(),
+            Err(CommandError::DimensionOutOfRange {
+                field: "delta_mm",
+                ..
+            })
+        ));
+
+        let mut smooth = base;
+        if let CommandOp::SculptTerrain { kind, delta_mm, .. } = &mut smooth {
+            *kind = TerrainBrushKind::Smooth;
+            *delta_mm = MAX_SMOOTH_STRENGTH_PERMILLE + 1;
+        }
+        assert!(matches!(
+            smooth.validated(),
+            Err(CommandError::DimensionOutOfRange {
+                field: "delta_mm",
                 ..
             })
         ));

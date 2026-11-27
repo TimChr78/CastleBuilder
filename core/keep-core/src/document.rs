@@ -32,6 +32,7 @@ pub enum ElementKind {
     Ditch,
     Keep,
     Range,
+    TerrainSculpt,
 }
 
 /// Plan shape of a tower footprint. Defaults to [`TowerPlan::Round`] so saves
@@ -548,6 +549,58 @@ impl Ditch {
     }
 }
 
+/// How an authoritative terrain sculpt modifies the ground.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerrainBrushKind {
+    /// Raise the ground toward the brush centre.
+    Raise,
+    /// Lower the ground toward the brush centre.
+    Lower,
+    /// Flatten the ground toward a target elevation.
+    Flatten,
+    /// Smooth the ground toward the local neighbourhood mean.
+    Smooth,
+}
+
+/// An authoritative earthwork brush applied to the site terrain.
+///
+/// Sculpts are semantic document elements: they hash into the document, are
+/// undone by [`crate::command::InverseRecord`], and are re-applied
+/// deterministically whenever terrain is sampled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerrainSculpt {
+    pub id: ElementId,
+    pub name: String,
+    pub kind: TerrainBrushKind,
+    /// Brush centre on the plan, `[x, z]` millimetres.
+    pub centre_mm: [i64; 2],
+    pub radius_mm: i64,
+    /// Height delta in millimetres. For `Flatten` this is the target
+    /// elevation; for `Smooth` it is a strength in permille.
+    pub delta_mm: i64,
+}
+
+impl TerrainSculpt {
+    pub fn new(
+        id: ElementId,
+        name: impl Into<String>,
+        kind: TerrainBrushKind,
+        centre_mm: [i64; 2],
+        radius_mm: i64,
+        delta_mm: i64,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            kind,
+            centre_mm,
+            radius_mm,
+            delta_mm,
+        }
+    }
+}
+
 /// One architectural element.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Element {
@@ -557,6 +610,7 @@ pub enum Element {
     Ditch(Ditch),
     Keep(Keep),
     Range(Range),
+    TerrainSculpt(TerrainSculpt),
 }
 
 impl Element {
@@ -568,6 +622,7 @@ impl Element {
             Self::Ditch(d) => d.id,
             Self::Keep(k) => k.id,
             Self::Range(r) => r.id,
+            Self::TerrainSculpt(s) => s.id,
         }
     }
 
@@ -579,6 +634,7 @@ impl Element {
             Self::Ditch(d) => &d.name,
             Self::Keep(k) => &k.name,
             Self::Range(r) => &r.name,
+            Self::TerrainSculpt(s) => &s.name,
         }
     }
 
@@ -590,6 +646,21 @@ impl Element {
             Self::Ditch(_) => ElementKind::Ditch,
             Self::Keep(_) => ElementKind::Keep,
             Self::Range(_) => ElementKind::Range,
+            Self::TerrainSculpt(_) => ElementKind::TerrainSculpt,
+        }
+    }
+
+    /// Stable snake_case name for the element kind, used by summaries and the
+    /// plan renderer.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::BatteredWall(_) => "battered_wall",
+            Self::RoundTower(_) => "round_tower",
+            Self::Gatehouse(_) => "gatehouse",
+            Self::Ditch(_) => "ditch",
+            Self::Keep(_) => "keep",
+            Self::Range(_) => "range",
+            Self::TerrainSculpt(_) => "terrain_sculpt",
         }
     }
 }
@@ -649,6 +720,12 @@ impl CastleDocument {
         id
     }
 
+    pub fn add_terrain_sculpt(&mut self, sculpt: TerrainSculpt) -> ElementId {
+        let id = sculpt.id;
+        self.insert(Element::TerrainSculpt(sculpt));
+        id
+    }
+
     /// Every keep in stable id order.
     pub fn keeps(&self) -> impl Iterator<Item = &Keep> {
         self.elements.values().filter_map(|element| match element {
@@ -669,6 +746,14 @@ impl CastleDocument {
     pub fn ditches(&self) -> impl Iterator<Item = &Ditch> {
         self.elements.values().filter_map(|element| match element {
             Element::Ditch(ditch) => Some(ditch),
+            _ => None,
+        })
+    }
+
+    /// Every terrain sculpt in stable id order.
+    pub fn terrain_sculpts(&self) -> impl Iterator<Item = &TerrainSculpt> {
+        self.elements.values().filter_map(|element| match element {
+            Element::TerrainSculpt(sculpt) => Some(sculpt),
             _ => None,
         })
     }
@@ -897,6 +982,15 @@ impl CastleDocument {
                     bytes.extend_from_slice(&r.orientation_deg.to_le_bytes());
                     bytes.extend_from_slice(&r.seed.to_le_bytes());
                 }
+                Element::TerrainSculpt(s) => {
+                    bytes.push(7);
+                    bytes.extend_from_slice(&s.id.to_le_bytes());
+                    bytes.push(s.kind as u8);
+                    bytes.extend_from_slice(&s.centre_mm[0].to_le_bytes());
+                    bytes.extend_from_slice(&s.centre_mm[1].to_le_bytes());
+                    bytes.extend_from_slice(&s.radius_mm.to_le_bytes());
+                    bytes.extend_from_slice(&s.delta_mm.to_le_bytes());
+                }
             }
         }
         bytes.extend_from_slice(&(self.openings.len() as u64).to_le_bytes());
@@ -1064,6 +1158,18 @@ pub(crate) fn validate_element(element: &Element) -> Result<(), CommandError> {
                 wall_height_mm: Some(range.wall_height_mm),
                 roof_pitch_deg: Some(range.roof_pitch_deg),
                 orientation_deg: Some(range.orientation_deg),
+            }
+            .validated()?;
+        }
+        Element::TerrainSculpt(sculpt) => {
+            sanitize_name(&sculpt.name)?;
+            CommandOp::SculptTerrain {
+                ref_id: None,
+                name: sculpt.name.clone(),
+                kind: sculpt.kind,
+                centre_mm: sculpt.centre_mm,
+                radius_mm: sculpt.radius_mm,
+                delta_mm: sculpt.delta_mm,
             }
             .validated()?;
         }

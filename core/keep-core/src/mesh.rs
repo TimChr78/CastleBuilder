@@ -93,7 +93,8 @@ impl SceneData {
 /// displays the earthworks described by the document.
 pub fn build_scene(document: &CastleDocument, terrain: &SiteTerrain) -> SceneData {
     let ditches: Vec<&crate::document::Ditch> = document.ditches().collect();
-    let effective_terrain = terrain.with_ditches(&ditches);
+    let sculpts: Vec<&crate::document::TerrainSculpt> = document.terrain_sculpts().collect();
+    let effective_terrain = terrain.with_earthworks(&ditches, &sculpts);
     let terrain = &effective_terrain;
 
     let blocks = generate_blocks(document, terrain);
@@ -277,7 +278,7 @@ fn build_chunk(
                     emit_box(&mut lod1, &aabb, &params, terrain, occupancy);
                 }
             }
-            Element::Ditch(_) => {}
+            Element::Ditch(_) | Element::TerrainSculpt(_) => {}
         }
     }
 

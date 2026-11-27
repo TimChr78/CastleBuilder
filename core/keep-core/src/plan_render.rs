@@ -7,6 +7,7 @@
 //! design sits on the sloping site.
 
 use crate::document::{CastleDocument, Element};
+use crate::interior::{build_interior_props, SectionAxis, SectionPlane};
 use crate::terrain::SiteTerrain;
 use libm::{round, sqrt};
 
@@ -21,9 +22,19 @@ pub enum PlanView {
 
 /// Render `document` over `terrain` as a standalone SVG document.
 pub fn render_plan_svg(document: &CastleDocument, terrain: &SiteTerrain, view: PlanView) -> String {
+    render_plan_svg_with_section(document, terrain, view, SectionPlane::Off)
+}
+
+/// Render `document` over `terrain` with an optional dollhouse cutaway plane.
+pub fn render_plan_svg_with_section(
+    document: &CastleDocument,
+    terrain: &SiteTerrain,
+    view: PlanView,
+    section: SectionPlane,
+) -> String {
     match view {
-        PlanView::TopPlan => render_top_plan(document, terrain),
-        PlanView::ElevationNorth => render_elevation(document, terrain),
+        PlanView::TopPlan => render_top_plan(document, terrain, section),
+        PlanView::ElevationNorth => render_elevation(document, terrain, section),
     }
 }
 
@@ -77,6 +88,11 @@ const STYLE: &str = "<style>\n\
 .element-label{font-size:1.2;}\n\
 .scale-label{font-size:1.2;}\n\
 .north-label{font-size:1.4;font-weight:bold;}\n\
+.prop{fill:#e7d3a8;stroke:#7a5a2e;stroke-width:0.16;}\n\
+.prop-label{font-family:\"DejaVu Sans\",sans-serif;font-size:0.62;fill:#5b4526;}\n\
+.section-cut{fill:none;stroke:#b03a2e;stroke-width:0.5;stroke-dasharray:1.4 0.8;}\n\
+.section-label{font-family:\"DejaVu Sans\",sans-serif;font-size:1.05;font-weight:bold;fill:#8e2a22;}\n\
+.section-banner{fill:#f3e2c9;stroke:#b03a2e;stroke-width:0.22;}\n\
 </style>\n";
 
 /// Terrain or element bounds in metres.
@@ -169,6 +185,12 @@ impl Bounds {
                         ax.max(bx) + half,
                         az.max(bz) + half,
                     );
+                }
+                Element::TerrainSculpt(sculpt) => {
+                    let cx = sculpt.centre_mm[0] as f64 / 1000.0;
+                    let cz = sculpt.centre_mm[1] as f64 / 1000.0;
+                    let r = sculpt.radius_mm as f64 / 1000.0;
+                    include(cx - r, cz - r, cx + r, cz + r);
                 }
             }
         }
@@ -356,7 +378,11 @@ fn polygon_attr(points: &[(f64, f64)], to_svg: &dyn Fn(f64, f64) -> (f64, f64)) 
         .join(" ")
 }
 
-fn render_top_plan(document: &CastleDocument, terrain: &SiteTerrain) -> String {
+fn render_top_plan(
+    document: &CastleDocument,
+    terrain: &SiteTerrain,
+    section: SectionPlane,
+) -> String {
     // Crop to the castle plus a 20 m margin (10 m on each side). Only an empty
     // document falls back to the full terrain extent.
     let bounds = Bounds::elements(document)
@@ -641,6 +667,7 @@ fn render_top_plan(document: &CastleDocument, terrain: &SiteTerrain) -> String {
                 );
                 svg.push_str(&element_label(mid.0, mid.1, ditch.id, &ditch.name));
             }
+            Element::TerrainSculpt(_) => {}
         }
     }
 
@@ -702,12 +729,89 @@ fn render_top_plan(document: &CastleDocument, terrain: &SiteTerrain) -> String {
         ));
     }
 
+    svg.push_str(&render_top_section(
+        document, terrain, section, &bounds, &to_svg,
+    ));
     svg.push_str(&legend_and_scale(width, height, true, true));
     svg.push_str("</svg>\n");
     svg
 }
 
-fn render_elevation(document: &CastleDocument, terrain: &SiteTerrain) -> String {
+/// Draw the cutaway banner, section line and interior prop markers on a plan.
+fn render_top_section(
+    document: &CastleDocument,
+    terrain: &SiteTerrain,
+    section: SectionPlane,
+    bounds: &Bounds,
+    to_svg: &dyn Fn(f64, f64) -> (f64, f64),
+) -> String {
+    let mut out = String::new();
+    match section {
+        SectionPlane::Off => {}
+        SectionPlane::Horizontal { y_mm } => {
+            let label = format!("Section Y = {:.2} m (cutaway)", y_mm as f64 / 1000.0);
+            out.push_str(&format!(
+                "<rect class=\"section-banner\" x=\"4\" y=\"4\" width=\"58\" height=\"7\" rx=\"1\"/>\n\
+                 <text class=\"section-label\" x=\"5.5\" y=\"8.6\">{}</text>\n",
+                escape_xml(&label)
+            ));
+            // Only props below the cut plane are visible in the dollhouse.
+            for prop in build_interior_props(document, terrain) {
+                if prop.pos_mm[1] > y_mm {
+                    continue;
+                }
+                let p = to_svg(
+                    prop.pos_mm[0] as f64 / 1000.0,
+                    prop.pos_mm[2] as f64 / 1000.0,
+                );
+                out.push_str(&format!(
+                    "<rect class=\"prop\" x=\"{}\" y=\"{}\" width=\"0.9\" height=\"0.9\"/>\n",
+                    n(p.0 - 0.45),
+                    n(p.1 - 0.45)
+                ));
+                out.push_str(&format!(
+                    "<text class=\"prop-label\" x=\"{}\" y=\"{}\">{} {}</text>\n",
+                    n(p.0 + 0.6),
+                    n(p.1 - 0.6),
+                    escape_xml(prop.kind.kind_name()),
+                    escape_xml(&prop.room_type)
+                ));
+            }
+        }
+        SectionPlane::Vertical { axis, pos_mm } => {
+            let pos_m = pos_mm as f64 / 1000.0;
+            let axis_name = match axis {
+                SectionAxis::X => "X",
+                SectionAxis::Z => "Z",
+            };
+            let (a, b) = match axis {
+                SectionAxis::X => (to_svg(pos_m, bounds.min_z), to_svg(pos_m, bounds.max_z)),
+                SectionAxis::Z => (to_svg(bounds.min_x, pos_m), to_svg(bounds.max_x, pos_m)),
+            };
+            out.push_str(&format!(
+                "<line class=\"section-cut\" x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\"/>\n",
+                n(a.0),
+                n(a.1),
+                n(b.0),
+                n(b.1)
+            ));
+            out.push_str(&format!(
+                "<text class=\"section-label\" x=\"{}\" y=\"{}\">Section {} = {:.2} m</text>\n",
+                n(a.0 + 1.0),
+                n(a.1 + 3.0),
+                axis_name,
+                pos_m
+            ));
+        }
+    }
+    out
+}
+
+fn render_elevation(
+    document: &CastleDocument,
+    terrain: &SiteTerrain,
+    section: SectionPlane,
+) -> String {
     let bounds = Bounds::elements(document)
         .unwrap_or_else(|| Bounds::terrain(terrain))
         .padded(10.0);
@@ -768,7 +872,7 @@ fn render_elevation(document: &CastleDocument, terrain: &SiteTerrain) -> String 
                 max_y = max_y
                     .max(ground + (range.wall_height_mm + range.ridge_rise_mm()) as f64 / 1000.0);
             }
-            Element::Ditch(_) => {}
+            Element::Ditch(_) | Element::TerrainSculpt(_) => {}
         }
     }
     let world_h = (max_y - min_y).max(5.0);
@@ -957,7 +1061,7 @@ fn render_elevation(document: &CastleDocument, terrain: &SiteTerrain) -> String 
                 let label = to_svg(cx, ridge + 0.8);
                 svg.push_str(&element_label(label.0, label.1, range.id, &range.name));
             }
-            Element::Ditch(_) => {}
+            Element::Ditch(_) | Element::TerrainSculpt(_) => {}
         }
     }
 
@@ -985,15 +1089,61 @@ fn render_elevation(document: &CastleDocument, terrain: &SiteTerrain) -> String 
         svg.push_str(&element_label(label.0, label.1, opening.id, &opening.name));
     }
 
+    svg.push_str(&render_elevation_section(section, &bounds, &to_svg, height));
     svg.push_str(&legend_and_scale(width, height, false, false));
     svg.push_str("</svg>\n");
     svg
 }
 
+/// Annotate an elevation with the active section plane. A vertical X cut is
+/// drawn as a dashed line through the elevation; other planes are labelled.
+fn render_elevation_section(
+    section: SectionPlane,
+    bounds: &Bounds,
+    to_svg: &dyn Fn(f64, f64) -> (f64, f64),
+    height: f64,
+) -> String {
+    let mut out = String::new();
+    match section {
+        SectionPlane::Off => {}
+        SectionPlane::Horizontal { y_mm } => {
+            let label = format!("Section Y = {:.2} m (plan cutaway)", y_mm as f64 / 1000.0);
+            out.push_str(&format!(
+                "<text class=\"section-label\" x=\"4\" y=\"6\">{}</text>\n",
+                escape_xml(&label)
+            ));
+        }
+        SectionPlane::Vertical { axis, pos_mm } => {
+            let axis_name = match axis {
+                SectionAxis::X => "X",
+                SectionAxis::Z => "Z",
+            };
+            let pos_m = pos_mm as f64 / 1000.0;
+            if axis == SectionAxis::X {
+                let p = to_svg(pos_m, bounds.min_z);
+                out.push_str(&format!(
+                    "<line class=\"section-cut\" x1=\"{}\" y1=\"4\" x2=\"{}\" y2=\"{}\"/>\n",
+                    n(p.0),
+                    n(p.0),
+                    n(height - 4.0)
+                ));
+            }
+            out.push_str(&format!(
+                "<text class=\"section-label\" x=\"4\" y=\"6\">Section {} = {:.2} m</text>\n",
+                axis_name, pos_m
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{m0a_showcase_document, m0b_showcase_document, m1_edwardian_document};
+    use crate::fixtures::{
+        m0a_showcase_document, m0b_showcase_document, m1_edwardian_document, m2_baltic_document,
+    };
+    use crate::interior::{SectionAxis, SectionPlane};
 
     #[test]
     fn top_plan_is_valid_svg_with_labels_and_contours() {
@@ -1071,5 +1221,88 @@ mod tests {
         let elevation = render_plan_svg(&document, &terrain, PlanView::ElevationNorth);
         assert!(elevation.contains("class=\"gatehouse\""));
         assert_eq!(svg, render_plan_svg(&document, &terrain, PlanView::TopPlan));
+    }
+
+    #[test]
+    fn off_section_matches_the_classic_plan_render() {
+        let terrain = SiteTerrain::for_site("lake_island").unwrap();
+        let document = m2_baltic_document();
+        assert_eq!(
+            render_plan_svg(&document, &terrain, PlanView::TopPlan),
+            render_plan_svg_with_section(&document, &terrain, PlanView::TopPlan, SectionPlane::Off)
+        );
+    }
+
+    #[test]
+    fn horizontal_section_renders_a_cutaway_banner_props_and_room_labels() {
+        let terrain = SiteTerrain::for_site("lake_island").unwrap();
+        let document = m2_baltic_document();
+        let y_mm = terrain.height_mm(0, -1_000) + 5_000;
+        let svg = render_plan_svg_with_section(
+            &document,
+            &terrain,
+            PlanView::TopPlan,
+            SectionPlane::Horizontal { y_mm },
+        );
+        assert!(svg.starts_with("<svg "));
+        assert!(svg.trim_end().ends_with("</svg>"));
+        assert!(svg.contains(&format!(
+            "Section Y = {:.2} m (cutaway)",
+            y_mm as f64 / 1000.0
+        )));
+        assert!(svg.contains("class=\"section-banner\""));
+        assert!(svg.contains("class=\"prop\""));
+        assert!(svg.contains("class=\"prop-label\""));
+        assert!(svg.contains("undercroft"));
+        assert!(svg.contains("solar"));
+        // Props above the cut plane must be omitted from the dollhouse view.
+        let low = render_plan_svg_with_section(
+            &document,
+            &terrain,
+            PlanView::TopPlan,
+            SectionPlane::Horizontal { y_mm: i64::MIN + 1 },
+        );
+        assert!(!low.contains("class=\"prop\""));
+    }
+
+    #[test]
+    fn vertical_section_renders_a_dashed_cut_line_and_label_on_plan_and_elevation() {
+        let terrain = SiteTerrain::for_site("lake_island").unwrap();
+        let document = m2_baltic_document();
+        let plan = render_plan_svg_with_section(
+            &document,
+            &terrain,
+            PlanView::TopPlan,
+            SectionPlane::Vertical {
+                axis: SectionAxis::X,
+                pos_mm: 0,
+            },
+        );
+        assert!(plan.contains("class=\"section-cut\""));
+        assert!(plan.contains("Section X = 0.00 m"));
+
+        let z_plan = render_plan_svg_with_section(
+            &document,
+            &terrain,
+            PlanView::TopPlan,
+            SectionPlane::Vertical {
+                axis: SectionAxis::Z,
+                pos_mm: 2_500,
+            },
+        );
+        assert!(z_plan.contains("Section Z = 2.50 m"));
+
+        let elevation = render_plan_svg_with_section(
+            &document,
+            &terrain,
+            PlanView::ElevationNorth,
+            SectionPlane::Vertical {
+                axis: SectionAxis::X,
+                pos_mm: 0,
+            },
+        );
+        assert!(elevation.starts_with("<svg "));
+        assert!(elevation.contains("class=\"section-cut\""));
+        assert!(elevation.contains("Section X = 0.00 m"));
     }
 }

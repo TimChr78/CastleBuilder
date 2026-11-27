@@ -257,6 +257,18 @@ impl Session {
         &self.terrain
     }
 
+    /// The terrain as the player actually sees it: the bare site heightfield
+    /// with every ditch and terrain sculpt applied. Picking and the historian
+    /// must sample this surface rather than the unedited site, otherwise a
+    /// click on sculpted ground or a ditch hits the old, invisible surface
+    /// (M3.1 H1/M9).
+    pub fn effective_terrain(&self) -> SiteTerrain {
+        let ditches: Vec<&crate::document::Ditch> = self.document.ditches().collect();
+        let sculpts: Vec<&crate::document::TerrainSculpt> =
+            self.document.terrain_sculpts().collect();
+        self.terrain.with_earthworks(&ditches, &sculpts)
+    }
+
     pub fn history(&self) -> &[LoggedCommand] {
         &self.command_log
     }

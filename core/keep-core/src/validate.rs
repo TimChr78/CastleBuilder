@@ -73,10 +73,11 @@ pub fn validate_structure(
     let source = style.primary_source_note().to_string();
 
     // Footing, bedrock and slope checks must see the ground the player actually
-    // carved, not the pristine site. `with_ditches` returns a copy when there
+    // carved, not the pristine site. `with_earthworks` returns a copy when there
     // are no earthworks, so this stays cheap.
     let ditches: Vec<&crate::document::Ditch> = document.ditches().collect();
-    let effective_terrain = terrain.with_ditches(&ditches);
+    let sculpts: Vec<&crate::document::TerrainSculpt> = document.terrain_sculpts().collect();
+    let effective_terrain = terrain.with_earthworks(&ditches, &sculpts);
     let terrain = &effective_terrain;
 
     for element in document.elements() {
@@ -260,7 +261,7 @@ pub fn validate_structure(
                     });
                 }
             }
-            Element::RoundTower(_) | Element::Ditch(_) => {}
+            Element::RoundTower(_) | Element::Ditch(_) | Element::TerrainSculpt(_) => {}
         }
     }
 
