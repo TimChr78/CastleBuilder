@@ -1234,8 +1234,8 @@ mod tests {
         let scene = m0a_showcase();
         let average = average_triangles_per_block(&scene);
         assert!(
-            (2.0..=10.0).contains(&average),
-            "average {average} tris/block outside 2..=10"
+            (6.0..=10.0).contains(&average),
+            "average {average} tris/block outside 6..=10"
         );
         assert!(
             scene.triangle_count < scene.block_count * 12,

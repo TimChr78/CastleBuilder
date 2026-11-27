@@ -15,16 +15,32 @@ extends Camera3D
 @export var min_pitch := -0.10
 @export var max_pitch := 1.45
 @export var keyboard_pan_speed := 0.9
+## Radians per second for Q/E yaw and R/F pitch keyboard orbit.
+@export var keyboard_orbit_speed := 1.5
+@export var keyboard_pitch_speed := 1.1
+## Exponential zoom rate for the +/- keys (distance e-folds per second).
+@export var keyboard_zoom_rate := 1.6
+## W/A/S/D and arrow pan speed multiplier while Shift is held.
+@export var keyboard_boost := 2.5
 
-var _yaw := 0.65
-var _pitch := 0.34
-var _distance := 90.0
-var _focus := Vector3(0.0, 8.0, 0.0)
+const HOME_YAW := 0.65
+const HOME_PITCH := 0.34
+const HOME_DISTANCE := 90.0
+const HOME_FOCUS := Vector3(0.0, 8.0, 0.0)
+
+var _yaw := HOME_YAW
+var _pitch := HOME_PITCH
+var _distance := HOME_DISTANCE
+var _focus := HOME_FOCUS
 
 var _target_yaw := _yaw
 var _target_pitch := _pitch
 var _target_distance := _distance
 var _target_focus := _focus
+
+# Remembered site/castle framing for Home / reset_view().
+var _home_focus := HOME_FOCUS
+var _home_distance := HOME_DISTANCE
 
 var _drag_mode := 0 # 0 = none, 1 = orbit, 2 = pan
 var _drag_button := 0
@@ -51,10 +67,30 @@ func get_view_distance() -> float:
 
 func focus_on(point: Vector3, distance := -1.0) -> void:
 	_target_focus = point
+	_home_focus = point
 	if distance > 0.0:
 		_target_distance = clampf(distance, min_distance, max_distance)
+		_home_distance = _target_distance
 	elif _target_distance <= 0.0:
-		_target_distance = 90.0
+		_target_distance = HOME_DISTANCE
+		_home_distance = _target_distance
+
+
+## Re-frame the camera to the most recent site/castle framing and the default
+## orbit orientation. Bound to Home.
+func reset_view() -> void:
+	_target_focus = _home_focus
+	_target_distance = _home_distance
+	_target_yaw = HOME_YAW
+	_target_pitch = HOME_PITCH
+
+
+func _keyboard_allowed() -> bool:
+	var viewport := get_viewport()
+	if viewport == null:
+		return true
+	# Never steal movement keys from a focused text field, slider or button.
+	return viewport.gui_get_focus_owner() == null
 
 
 func _sync_immediate() -> void:
@@ -66,7 +102,8 @@ func _sync_immediate() -> void:
 
 
 func _process(delta: float) -> void:
-	_handle_keyboard_pan(delta)
+	if _keyboard_allowed():
+		_handle_keyboard_navigation(delta)
 
 	var t := 1.0 - exp(-smoothing * delta)
 	_yaw = lerp_angle(_yaw, _target_yaw, t)
@@ -86,16 +123,22 @@ func _apply_transform() -> void:
 	look_at(_focus, Vector3.UP)
 
 
+func _handle_keyboard_navigation(delta: float) -> void:
+	_handle_keyboard_pan(delta)
+	_handle_keyboard_orbit(delta)
+	_handle_keyboard_zoom(delta)
+
+
 func _handle_keyboard_pan(delta: float) -> void:
 	var x := 0.0
 	var z := 0.0
-	if Input.is_key_pressed(KEY_A):
+	if Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT):
 		x -= 1.0
-	if Input.is_key_pressed(KEY_D):
+	if Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT):
 		x += 1.0
-	if Input.is_key_pressed(KEY_W):
+	if Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP):
 		z += 1.0
-	if Input.is_key_pressed(KEY_S):
+	if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN):
 		z -= 1.0
 	if is_zero_approx(x) and is_zero_approx(z):
 		return
@@ -103,10 +146,64 @@ func _handle_keyboard_pan(delta: float) -> void:
 	var right := Vector3(cos(_yaw), 0.0, -sin(_yaw))
 	var forward := Vector3(-sin(_yaw), 0.0, -cos(_yaw))
 	var speed := maxf(_distance, 5.0) * keyboard_pan_speed * delta
+	if Input.is_key_pressed(KEY_SHIFT):
+		speed *= keyboard_boost
 	_target_focus += (right * x + forward * z) * speed
 
 
+func _handle_keyboard_orbit(delta: float) -> void:
+	var yaw_input := 0.0
+	if Input.is_key_pressed(KEY_Q):
+		yaw_input += 1.0
+	if Input.is_key_pressed(KEY_E):
+		yaw_input -= 1.0
+	_target_yaw += yaw_input * keyboard_orbit_speed * delta
+
+	var pitch_input := 0.0
+	if Input.is_key_pressed(KEY_R):
+		pitch_input += 1.0
+	if Input.is_key_pressed(KEY_F):
+		pitch_input -= 1.0
+	if not is_zero_approx(pitch_input):
+		_target_pitch = clampf(
+			_target_pitch + pitch_input * keyboard_pitch_speed * delta,
+			min_pitch,
+			max_pitch
+		)
+
+
+func _handle_keyboard_zoom(delta: float) -> void:
+	var zoom := 0.0
+	if (
+		Input.is_key_pressed(KEY_EQUAL)
+		or Input.is_key_pressed(KEY_PLUS)
+		or Input.is_key_pressed(KEY_KP_ADD)
+	):
+		zoom -= 1.0
+	if Input.is_key_pressed(KEY_MINUS) or Input.is_key_pressed(KEY_KP_SUBTRACT):
+		zoom += 1.0
+	if is_zero_approx(zoom):
+		return
+	_target_distance = clampf(
+		_target_distance * exp(zoom * keyboard_zoom_rate * delta),
+		min_distance,
+		max_distance
+	)
+
+
 func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventKey:
+		var key := event as InputEventKey
+		if (
+			key.pressed
+			and not key.echo
+			and key.keycode == KEY_HOME
+			and _keyboard_allowed()
+		):
+			reset_view()
+			get_viewport().set_input_as_handled()
+		return
+
 	if event is InputEventMouseButton:
 		var mouse_button := event as InputEventMouseButton
 		if mouse_button.pressed:

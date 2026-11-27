@@ -215,7 +215,11 @@ fn layout_wall(
         } else {
             0
         };
-        let expose_top = y1 >= top_y || (is_plinth && y1 >= plinth_top_y);
+        // Every course carries a top cap, not just the final course or the
+        // plinth ledge. Construction playback hides the course above while the
+        // active course rises, so exposing only the final cap would show a
+        // hollow, paper-thin shell mid-build.
+        let expose_top = true;
 
         // True sloped batter: evaluate the face at the course bed and its top
         // separately so stacked courses share an exact horizontal plane. The
@@ -1289,7 +1293,9 @@ fn layout_round_tower(tower: &RoundTower, terrain: &SiteTerrain, out: &mut Vec<B
         } else {
             0
         };
-        let expose_top = y1 >= top_y || (is_plinth && y1 >= plinth_top_y);
+        // Every course is capped; see `layout_wall` for why mid-build courses
+        // must expose their top face.
+        let expose_top = true;
         // Sloped batter: bed and top rings get their own radii so stacked
         // courses share an exact horizontal plane. The plinth projection stays
         // constant within the course and steps at the capped ledge.
@@ -1399,7 +1405,9 @@ fn layout_shaped_tower(
         } else {
             0
         };
-        let expose_top = y1 >= top_y || (is_plinth && y1 >= plinth_top_y);
+        // Every course is capped; see `layout_wall` for why mid-build courses
+        // must expose their top face.
+        let expose_top = true;
         let (r_out_bot, r_in_bot) =
             tower_face_radii(tower, thickness, foundation_y, total_height, y0, plinth);
         let (r_out_top, r_in_top) =
@@ -1573,36 +1581,28 @@ fn layout_shaped_tower(
                         role: BlockRole::Masonry,
                     });
                 }
-                // Straight rear gorge wall on the flat side of the D. It is
-                // trimmed to the arc's inner radius at each course (bottom and
-                // top separately) so battering never pushes rear stones into the
-                // curved shell.
+                // Straight rear gorge wall on the flat back of the D. The curved
+                // arc occupies `u >= 0`; the rear wall occupies `u in [-thickness, 0]`
+                // across the full outer width `[-r_out, +r_out]` (tapered from
+                // `r_out_bot` to `r_out_top`), closing flush against both ends of
+                // the arc with zero gap and zero overlapping volume.
                 let bond = if course_index % 2 == 0 { 0 } else { 475 };
-                if r_in_bot > 0 {
+                if r_out_bot > 0 {
                     let joints = joint_positions(
-                        -r_in_bot,
-                        r_in_bot,
+                        -r_out_bot,
+                        r_out_bot,
                         950,
                         bond,
                         element_seed,
                         course_index,
                         50_000,
                     );
+                    let col_count = joints.len().saturating_sub(1);
                     for (column, pair) in joints.windows(2).enumerate() {
                         let (v0_bot, v1_bot) = (pair[0], pair[1]);
-                        let v0_top = map_radius(v0_bot, r_in_bot, r_in_top);
-                        let v1_top = map_radius(v1_bot, r_in_bot, r_in_top);
+                        let v0_top = map_radius(v0_bot, r_out_bot, r_out_top);
+                        let v1_top = map_radius(v1_bot, r_out_bot, r_out_top);
                         if v1_bot <= v0_bot || v1_top <= v0_top {
-                            continue;
-                        }
-                        // Follow the arc's inner circle on the courtyard side:
-                        // the rear wall is full thickness at the centre and
-                        // tapers to nothing where it meets the arc, so the two
-                        // solids share one boundary with no overlapping volume.
-                        let u_inner = rear_wall_inner_face(
-                            v0_bot, v1_bot, r_in_bot, r_in_top, v0_top, v1_top, thickness,
-                        );
-                        if u_inner <= 0 {
                             continue;
                         }
                         let corners = dshaped_rear_corners(
@@ -1612,12 +1612,14 @@ fn layout_shaped_tower(
                             v1_bot,
                             v0_top,
                             v1_top,
-                            u_inner,
-                            0,
+                            -1,
+                            -thickness,
                             y0,
                             y1,
                         );
                         if !is_buried(&corners, terrain) {
+                            let expose_end0 = column == 0;
+                            let expose_end1 = column + 1 == col_count;
                             out.push(Block {
                                 element_id: tower.id,
                                 kind: ElementKind::RoundTower,
@@ -1640,7 +1642,7 @@ fn layout_shaped_tower(
                                     10_000 + column as i64,
                                     12,
                                 ),
-                                expose: [false, expose_top, true, true, true, true],
+                                expose: [false, expose_top, true, true, expose_end0, expose_end1],
                                 role: BlockRole::Masonry,
                             });
                         }
@@ -1741,31 +1743,6 @@ fn map_radius(value: i64, from: i64, to: i64) -> i64 {
     } else {
         round(value as f64 * to as f64 / from as f64) as i64
     }
-}
-
-/// Depth available to the straight rear wall at a given span. The wall fills
-/// the flat side but must stop at the arc's circular inner boundary, so its
-/// thickness tapers where that boundary curves back toward the chord.
-fn rear_wall_inner_face(
-    v0_bot: i64,
-    v1_bot: i64,
-    r_in_bot: i64,
-    r_in_top: i64,
-    v0_top: i64,
-    v1_top: i64,
-    thickness: i64,
-) -> i64 {
-    let available = |radius: i64, far: i64| -> i64 {
-        let r = radius.max(1) as f64;
-        let far = far as f64;
-        let squared = (r * r - far * far).max(0.0);
-        (sqrt(squared).floor() as i64).saturating_sub(20)
-    };
-    let far_bot = v0_bot.abs().max(v1_bot.abs());
-    let far_top = v0_top.abs().max(v1_top.abs());
-    available(r_in_bot, far_bot)
-        .min(available(r_in_top, far_top))
-        .min(thickness)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1874,14 +1851,21 @@ fn dshaped_rear_corners(
     ]
 }
 
-/// Lay out the gatehouse: two flanking drum towers plus a central block that
-/// starts above `passage_height_mm`, leaving a clear passage underneath.
+/// Lay out the gatehouse: two flanking drum towers, solid passage side walls
+/// between the passage and the towers, and a bridging chamber over a clear
+/// passage. The bridge is embedded into both towers, so no floating gap can
+/// appear, and every course is laid in running-bond ashlar across its width.
 fn layout_gatehouse(gatehouse: &Gatehouse, terrain: &SiteTerrain, out: &mut Vec<Block>) {
-    for tower in gatehouse.flank_towers() {
-        layout_tower(&tower, terrain, out);
+    let towers = gatehouse.flank_towers();
+    // The towers' plinth projects outward at ground level; the bridge has to
+    // span past that projection to stay buried in the drums.
+    let plinth_offset = towers[0].plinth_projection_mm.max(0);
+    for tower in &towers {
+        layout_tower(tower, terrain, out);
     }
 
     let ground = terrain.height_mm(gatehouse.centre_mm[0], gatehouse.centre_mm[1]);
+    let passage_half = gatehouse.passage_width_mm.max(1) / 2;
     let passage_top = ground + gatehouse.passage_height_mm.max(1);
     let top = ground + gatehouse.height_mm.max(1);
     if top <= passage_top {
@@ -1890,15 +1874,116 @@ fn layout_gatehouse(gatehouse: &Gatehouse, terrain: &SiteTerrain, out: &mut Vec<
 
     let dir = gatehouse.direction();
     let right = [-dir[1], dir[0]];
-    let half_depth = gatehouse.depth_mm.max(1) / 2;
-    // Meet the flanking towers' inner faces so the bridging block is connected.
-    let half_width = gatehouse.passage_width_mm.max(1) / 2 + 100;
+    // Keep the central bridge tucked cleanly between the two flanking drums so
+    // the rounded towers project proud on both approach and bailey sides.
+    let max_tucked_half_depth = (gatehouse.tower_radius_mm.max(1_000) * 65) / 100;
+    let half_depth = (gatehouse.depth_mm.max(1) / 2).min(max_tucked_half_depth);
+    // Reach 500 mm past the passage edge plus the tower plinth projection so
+    // both ends of the bridge bite into the drum shells. The tower faces recede
+    // with batter as they rise, so this stays embedded at every course and the
+    // old mid-air gap between bridge and towers cannot open up again.
+    let half_span = passage_half + 500 + plinth_offset;
     let element_seed = gatehouse.seed ^ CASTLE_SEED.rotate_left(23);
     let course_nominal = 450i64;
+    let nominal_block = 900i64;
     let total_height = (top - passage_top).max(1);
+
+    let point = |u: i64, v: i64, y: i64| -> [i64; 3] {
+        let x = gatehouse.centre_mm[0] as f64 + dir[0] * u as f64 + right[0] * v as f64;
+        let z = gatehouse.centre_mm[1] as f64 + dir[1] * u as f64 + right[1] * v as f64;
+        [round(x) as i64, y, round(z) as i64]
+    };
+
+    // Lower passage side walls: fill the band between the clear passage edge
+    // and the drum towers, from ground to the passage crown, on both sides.
+    // The wall rises in its own courses so the passage stays fully open.
+    let mut y1 = passage_top;
+    let mut side_course = 0i32;
+    while y1 > ground {
+        let y0 = (y1 - course_nominal).max(ground);
+        if y0 >= y1 {
+            break;
+        }
+        let course_index = -1 - side_course;
+        let bond = if side_course % 2 == 0 {
+            0
+        } else {
+            nominal_block / 2
+        };
+        for (side_index, sign) in [-1i64, 1].into_iter().enumerate() {
+            let (d0, d1) = if sign < 0 {
+                (-half_span, -passage_half)
+            } else {
+                (passage_half, half_span)
+            };
+            let joints = joint_positions(
+                -half_depth,
+                half_depth,
+                nominal_block,
+                bond,
+                element_seed,
+                course_index,
+                20_000 + side_index as i32 * 1_000,
+            );
+            for pair in joints.windows(2) {
+                let (u0, u1) = (pair[0], pair[1]);
+                if u1 <= u0 {
+                    continue;
+                }
+                let corners = [
+                    point(u0, d0, y0),
+                    point(u1, d0, y0),
+                    point(u1, d1, y0),
+                    point(u0, d1, y0),
+                    point(u0, d0, y1),
+                    point(u1, d0, y1),
+                    point(u1, d1, y1),
+                    point(u0, d1, y1),
+                ];
+                if is_buried(&corners, terrain) {
+                    continue;
+                }
+                let column = u0 + half_depth;
+                out.push(Block {
+                    element_id: gatehouse.id,
+                    kind: ElementKind::Gatehouse,
+                    course_index,
+                    run_pos_mm: (side_index as i64 + 1) * 1_000_000 + column,
+                    build_index: 0,
+                    corners_mm: corners,
+                    block_width_mm: (u1 - u0).max(1),
+                    block_height_mm: (y1 - y0).max(1),
+                    tint: stone_tint(hash01(
+                        element_seed,
+                        course_index as i64,
+                        side_index as i64 * 1_000 + column,
+                        11,
+                    )),
+                    age: (0.55 + 0.45 * (y0 - ground) as f32 / total_height as f32).min(1.0),
+                    jitter_seed: hash01(
+                        element_seed,
+                        course_index as i64,
+                        side_index as i64 * 1_000 + column,
+                        12,
+                    ),
+                    // Every vertical face is exposed: the outward face is
+                    // visible past the drum at the facades and buried inside
+                    // it near the passage. Top is always exposed so the rising
+                    // wall reads as solid during construction.
+                    expose: [false, true, true, true, true, true],
+                    role: BlockRole::Masonry,
+                });
+            }
+        }
+        y1 = y0;
+        side_course += 1;
+    }
+
+    // Bridging chamber above the passage. Each course is a row of running-bond
+    // ashlar blocks across the full lateral span, so the front and rear faces
+    // show real coursed stonework rather than one plank per bed.
     let mut course_index = 0i32;
     let mut y0 = passage_top;
-
     while y0 < top {
         let jitter = (hash01(element_seed, i64::from(course_index), 3, 0) - 0.5) * 40.0;
         let mut y1 = y0 + course_nominal + jitter as i64;
@@ -1908,58 +1993,72 @@ fn layout_gatehouse(gatehouse: &Gatehouse, terrain: &SiteTerrain, out: &mut Vec<
         if y1 <= y0 {
             break;
         }
-        let expose_top = y1 >= top;
         let t = ((y0 + y1) / 2 - passage_top) as f64 / total_height as f64;
         let lintel = course_index == 0;
-
-        let mut a = -half_depth;
-        let mut column = 0i32;
-        while a < half_depth {
-            let vary =
-                (hash01(element_seed, i64::from(course_index), i64::from(column), 7) - 0.5) * 360.0;
-            let mut next = a + 950 + vary as i64;
-            if next <= a + 250 {
-                next = a + 500;
+        // Stepped lintel trim: the two courses over the passage project past
+        // the facade, then step back to the wall plane, forming a corbelled
+        // band across the top of the gateway.
+        let corbel = match course_index {
+            0 => 180i64,
+            1 => 90i64,
+            _ => 0,
+        };
+        let u0 = -half_depth - corbel;
+        let u1 = half_depth + corbel;
+        let bond = if course_index % 2 == 0 {
+            0
+        } else {
+            nominal_block / 2
+        };
+        let joints = joint_positions(
+            -half_span,
+            half_span,
+            nominal_block,
+            bond,
+            element_seed,
+            course_index,
+            40_000,
+        );
+        for (column, pair) in joints.windows(2).enumerate() {
+            let (v0, v1) = (pair[0], pair[1]);
+            if v1 <= v0 {
+                continue;
             }
-            next = next.min(half_depth);
-            let point = |u: i64, v: i64, y: i64| -> [i64; 3] {
-                let x = gatehouse.centre_mm[0] as f64 + dir[0] * u as f64 + right[0] * v as f64;
-                let z = gatehouse.centre_mm[1] as f64 + dir[1] * u as f64 + right[1] * v as f64;
-                [round(x) as i64, y, round(z) as i64]
-            };
             let corners = [
-                point(a, -half_width, y0),
-                point(next, -half_width, y0),
-                point(next, half_width, y0),
-                point(a, half_width, y0),
-                point(a, -half_width, y1),
-                point(next, -half_width, y1),
-                point(next, half_width, y1),
-                point(a, half_width, y1),
+                point(u0, v0, y0),
+                point(u1, v0, y0),
+                point(u1, v1, y0),
+                point(u0, v1, y0),
+                point(u0, v0, y1),
+                point(u1, v0, y1),
+                point(u1, v1, y1),
+                point(u0, v1, y1),
             ];
-            if !is_buried(&corners, terrain) {
-                out.push(Block {
-                    element_id: gatehouse.id,
-                    kind: ElementKind::Gatehouse,
-                    course_index,
-                    run_pos_mm: a + half_depth,
-                    build_index: 0,
-                    corners_mm: corners,
-                    block_width_mm: (next - a).max(1),
-                    block_height_mm: (y1 - y0).max(1),
-                    tint: stone_tint(hash01(element_seed, course_index as i64, column as i64, 11)),
-                    age: (0.55 + 0.45 * t as f32).min(1.0),
-                    jitter_seed: hash01(element_seed, course_index as i64, column as i64, 12),
-                    expose: [false, expose_top, true, true, true, true],
-                    role: if lintel {
-                        BlockRole::Lintel
-                    } else {
-                        BlockRole::Masonry
-                    },
-                });
+            if is_buried(&corners, terrain) {
+                continue;
             }
-            a = next;
-            column += 1;
+            out.push(Block {
+                element_id: gatehouse.id,
+                kind: ElementKind::Gatehouse,
+                course_index,
+                run_pos_mm: v0 + half_span,
+                build_index: 0,
+                corners_mm: corners,
+                block_width_mm: (v1 - v0).max(1),
+                block_height_mm: (y1 - y0).max(1),
+                tint: stone_tint(hash01(element_seed, course_index as i64, column as i64, 11)),
+                age: (0.55 + 0.45 * t as f32).min(1.0),
+                jitter_seed: hash01(element_seed, course_index as i64, column as i64, 12),
+                // The lintel soffit is the visible passage ceiling. The side
+                // ends are buried in the drums near the passage and emerge past
+                // them at the facades, so all vertical faces stay exposed.
+                expose: [lintel, true, true, true, true, true],
+                role: if lintel {
+                    BlockRole::Lintel
+                } else {
+                    BlockRole::Masonry
+                },
+            });
         }
 
         course_index += 1;
@@ -2467,6 +2566,12 @@ mod tests {
                     e1[2] * e2[0] - e1[0] * e2[2],
                     e1[0] * e2[1] - e1[1] * e2[0],
                 ];
+                // The innermost splay jamb step tapers to a line, so its cap is
+                // a triangle stored in a quad slot. One triangle is degenerate
+                // and has no direction; the other still caps the stone.
+                if normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2] <= 1.0 {
+                    continue;
+                }
                 let face_centre = [
                     (p[0][0] + p[1][0] + p[2][0] + p[3][0]) * 0.25,
                     (p[0][1] + p[1][1] + p[2][1] + p[3][1]) * 0.25,
@@ -3145,7 +3250,7 @@ mod tests {
                 [dx * oc + dz * os, -dx * os + dz * oc]
             };
 
-            let inner_limit = (tower.radius_mm - tower.thickness_mm + 1) as f64;
+            let outer_limit = (tower.radius_mm + tower.plinth_projection_mm + 2) as f64;
             let mut rear_blocks: Vec<&Block> = Vec::new();
             let mut arc_blocks: Vec<&Block> = Vec::new();
             for block in &blocks {
@@ -3157,8 +3262,13 @@ mod tests {
                 if block.run_pos_mm >= 1_000_000 {
                     for point in local {
                         assert!(
-                            point[1].abs() <= inner_limit,
-                            "rear block reaches v={:.1} beyond r_in={inner_limit:.1}",
+                            point[0] <= 2.0,
+                            "rear block extends past u=0 into arc at u={:.1}",
+                            point[0]
+                        );
+                        assert!(
+                            point[1].abs() <= outer_limit,
+                            "rear block reaches v={:.1} beyond r_out={outer_limit:.1}",
                             point[1]
                         );
                     }
@@ -3243,5 +3353,131 @@ mod tests {
                 && max[1] > (ground + gatehouse.passage_height_mm) as f64
         });
         assert!(above, "no masonry bridges the passage");
+    }
+
+    #[test]
+    fn gatehouse_bridge_is_coursed_ashlar_buried_in_both_drums() {
+        let terrain = SiteTerrain::m0a_promontory();
+        let mut doc = CastleDocument::new();
+        let gatehouse = Gatehouse::new(1, "Gatehouse", [0, 0], 0);
+        let ground = terrain.height_mm(0, 0);
+        let passage_top = ground + gatehouse.passage_height_mm;
+        let passage_half = gatehouse.passage_width_mm / 2;
+        let towers = gatehouse.flank_towers();
+        let half_span = passage_half + 500 + towers[0].plinth_projection_mm;
+        doc.add_gatehouse(gatehouse.clone());
+        let blocks = generate_blocks(&doc, &terrain);
+
+        // The bridge starts exactly on the passage crown and spans the whole
+        // lateral width, so it is not stranded above a gap.
+        let mut bridge: std::collections::BTreeMap<i32, Vec<&Block>> =
+            std::collections::BTreeMap::new();
+        for block in blocks
+            .iter()
+            .filter(|b| b.kind == ElementKind::Gatehouse && b.course_index >= 0)
+        {
+            bridge.entry(block.course_index).or_default().push(block);
+        }
+        assert!(bridge.len() > 10, "bridge has too few courses");
+        let mut courses_with_bond = 0;
+        for (course, mut stones) in bridge {
+            stones.sort_by_key(|b| b.run_pos_mm);
+            assert!(stones[0].corners_mm[0][1] >= passage_top - 1);
+            let min_v = stones
+                .iter()
+                .flat_map(|b| b.corners_mm)
+                .map(|c| c[2])
+                .min()
+                .unwrap();
+            let max_v = stones
+                .iter()
+                .flat_map(|b| b.corners_mm)
+                .map(|c| c[2])
+                .max()
+                .unwrap();
+            assert_eq!(min_v, -half_span, "course {course} stops short on the left");
+            assert_eq!(max_v, half_span, "course {course} stops short on the right");
+            assert!(
+                stones.len() >= 4,
+                "course {course} is one full-width plank, not ashlar"
+            );
+            // Neighbouring stones share the exact same joint plane.
+            for pair in stones.windows(2) {
+                let (left, right) = (pair[0], pair[1]);
+                assert_eq!(left.corners_mm[3][2], right.corners_mm[0][2]);
+                assert_eq!(left.corners_mm[7][2], right.corners_mm[4][2]);
+            }
+            // Each end of the course is buried in the drum shell rather than
+            // stopping at its surface with a daylight gap.
+            let y = (stones[0].corners_mm[0][1] + stones[0].corners_mm[4][1]) / 2;
+            for tower in &towers {
+                let offset = (tower.centre_mm[1] - gatehouse.centre_mm[1]).abs();
+                let inner = junction::tower_inner_radius_at(tower, &terrain, y);
+                let outer = junction::tower_outer_radius_at(tower, &terrain, y);
+                let reach = offset - half_span;
+                assert!(
+                    reach > inner && reach < outer,
+                    "course {course}: bridge end {reach} mm from drum centre is outside shell {inner}..{outer}"
+                );
+            }
+            courses_with_bond += stones.len();
+        }
+        assert!(courses_with_bond > 40);
+
+        // Lower side walls fill the band from the passage edge out to the
+        // drums, from ground to the passage crown, on both sides.
+        let mut side_blocks: Vec<&Block> = blocks
+            .iter()
+            .filter(|b| b.kind == ElementKind::Gatehouse && b.course_index < 0)
+            .collect();
+        assert!(!side_blocks.is_empty(), "no passage side walls");
+        side_blocks.sort_by_key(|b| (b.course_index, b.run_pos_mm));
+        let low = side_blocks
+            .iter()
+            .map(|b| b.corners_mm[0][1])
+            .min()
+            .unwrap();
+        let high = side_blocks
+            .iter()
+            .map(|b| b.corners_mm[4][1])
+            .max()
+            .unwrap();
+        assert_eq!(low, ground);
+        assert_eq!(high, passage_top);
+        for sign in [-1i64, 1] {
+            let inner = sign * passage_half;
+            let outer = sign * half_span;
+            assert!(side_blocks.iter().any(|b| {
+                let v0 = b.corners_mm[0][2].min(b.corners_mm[3][2]);
+                let v1 = b.corners_mm[0][2].max(b.corners_mm[3][2]);
+                v0 == inner.min(outer) && v1 == inner.max(outer)
+            }));
+        }
+    }
+
+    #[test]
+    fn every_block_caps_its_course_with_a_top_face() {
+        let cases = [
+            (SiteTerrain::m0a_promontory(), m0a_showcase_document()),
+            (
+                SiteTerrain::for_site("coastal_headland").expect("curated site"),
+                m1_edwardian_document(),
+            ),
+        ];
+        for (terrain, doc) in cases {
+            let blocks = generate_blocks(&doc, &terrain);
+            assert!(!blocks.is_empty());
+            // Construction playback hides the course above while the active
+            // course rises; an uncapped course would read as a hollow shell.
+            for block in &blocks {
+                assert!(
+                    block.expose[BlockFace::Top as usize],
+                    "{:?} block {} course {} has no top cap",
+                    block.kind,
+                    block.element_id,
+                    block.course_index
+                );
+            }
+        }
     }
 }

@@ -15,6 +15,7 @@ extends Node3D
 
 const MASONRY_SHADER := preload("res://shaders/masonry.gdshader")
 const TERRAIN_SHADER := preload("res://shaders/terrain.gdshader")
+const WATER_SHADER := preload("res://shaders/water.gdshader")
 const ORBIT_CAMERA_SCRIPT := preload("res://scripts/orbit_camera.gd")
 const DEBUG_HUD_SCRIPT := preload("res://scripts/debug_hud.gd")
 const CONSTRUCTION_FX_SCRIPT := preload("res://scripts/construction_fx.gd")
@@ -43,6 +44,8 @@ var _design_tool: Node3D
 
 var _masonry_material: ShaderMaterial
 var _terrain_material: ShaderMaterial
+var _water_material: ShaderMaterial
+var _water_instance: MeshInstance3D
 var _chunk_instances: Array[MeshInstance3D] = []
 
 var _build_front := 1.0
@@ -98,6 +101,104 @@ func _make_materials() -> void:
 
 	_terrain_material = ShaderMaterial.new()
 	_terrain_material.shader = TERRAIN_SHADER
+
+	_water_material = ShaderMaterial.new()
+	_water_material.shader = WATER_SHADER
+
+
+## Retint the shared terrain material and place the water plane for a site.
+## Heights come from core/keep-core/src/terrain.rs:
+##   promontory  plateau +10.5 m, river shelf bottom -12.7 m  -> river at -6.0 m
+##   headland    upper shelf +17.5 m, sea-cliff foot  -16.0 m -> sea at -0.3 m
+##   lake        island +4.2 m, lake basin -3.44 m            -> lake at -1.6 m
+func _apply_site_look(site_id: String) -> void:
+	var grass_tint := Color(1.0, 1.0, 1.0)
+	var rock_tint := Color(1.0, 1.0, 1.0)
+	var grass_lush := Color(0.24, 0.34, 0.16)
+	var grass_dry := Color(0.34, 0.35, 0.19)
+	var shore_height := -1000.0
+	var wet_band := 0.0
+	var water_level := 0.0
+	var water_shallow := Color(0.16, 0.42, 0.40)
+	var water_deep := Color(0.05, 0.18, 0.23)
+	var water_foam := Color(0.84, 0.88, 0.84)
+
+	match site_id:
+		"coastal_headland":
+			# Windswept coastal turf over slate-grey sea cliffs.
+			grass_tint = Color(0.90, 1.02, 0.94)
+			rock_tint = Color(0.88, 0.94, 1.03)
+			grass_lush = Color(0.24, 0.33, 0.17)
+			grass_dry = Color(0.36, 0.35, 0.21)
+			shore_height = -0.3
+			wet_band = 2.6
+			water_level = -0.3
+			water_shallow = Color(0.16, 0.40, 0.47)
+			water_deep = Color(0.04, 0.14, 0.25)
+			water_foam = Color(0.88, 0.91, 0.90)
+		"lake_island":
+			# Lush damp island grass rising out of a blue-green lake.
+			grass_tint = Color(0.94, 1.12, 0.84)
+			rock_tint = Color(0.95, 0.99, 0.98)
+			grass_lush = Color(0.22, 0.36, 0.16)
+			grass_dry = Color(0.32, 0.38, 0.20)
+			shore_height = -1.6
+			wet_band = 3.0
+			water_level = -1.6
+			water_shallow = Color(0.16, 0.44, 0.40)
+			water_deep = Color(0.05, 0.19, 0.22)
+			water_foam = Color(0.80, 0.84, 0.78)
+		_:
+			# m0a_promontory (and any unknown id): green upland meadow, warm pale
+			# limestone cliff and a dark wet river bank in the lower shelf.
+			grass_tint = Color(1.02, 1.06, 0.94)
+			rock_tint = Color(1.20, 1.07, 0.88)
+			grass_lush = Color(0.24, 0.34, 0.16)
+			grass_dry = Color(0.35, 0.34, 0.19)
+			shore_height = -6.0
+			wet_band = 3.5
+			water_level = -6.0
+			water_shallow = Color(0.18, 0.34, 0.30)
+			water_deep = Color(0.06, 0.16, 0.15)
+			water_foam = Color(0.72, 0.76, 0.70)
+
+	if _terrain_material != null:
+		_terrain_material.set_shader_parameter("grass_lush", grass_lush)
+		_terrain_material.set_shader_parameter("grass_dry", grass_dry)
+		_terrain_material.set_shader_parameter("grass_tint", grass_tint)
+		_terrain_material.set_shader_parameter("rock_tint", rock_tint)
+		_terrain_material.set_shader_parameter("shore_height", shore_height)
+		_terrain_material.set_shader_parameter("wet_shore_band", wet_band)
+
+	_configure_water(water_level, water_shallow, water_deep, water_foam)
+
+
+func _ensure_water() -> void:
+	if _water_instance != null and is_instance_valid(_water_instance):
+		return
+	var plane := PlaneMesh.new()
+	# Large enough to reach the fog/horizon from any orbit position; the
+	# terrain mesh itself only spans 240 m.
+	plane.size = Vector2(900.0, 900.0)
+	_water_instance = MeshInstance3D.new()
+	_water_instance.name = "Water"
+	_water_instance.mesh = plane
+	_water_instance.material_override = _water_material
+	_water_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_water_instance.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+	add_child(_water_instance)
+
+
+func _configure_water(
+	level: float, shallow: Color, deep: Color, foam: Color
+) -> void:
+	_ensure_water()
+	_water_instance.position = Vector3(0.0, level, 0.0)
+	_water_instance.visible = true
+	if _water_material != null:
+		_water_material.set_shader_parameter("shallow_color", shallow)
+		_water_material.set_shader_parameter("deep_color", deep)
+		_water_material.set_shader_parameter("foam_color", foam)
 
 
 func _setup_environment() -> void:
@@ -177,8 +278,8 @@ func _setup_sun() -> void:
 	_sun.directional_shadow_split_3 = 0.42
 	_sun.directional_shadow_blend_splits = true
 	_sun.directional_shadow_max_distance = 180.0
-	_sun.shadow_bias = 0.04
-	_sun.shadow_normal_bias = 1.2
+	_sun.shadow_bias = 0.08
+	_sun.shadow_normal_bias = 2.5
 	_sun.shadow_blur = 1.2
 	_sun.sky_mode = DirectionalLight3D.SKY_MODE_LIGHT_AND_SKY
 	add_child(_sun)
@@ -323,6 +424,7 @@ func _rebuild(mode: String) -> void:
 ## orbit camera, which is desirable for a mode switch but not for every edit.
 func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 	_clear_world_meshes()
+	_apply_site_look(str(data.get("site_id", "m0a_promontory")))
 	_spawn_terrain(data.get("terrain"))
 	_spawn_chunks(data.get("chunks"))
 

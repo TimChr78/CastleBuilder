@@ -255,7 +255,8 @@ func _build_ui() -> void:
 
 	var hint := Label.new()
 	hint.text = (
-		"RMB / MMB orbit · Shift+drag pan · Wheel zoom · WASD pan\n"
+		"RMB / MMB orbit · Shift+drag pan · Wheel zoom\n"
+		+ "WASD/Arrows pan · Q/E orbit · R/F tilt · +/- zoom · Home reset\n"
 		+ "LMB drag: wall/ditch · LMB click: tower/gatehouse · Ctrl+Z undo"
 	)
 	hint.add_theme_font_size_override("font_size", 11)

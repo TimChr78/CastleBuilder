@@ -1,19 +1,33 @@
-// Keepwright — terrain splat for M0a.
+// Keepwright — terrain splat for M0a/M1.
 //
-// Blends lush hillside grass, rocky scree and exposed pale limestone bedrock
-// using keep-core's baked height/bedrock/slope vertex fields plus world-space
-// slope, with procedural macro variation and a cheap normal perturbation so the
-// heightfield reads as ground rather than a low-poly sheet. Fed directly from
-// the keep-core heightfield mesh.
+// Blends grounded medieval Northern European meadow grass, earthy scree/soil
+// and cool Welsh grey-limestone bedrock using keep-core's baked
+// height/bedrock/slope vertex fields plus world-space slope, with procedural
+// macro variation and a cheap normal perturbation so the heightfield reads as
+// ground rather than a low-poly sheet. Per-site uniforms retint grass and rock
+// and add a wet shoreline band around each site's water level.
 
 shader_type spatial;
 render_mode blend_mix, depth_draw_opaque, cull_back, diffuse_burley, specular_schlick_ggx;
 
-uniform vec4 grass_lush : source_color = vec4(0.22, 0.34, 0.12, 1.0);
-uniform vec4 grass_dry : source_color = vec4(0.45, 0.43, 0.20, 1.0);
-uniform vec4 scree_color : source_color = vec4(0.46, 0.43, 0.38, 1.0);
-uniform vec4 bedrock_color : source_color = vec4(0.75, 0.71, 0.61, 1.0);
-uniform vec4 lichen_color : source_color = vec4(0.55, 0.58, 0.38, 1.0);
+// Meadow green, mossy dry grass, earthy scree and cool grey limestone.
+uniform vec4 grass_lush : source_color = vec4(0.24, 0.34, 0.16, 1.0);
+uniform vec4 grass_dry : source_color = vec4(0.34, 0.35, 0.19, 1.0);
+uniform vec4 scree_color : source_color = vec4(0.32, 0.26, 0.19, 1.0);
+uniform vec4 bedrock_color : source_color = vec4(0.46, 0.48, 0.49, 1.0);
+uniform vec4 lichen_color : source_color = vec4(0.40, 0.44, 0.31, 1.0);
+
+// Per-site tint multipliers keep the same palette while giving each site its
+// own character (warm upland, windswept slate coast, lush damp island).
+uniform vec4 grass_tint : source_color = vec4(1.0, 1.0, 1.0, 1.0);
+uniform vec4 rock_tint : source_color = vec4(1.0, 1.0, 1.0, 1.0);
+
+// World-space Y of the site's water level and the width of the damp band above
+// it. A non-positive band disables shoreline wetting entirely.
+uniform float shore_height = -1000.0;
+uniform float wet_shore_band = 0.0;
+uniform vec4 wet_shore_color : source_color = vec4(0.15, 0.14, 0.11, 1.0);
+uniform vec4 lakebed_color : source_color = vec4(0.29, 0.30, 0.26, 1.0);
 
 uniform float grass_slope_limit : hint_range(0.0, 1.0) = 0.30;
 uniform float scree_slope : hint_range(0.0, 1.0) = 0.45;
@@ -96,19 +110,36 @@ void fragment() {
 
 	vec3 grass = mix(grass_lush.rgb, grass_dry.rgb, clamp(macro * 0.80 + elevation * 0.35, 0.0, 1.0));
 	grass *= 0.82 + 0.38 * detail;
+	grass *= grass_tint.rgb;
 
-	vec3 scree = scree_color.rgb * (0.80 + 0.40 * rock_noise) * (0.85 + 0.25 * detail);
+	vec3 scree = scree_color.rgb * rock_tint.rgb;
+	scree *= (0.80 + 0.40 * rock_noise) * (0.85 + 0.25 * detail);
 
-	vec3 bedrock = bedrock_color.rgb * (0.82 + 0.30 * rock_noise);
-	bedrock = mix(bedrock, lichen_color.rgb, smoothstep(0.55, 0.85, macro) * 0.30);
+	vec3 bedrock = bedrock_color.rgb * rock_tint.rgb;
+	bedrock *= 0.82 + 0.30 * rock_noise;
+	bedrock = mix(bedrock, lichen_color.rgb * rock_tint.rgb, smoothstep(0.55, 0.85, macro) * 0.30);
 
 	vec3 albedo = grass;
 	albedo = mix(albedo, scree, clamp(scree_mask, 0.0, 1.0));
 	albedo = mix(albedo, bedrock, bedrock_mask);
 
+	// Damp shoreline: darken and desaturate ground near the site's water level,
+	// and read the submerged lakebed as wet pebbles/sediment.
+	float shore_valid = step(0.001, wet_shore_band);
+	float above_water = v_world_pos.y - shore_height;
+	float wet = shore_valid * (1.0 - smoothstep(0.0, wet_shore_band, max(above_water, 0.0)));
+	float submerged = shore_valid * (1.0 - smoothstep(-0.05, 0.30, above_water));
+	float pebble = fbm2(v_world_pos.xz * 5.2 + vec2(7.3, 1.9));
+	vec3 wet_ground = wet_shore_color.rgb * (0.84 + 0.32 * rock_noise);
+	vec3 lakebed = mix(lakebed_color.rgb, wet_shore_color.rgb, pebble * 0.45);
+	lakebed *= 0.80 + 0.34 * pebble;
+	albedo = mix(albedo, wet_ground, wet * 0.60);
+	albedo = mix(albedo, lakebed, submerged * 0.72);
+
 	ALBEDO = albedo;
-	ROUGHNESS = mix(mix(0.95, 0.82, scree_mask), 0.72, bedrock_mask);
-	SPECULAR = 0.25;
+	float base_roughness = mix(mix(0.95, 0.82, scree_mask), 0.72, bedrock_mask);
+	ROUGHNESS = mix(mix(base_roughness, 0.40, wet * 0.75), 0.55, submerged);
+	SPECULAR = mix(0.25, 0.48, wet);
 	METALLIC = 0.0;
 
 	// Subtle procedural bump from the same noise field, strongest on rock.

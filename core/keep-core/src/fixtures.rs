@@ -318,6 +318,13 @@ mod tests {
             "stress fixture produced {} blocks, outside 180k..=230k",
             scene.block_count
         );
+        // Every course carries a top cap, so the stress scene must still stay
+        // comfortably inside the 1.5M-triangle budget.
+        assert!(
+            scene.triangle_count < 1_500_000,
+            "stress fixture produced {} triangles, over the 1.5M budget",
+            scene.triangle_count
+        );
         assert!(!scene.chunks.is_empty());
         for chunk in &scene.chunks {
             assert!(!chunk.lod0.is_empty());
