@@ -25,6 +25,7 @@ const AGENT_PANEL_SCRIPT := preload("res://scripts/agent_panel.gd")
 const INTERIOR_PROPS_SCRIPT := preload("res://scripts/interior_props.gd")
 const PHOTO_MODE_SCRIPT := preload("res://scripts/photo_mode.gd")
 const CODEX_PANEL_SCRIPT := preload("res://scripts/codex_panel.gd")
+const COMMISSION_PANEL_SCRIPT := preload("res://scripts/commission_panel.gd")
 
 ## Preferred loopback port for the live MCP/JSON-RPC control server.
 const CONTROL_PORT := 17731
@@ -65,6 +66,7 @@ var _control_url := ""
 var _interior_props: Node3D
 var _photo_mode: CanvasLayer
 var _codex_panel: CanvasLayer
+var _commission_panel: CanvasLayer
 var _sky_material: PhysicalSkyMaterial
 var _environment: Environment
 var _cutaway_mode := 0
@@ -90,6 +92,9 @@ var _timelapse_elapsed := 0.0
 var _render_view_busy := false
 var _tick_timer := 0.0
 var _mode_busy := false
+var _winter_frost := false
+var _commission_active := false
+var _commission_was_visible := false
 
 
 func _ready() -> void:
@@ -104,10 +109,12 @@ func _ready() -> void:
 	_setup_interior_props()
 	_setup_photo_mode()
 	_setup_codex()
+	_setup_commission_panel()
 
 	if _bridge != null:
 		_start_control_server()
 		_rebuild("m1")
+		_refresh_commission_panel()
 
 
 func _process(delta: float) -> void:
@@ -119,20 +126,37 @@ func _process(delta: float) -> void:
 		_audio.call("set_camera_distance", float(_camera.call("get_view_distance")))
 
 	if _timelapse_active:
-		_timelapse_elapsed += delta
-		var progress := clampf(_timelapse_elapsed / TIMELAPSE_SECONDS, 0.0, 1.0)
-		_apply_build_front(progress)
-		if _hud != null:
-			_hud.call("set_build_front", _build_front)
-		if _build_front > 0.01 and _audio != null:
-			_tick_timer -= delta
-			if _tick_timer <= 0.0:
-				_audio.call("play_stone_tick", _build_front)
-				_tick_timer = randf_range(0.08, 0.18)
-		if progress >= 1.0:
-			_stop_timelapse(true)
+		if _winter_frost:
+			# Frost season also pauses the time-lapse replay (L4): the masons
+			# have stopped raising courses, so the front must not creep up.
+			if _hud != null:
+				_hud.call(
+					"set_tool_status",
+					"Winter frost — time-lapse paused while fresh walls are thatched"
+				)
+		else:
+			_timelapse_elapsed += delta
+			var progress := clampf(_timelapse_elapsed / TIMELAPSE_SECONDS, 0.0, 1.0)
+			_apply_build_front(progress)
+			if _hud != null:
+				_hud.call("set_build_front", _build_front)
+			if _build_front > 0.01 and _audio != null:
+				_tick_timer -= delta
+				if _tick_timer <= 0.0:
+					_audio.call("play_stone_tick", _build_front)
+					_tick_timer = randf_range(0.08, 0.18)
+			if progress >= 1.0:
+				_stop_timelapse(true)
 	elif _playing:
-		if _build_front < 1.0:
+		if _winter_frost:
+			# Frost season: the masons thatch the fresh wall tops and stop
+			# raising courses until spring. Never advance the visible build.
+			if _hud != null:
+				_hud.call(
+					"set_tool_status",
+					"Winter frost — construction paused while fresh walls are thatched"
+				)
+		elif _build_front < 1.0:
 			# Guard against a zero/huge multiplier; Instant is handled by snapping.
 			var speed := maxf(_speed_multiplier, 0.01)
 			_apply_build_front(
@@ -145,7 +169,7 @@ func _process(delta: float) -> void:
 			_playing = false
 			if _hud != null:
 				_hud.call("set_playing", false)
-		elif _build_front > 0.01 and _audio != null:
+		elif not _winter_frost and _build_front > 0.01 and _audio != null:
 			_tick_timer -= delta
 			if _tick_timer <= 0.0:
 				_audio.call("play_stone_tick", _build_front)
@@ -429,6 +453,7 @@ func _setup_hud() -> void:
 	_hud.connect("terrain_tool_requested", Callable(self, "_on_hud_terrain_tool_requested"))
 	_hud.connect("photo_requested", Callable(self, "_on_hud_photo_requested"))
 	_hud.connect("codex_requested", Callable(self, "_on_hud_codex_requested"))
+	_hud.connect("commissions_requested", Callable(self, "_on_hud_commissions_requested"))
 
 
 func _setup_feel() -> void:
@@ -521,6 +546,69 @@ func _refresh_codex_entries() -> void:
 	var entries: Variant = _bridge.call("list_codex_entries")
 	if entries is Array:
 		_codex_panel.call("set_entries", entries)
+
+
+## M3.2 commission picker + active-commission HUD.
+func _setup_commission_panel() -> void:
+	_commission_panel = COMMISSION_PANEL_SCRIPT.new()
+	_commission_panel.name = "CommissionPanel"
+	add_child(_commission_panel)
+	_commission_panel.connect(
+		"commission_selected", Callable(self, "_on_commission_selected")
+	)
+	_commission_panel.connect(
+		"advance_season_requested", Callable(self, "_on_advance_season_requested")
+	)
+	_commission_panel.connect(
+		"exit_commission_requested", Callable(self, "_on_exit_commission_requested")
+	)
+	_refresh_commission_entries()
+
+
+func _refresh_commission_entries() -> void:
+	if _commission_panel == null or _bridge == null:
+		return
+	if not _bridge.has_method("list_commissions"):
+		return
+	var entries: Variant = _bridge.call("list_commissions")
+	if entries is Array:
+		_commission_panel.call("set_commissions", entries)
+
+
+## Pull the authoritative commission state and render it. Also drives the
+## winter frost shader uniform so the season is visually unmistakable.
+func _refresh_commission_panel() -> void:
+	if _commission_panel == null or _bridge == null:
+		return
+	if not _bridge.has_method("get_commission_state"):
+		return
+	var state: Variant = _bridge.call("get_commission_state")
+	if not (state is Dictionary):
+		return
+	var data: Dictionary = state
+	_commission_active = bool(data.get("active", false))
+	_commission_panel.call("refresh", data)
+	_apply_commission_season(data)
+
+
+func _apply_commission_season(state: Dictionary) -> void:
+	var commission: Variant = state.get("commission", {})
+	var frost := false
+	if commission is Dictionary:
+		frost = bool((commission as Dictionary).get("frost_active", false))
+	_winter_frost = frost
+	if _masonry_material != null:
+		_masonry_material.set_shader_parameter("winter_frost", 1.0 if frost else 0.0)
+
+
+func _on_hud_commissions_requested() -> void:
+	if _commission_panel == null:
+		return
+	if _commission_active:
+		_refresh_commission_panel()
+	else:
+		_refresh_commission_entries()
+		_commission_panel.call("open_picker")
 
 
 ## Build the in-game agent panel and the proposal ghost overlay root.
@@ -636,6 +724,7 @@ func _fulfill_render_view(request_id: int, state: Dictionary) -> void:
 	var panel_was_visible := false
 	var photo_was_visible := false
 	var codex_was_visible := false
+	var commission_was_visible := false
 	var prev_fov := _default_fov
 	var prev_cutaway_mode := _cutaway_mode
 	if _hud != null:
@@ -650,6 +739,9 @@ func _fulfill_render_view(request_id: int, state: Dictionary) -> void:
 	if _codex_panel != null:
 		codex_was_visible = _codex_panel.visible
 		_codex_panel.visible = false
+	if _commission_panel != null:
+		commission_was_visible = _commission_panel.visible
+		_commission_panel.visible = false
 	# Capture the raw architectural form: no dollhouse cut and the default lens
 	# (M7). Both are restored after the frame is read.
 	if _cutaway_mode != 0:
@@ -682,6 +774,8 @@ func _fulfill_render_view(request_id: int, state: Dictionary) -> void:
 		_photo_mode.visible = photo_was_visible
 	if _codex_panel != null:
 		_codex_panel.visible = codex_was_visible
+	if _commission_panel != null:
+		_commission_panel.visible = commission_was_visible
 
 	if image == null or image.is_empty():
 		_render_view_busy = false
@@ -999,6 +1093,29 @@ func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 	if historian is Dictionary:
 		_hud.call("set_historian", historian as Dictionary)
 
+	# Mid-build salvage feedback (M3.2): an edit during the rising build may
+	# dismantle already-laid stone, which is credited back to the commission.
+	var salvage: Variant = data.get("salvage", null)
+	if salvage is Dictionary and int((salvage as Dictionary).get("dismantled_blocks", 0)) > 0:
+		var dismantled := int((salvage as Dictionary).get("dismantled_blocks", 0))
+		var credit := int((salvage as Dictionary).get("salvage_credit_silver", 0))
+		var preserved := int(
+			round(float((salvage as Dictionary).get("preserved_fraction", 0.0)) * 100.0)
+		)
+		_hud.call(
+			"show_warning",
+			"Mid-build salvage: %d blocks dismantled (+%d silver), %d%% lower courses preserved"
+			% [dismantled, credit, preserved]
+		)
+		_hud.call(
+			"set_tool_status",
+			"Mid-build salvage: %d blocks dismantled (+%d silver) — %d%% preserved"
+			% [dismantled, credit, preserved]
+		)
+		_refresh_commission_panel()
+	elif not data.has("salvage"):
+		_hud.call("clear_warning")
+
 	var style_id := str(data.get("style_id", "edwardian_welsh"))
 	_hud.call("set_style_selection", style_id)
 	if _masonry_material != null:
@@ -1040,6 +1157,13 @@ func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 	if _agent_panel != null:
 		_refresh_agent_panel()
 		_refresh_ghosts()
+
+	# Keep the commission card authoritative after every scene: this resyncs
+	# frost/pause state on showcase loads (H1) and treasury/goal ticks after
+	# ordinary edits, undo and accepted proposals (H2). The helper only reads
+	# bridge state and never calls back into _apply_scene (no recursion).
+	if _commission_panel != null:
+		_refresh_commission_panel()
 
 
 func _spawn_terrain(mesh: Variant) -> void:
@@ -1284,6 +1408,10 @@ func _on_camera_auto_orbit_cancelled() -> void:
 
 func _apply_build_front(value: float) -> void:
 	_build_front = clampf(value, 0.0, 1.0)
+	if _bridge != null and _bridge.has_method("set_build_front_norm"):
+		# Keep the authoritative mid-build salvage reference in sync with the
+		# visible construction front before any interactive edit.
+		_bridge.call("set_build_front_norm", _build_front)
 	if _masonry_material != null:
 		_masonry_material.set_shader_parameter("build_front", _build_front)
 	if _fx != null:
@@ -1476,10 +1604,15 @@ func _set_photo_mode(enabled: bool) -> void:
 	if enabled:
 		if _codex_panel != null:
 			_codex_panel.visible = false
+		if _commission_panel != null:
+			_commission_was_visible = _commission_panel.visible
+			_commission_panel.visible = false
 		if _camera != null:
 			_camera.fov = float(_photo_mode.call("get_fov"))
 		_apply_sun_time(float(_photo_mode.call("get_sun_time")))
 	else:
+		if _commission_panel != null:
+			_commission_panel.visible = _commission_was_visible
 		if _camera != null:
 			_camera.fov = _default_fov
 		# Keep the chosen sun time: the scene stays photogenic after exiting.
@@ -1523,6 +1656,92 @@ func _toggle_codex() -> void:
 func _close_codex() -> void:
 	if _codex_panel != null:
 		_codex_panel.visible = false
+
+
+# ---------------------------------------------------------------------------
+# M3.2: commissions, seasons and winter frost
+# ---------------------------------------------------------------------------
+
+func _on_commission_selected(commission_id: String) -> void:
+	if _bridge == null or not _bridge.has_method("start_commission"):
+		_hud.call(
+			"show_error",
+			"Cannot start commission: KeepBridge.start_commission() is unavailable."
+		)
+		return
+	var result: Variant = _bridge.call("start_commission", commission_id)
+	if not (result is Dictionary):
+		_hud.call("show_error", "start_commission() did not return a Dictionary.")
+		return
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		_hud.call("show_error", "Commission rejected: %s" % _dictionary_error(result))
+		return
+
+	_apply_scene(data, true, true)
+	_commission_active = true
+	_apply_commission_season(data)
+	_refresh_commission_panel()
+	_refresh_agent_panel()
+	_hud.call("clear_error")
+	var title := commission_id
+	var commission: Variant = data.get("commission", {})
+	if commission is Dictionary:
+		title = str((commission as Dictionary).get("title", commission_id))
+	_hud.call("set_mode_label", "Commission — %s" % title)
+	_hud.call("set_tool_status", "Commission accepted — raise the patron's castle")
+
+
+func _on_advance_season_requested() -> void:
+	if _bridge == null or not _bridge.has_method("advance_season"):
+		_hud.call("show_error", "KeepBridge.advance_season() is unavailable.")
+		return
+	var result: Variant = _bridge.call("advance_season")
+	if not (result is Dictionary):
+		_hud.call("show_error", "advance_season() did not return a Dictionary.")
+		return
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		_hud.call("show_error", "Season failed: %s" % _dictionary_error(result))
+		return
+
+	var commission: Variant = data.get("commission", {})
+	if commission is Dictionary:
+		_apply_commission_season({"active": true, "commission": commission})
+		var season_name := str((commission as Dictionary).get("season", "")).capitalize()
+		if bool((commission as Dictionary).get("frost_active", false)):
+			_hud.call(
+				"set_tool_status",
+				"%s — frost on the works; wall tops are thatched and construction is paused"
+				% season_name
+			)
+		else:
+			_hud.call(
+				"set_tool_status",
+				"%s — %s"
+				% [season_name, str((commission as Dictionary).get("status_note", ""))]
+			)
+	_refresh_commission_panel()
+	_hud.call("clear_error")
+
+
+func _on_exit_commission_requested() -> void:
+	if _bridge == null or not _bridge.has_method("end_commission"):
+		_hud.call("show_error", "KeepBridge.end_commission() is unavailable.")
+		return
+	var result: Variant = _bridge.call("end_commission")
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_hud.call("show_error", "Exit failed: %s" % _dictionary_error(result))
+		return
+	_commission_active = false
+	_winter_frost = false
+	_apply_commission_season({"active": false})
+	if _commission_panel != null:
+		_commission_panel.call("refresh", {"active": false})
+		_commission_panel.visible = false
+	_hud.call("clear_error")
+	_hud.call("set_mode_label", "Sandbox")
+	_hud.call("set_tool_status", "Returned to the free-build sandbox")
 
 
 func _text_input_focused() -> bool:

@@ -43,6 +43,9 @@ pub use keep_core::command::{
 // the core and the game host use, so the wire protocol never carries a drifting
 // copy of the validation vocabulary (architecture sections 6.1 and 7.6).
 pub use keep_core::codex::CodexEntry;
+pub use keep_core::commission::{
+    CommissionBrief, CommissionGoal, CommissionState, Season, SeasonalEvent,
+};
 pub use keep_core::document::RangeKind;
 pub use keep_core::document::TerrainBrushKind;
 pub use keep_core::historian::{HistorianFinding, HistorianReport};
@@ -51,6 +54,7 @@ pub use keep_core::proposal::{
     ActivityEntry, AgentParticipant, AgentPermission, AgentRequest, AgentState, Proposal,
     ProposalStatus, RequestStatus,
 };
+pub use keep_core::salvage::SalvageDiff;
 pub use keep_core::style::StylePack;
 pub use keep_core::terrain::SiteInfo;
 pub use keep_core::validate::{AssessmentReport, Finding as AssessmentFinding, Severity};
@@ -173,6 +177,22 @@ pub struct CodexEntryArgs {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexEntryResponse {
     pub entry: CodexEntry,
+}
+
+/// Result of the `list_commissions` tool: every curated commission brief.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommissionListResponse {
+    pub count: usize,
+    pub commissions: Vec<CommissionBrief>,
+}
+
+/// Result of the `get_commission_status` tool and the
+/// `keep://session/commission` resource. `active` is false in the free-build
+/// sandbox, where `commission` is `None`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommissionStatusResponse {
+    pub active: bool,
+    pub commission: Option<CommissionState>,
 }
 
 /// Result of the `get_site` tool: the active site plus every curated site.
@@ -960,6 +980,144 @@ fn codex_entry_response_schema() -> serde_json::Value {
             "entry": codex_entry_schema()
         },
         "required": ["entry"]
+    })
+}
+
+fn commission_goal_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "label": { "type": "string" },
+            "met": { "type": "boolean" }
+        },
+        "required": ["id", "label", "met"]
+    })
+}
+
+fn seasonal_event_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "title": { "type": "string" },
+            "description": { "type": "string" },
+            "silver_delta": { "type": "integer" },
+            "patience_delta": { "type": "integer" },
+            "workforce_delta": { "type": "integer" }
+        },
+        "required": [
+            "id", "title", "description", "silver_delta",
+            "patience_delta", "workforce_delta"
+        ]
+    })
+}
+
+fn commission_brief_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "title": { "type": "string" },
+            "patron": { "type": "string" },
+            "description": { "type": "string" },
+            "site_id": { "type": "string" },
+            "style_id": { "type": "string" },
+            "starting_silver": { "type": "integer" },
+            "season_limit": { "type": "integer", "minimum": 0 },
+            "starting_workforce": { "type": "integer", "minimum": 0 },
+            "min_structure_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "min_historian_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "require_gatehouse": { "type": "boolean" },
+            "require_keep": { "type": "boolean" },
+            "require_hall": { "type": "boolean" },
+            "require_chapel": { "type": "boolean" },
+            "require_ditch": { "type": "boolean" },
+            "min_towers": { "type": "integer", "minimum": 0 },
+            "min_walls": { "type": "integer", "minimum": 0 }
+        },
+        "required": [
+            "id", "title", "patron", "description", "site_id", "style_id",
+            "starting_silver", "season_limit", "starting_workforce",
+            "min_structure_score", "min_historian_score", "require_gatehouse",
+            "require_keep", "require_hall", "require_chapel", "require_ditch",
+            "min_towers", "min_walls"
+        ]
+    })
+}
+
+fn commission_state_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "brief": commission_brief_schema(),
+            "year": { "type": "integer", "minimum": 0 },
+            "season": {
+                "type": "string",
+                "enum": ["spring", "summer", "autumn", "winter"]
+            },
+            "seasons_elapsed": { "type": "integer", "minimum": 0 },
+            "treasury_silver": { "type": "integer" },
+            "spent_silver": { "type": "integer" },
+            "salvage_silver": { "type": "integer" },
+            "workforce": { "type": "integer", "minimum": 0 },
+            "patron_patience": { "type": "integer", "minimum": 0 },
+            "frost_active": { "type": "boolean" },
+            "walls_thatched": { "type": "boolean" },
+            "active_event": {
+                "oneOf": [
+                    seasonal_event_schema(),
+                    { "type": "null" }
+                ]
+            },
+            "goals": {
+                "type": "array",
+                "items": commission_goal_schema()
+            },
+            "completed": { "type": "boolean" },
+            "failed": { "type": "boolean" },
+            "status_note": { "type": "string" }
+        },
+        "required": [
+            "brief", "year", "season", "seasons_elapsed", "treasury_silver",
+            "spent_silver", "salvage_silver", "workforce", "patron_patience",
+            "frost_active", "walls_thatched", "active_event", "goals",
+            "completed", "failed", "status_note"
+        ]
+    })
+}
+
+/// JSON schema for [`CommissionListResponse`].
+#[allow(non_snake_case)]
+pub fn COMMISSION_LIST_SCHEMA() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "commissions": {
+                "type": "array",
+                "items": commission_brief_schema()
+            }
+        },
+        "required": ["count", "commissions"]
+    })
+}
+
+/// JSON schema for [`CommissionStatusResponse`].
+#[allow(non_snake_case)]
+pub fn COMMISSION_STATUS_SCHEMA() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "active": { "type": "boolean" },
+            "commission": {
+                "oneOf": [
+                    commission_state_schema(),
+                    { "type": "null" }
+                ]
+            }
+        },
+        "required": ["active", "commission"]
     })
 }
 
@@ -1763,6 +1921,38 @@ pub fn tool_definitions() -> serde_json::Value {
                 "idempotentHint": true,
                 "openWorldHint": false
             }
+        },
+        {
+            "name": "list_commissions",
+            "description": "List every curated patron commission brief compiled into this build: patron, description, site and style, starting silver, season limit, workforce and required goals. Read-only; the player starts and advances commissions in the host UI.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "outputSchema": COMMISSION_LIST_SCHEMA(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "get_commission_status",
+            "description": "Read the active commission's patron brief, budget, season and frost status, current seasonal event and remaining goals, or report that the free-build sandbox is active. Read-only / non-destructive; the player starts, advances and ends commissions in the host UI.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "outputSchema": COMMISSION_STATUS_SCHEMA(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
         }
     ])
 }
@@ -2268,6 +2458,48 @@ mod tests {
     }
 
     #[test]
+    fn commission_wire_types_and_schemas_round_trip() {
+        let briefs = keep_core::commission::list_commissions();
+        assert!(!briefs.is_empty());
+        let list = CommissionListResponse {
+            count: briefs.len(),
+            commissions: briefs.clone(),
+        };
+        let value = serde_json::to_value(&list).unwrap();
+        assert_eq!(value["count"], briefs.len());
+        assert_eq!(value["commissions"][0]["id"], briefs[0].id);
+        assert_eq!(
+            serde_json::from_value::<CommissionListResponse>(value).unwrap(),
+            list
+        );
+
+        let inactive = CommissionStatusResponse {
+            active: false,
+            commission: None,
+        };
+        let value = serde_json::to_value(&inactive).unwrap();
+        assert_eq!(value["active"], false);
+        assert_eq!(value["commission"], serde_json::Value::Null);
+        assert_eq!(
+            serde_json::from_value::<CommissionStatusResponse>(value).unwrap(),
+            inactive
+        );
+
+        for schema in [
+            commission_brief_schema(),
+            commission_goal_schema(),
+            seasonal_event_schema(),
+            commission_state_schema(),
+            COMMISSION_LIST_SCHEMA(),
+            COMMISSION_STATUS_SCHEMA(),
+        ] {
+            let text = serde_json::to_string(&schema).unwrap();
+            let reparsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(reparsed, schema);
+        }
+    }
+
+    #[test]
     fn tool_definitions_cover_the_offline_surface() {
         let tools = tool_definitions();
         let tools = tools.as_array().expect("tools array");
@@ -2295,7 +2527,9 @@ mod tests {
                 "reply_request",
                 "get_activity_feed",
                 "list_codex",
-                "get_codex_entry"
+                "get_codex_entry",
+                "list_commissions",
+                "get_commission_status"
             ]
         );
         for tool in tools {
@@ -2620,6 +2854,29 @@ mod tests {
         assert_eq!(tools[20]["name"], "get_codex_entry");
         assert_eq!(tools[20]["annotations"]["readOnlyHint"], true);
         assert_eq!(tools[20]["inputSchema"]["required"], json!(["id"]));
+
+        // M3.2 commission reads are pure reads and non-destructive: the player
+        // controls starting and advancing commissions in the host UI.
+        assert_eq!(tools[21]["name"], "list_commissions");
+        assert_eq!(tools[21]["annotations"]["readOnlyHint"], true);
+        assert_eq!(tools[21]["annotations"]["destructiveHint"], false);
+        assert_eq!(
+            tools[21]["outputSchema"]["properties"]["commissions"]["items"]["properties"]["id"]
+                ["type"],
+            "string"
+        );
+        assert_eq!(tools[22]["name"], "get_commission_status");
+        assert_eq!(tools[22]["annotations"]["readOnlyHint"], true);
+        assert_eq!(tools[22]["annotations"]["destructiveHint"], false);
+        assert_eq!(
+            tools[22]["outputSchema"]["properties"]["commission"]["oneOf"][1]["type"],
+            "null"
+        );
+        assert!(
+            tools[22]["outputSchema"]["properties"]["commission"]["oneOf"][0]["properties"]
+                ["goals"]
+                .is_object()
+        );
 
         // The render_plan input schema documents the optional section plane.
         let section = &tools[2]["inputSchema"]["properties"]["section"];

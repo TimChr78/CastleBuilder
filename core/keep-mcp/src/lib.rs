@@ -12,6 +12,7 @@
 
 use keep_core::codex::{find_codex_entry, list_codex_entries};
 use keep_core::command::AuthorId;
+use keep_core::commission::list_commissions;
 use keep_core::document::CastleDocument;
 use keep_core::historian::assess_historian;
 use keep_core::plan_render::{render_plan_svg, render_plan_svg_with_section, PlanView};
@@ -23,11 +24,12 @@ use keep_core::validate::validate_structure;
 use keep_proto::{
     AckRequestArgs, ActivityFeedArgs, ActivityFeedResponse, ApplyOperationsRequest,
     ApplyOperationsResponse, AssessmentResponse, BeginProposalRequest, CodexEntryArgs,
-    CodexEntryResponse, CodexListResponse, ElementListResponse, GetCastleResponse,
-    GetHistoryResponse, GetSiteResponse, GetStyleResponse, HistoryEntry, ListProposalsResponse,
-    ListStylesResponse, ProposalResponse, RenderPlanRequest, RenderPlanResponse, RenderViewRequest,
-    RenderViewResponse, ReplyRequestArgs, RequestListResponse, RequestResponse, SectionPlane,
-    StageProposalOpsRequest, SubmitProposalRequest, UndoResponse,
+    CodexEntryResponse, CodexListResponse, CommissionListResponse, CommissionStatusResponse,
+    ElementListResponse, GetCastleResponse, GetHistoryResponse, GetSiteResponse, GetStyleResponse,
+    HistoryEntry, ListProposalsResponse, ListStylesResponse, ProposalResponse, RenderPlanRequest,
+    RenderPlanResponse, RenderViewRequest, RenderViewResponse, ReplyRequestArgs,
+    RequestListResponse, RequestResponse, SectionPlane, StageProposalOpsRequest,
+    SubmitProposalRequest, UndoResponse,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -301,6 +303,12 @@ impl McpServer {
             "get_codex_entry" => self
                 .tool_get_codex_entry(arguments)
                 .map(|value| tool_result(&value)),
+            "list_commissions" => self
+                .tool_list_commissions()
+                .map(|value| tool_result(&value)),
+            "get_commission_status" => self
+                .tool_get_commission_status()
+                .map(|value| tool_result(&value)),
             "begin_proposal" => self
                 .tool_begin_proposal(arguments)
                 .map(|value| tool_result(&value)),
@@ -454,6 +462,18 @@ impl McpServer {
             "get_codex_entry" => self
                 .tool_get_codex_entry(arguments)
                 .map(|value| tool_result(&value)),
+            // Curated commission briefs are compiled into keep-core, so list
+            // them locally in both modes. The live status still belongs to the
+            // running game, which owns the active commission.
+            "list_commissions" => self
+                .tool_list_commissions()
+                .map(|value| tool_result(&value)),
+            "get_commission_status" => {
+                let value = self.call_live(name, arguments)?;
+                let response: CommissionStatusResponse = serde_json::from_value(value)
+                    .map_err(|error| format!("invalid get_commission_status response: {error}"))?;
+                Ok(tool_result(&response))
+            }
             _ => self
                 .call_live(name, arguments)
                 .map(|value| tool_result(&value)),
@@ -685,6 +705,24 @@ impl McpServer {
         Ok(CodexEntryResponse { entry })
     }
 
+    /// Every curated patron commission brief, in stable id order.
+    fn tool_list_commissions(&self) -> Result<CommissionListResponse, String> {
+        let commissions = list_commissions();
+        Ok(CommissionListResponse {
+            count: commissions.len(),
+            commissions,
+        })
+    }
+
+    /// The active commission, or an explicit inactive sandbox status.
+    fn tool_get_commission_status(&self) -> Result<CommissionStatusResponse, String> {
+        let commission = self.session.commission();
+        Ok(CommissionStatusResponse {
+            active: commission.is_some(),
+            commission: commission.cloned(),
+        })
+    }
+
     /// Begin a draft proposal overlay owned by this agent.
     fn tool_begin_proposal(&mut self, arguments: Value) -> Result<ProposalResponse, String> {
         let request: BeginProposalRequest = serde_json::from_value(arguments)
@@ -831,6 +869,14 @@ impl McpServer {
                     .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?;
                 Ok(resource_contents(uri, "application/json", text))
             }
+            "keep://session/commission" => {
+                let status = self
+                    .tool_get_commission_status()
+                    .map_err(|message| (code::INTERNAL_ERROR, message))?;
+                let text = serde_json::to_string_pretty(&status)
+                    .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?;
+                Ok(resource_contents(uri, "application/json", text))
+            }
             "keep://styles/edwardian_welsh" => {
                 let style = StylePack::edwardian_welsh();
                 let text = serde_json::to_string_pretty(&style)
@@ -884,6 +930,7 @@ impl McpServer {
             "keep://castle/assessment" => ("get_assessment", json!({}), "application/json"),
             "keep://session/requests" => ("list_requests", json!({}), "application/json"),
             "keep://session/activity" => ("get_activity_feed", json!({}), "application/json"),
+            "keep://session/commission" => ("get_commission_status", json!({}), "application/json"),
             "keep://castle/plan/top" => (
                 "render_plan",
                 json!({ "view": "top_plan" }),
@@ -953,7 +1000,7 @@ fn initialize_result() -> Value {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Keepwright castle sidecar. Use get_castle, list_elements, render_plan, apply_operations, undo and get_history, plus get_assessment (optional style_id), list_styles, get_style, get_site, list_codex and get_codex_entry for structural, historical, style and codex reads. Use begin_proposal, stage_proposal_ops and submit_proposal to propose edits for the human to accept in-game (list_proposals shows their status). Use list_requests, ack_request and reply_request to work the player request inbox, and get_activity_feed for recent session activity. render_view needs live mode; render_plan works offline."
+        "instructions": "Keepwright castle sidecar. Use get_castle, list_elements, render_plan, apply_operations, undo and get_history, plus get_assessment (optional style_id), list_styles, get_style, get_site, list_codex and get_codex_entry for structural, historical, style and codex reads. Use begin_proposal, stage_proposal_ops and submit_proposal to propose edits for the human to accept in-game (list_proposals shows their status). Use list_requests, ack_request and reply_request to work the player request inbox, and get_activity_feed for recent session activity. Use list_commissions to read curated patron briefs and get_commission_status for the active commission's budget, season/frost and remaining goals; the player starts and advances commissions in-game. render_view needs live mode; render_plan works offline."
     })
 }
 
@@ -1000,6 +1047,12 @@ fn resources_list() -> Value {
                 "uri": "keep://session/activity",
                 "name": "Activity feed",
                 "description": "Recent session activity entries (requests, proposals, agents and tool use) in chronological order.",
+                "mimeType": "application/json"
+            },
+            {
+                "uri": "keep://session/commission",
+                "name": "Commission status",
+                "description": "The active patron commission's brief, budget, season and frost status, current seasonal event and remaining goals, or an inactive status in the free-build sandbox.",
                 "mimeType": "application/json"
             },
             {
@@ -1265,11 +1318,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_twenty_one_tools_with_schemas() {
+    fn tools_list_exposes_twenty_three_tools_with_schemas() {
         let mut server = server();
         let response = call(&mut server, 4, "tools/list", json!({}));
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 23);
         for tool in tools {
             assert!(tool["inputSchema"].is_object());
             assert!(tool["outputSchema"].is_object());
@@ -1299,7 +1352,9 @@ mod tests {
                 "reply_request",
                 "get_activity_feed",
                 "list_codex",
-                "get_codex_entry"
+                "get_codex_entry",
+                "list_commissions",
+                "get_commission_status"
             ]
         );
     }
@@ -1598,6 +1653,73 @@ mod tests {
         let templates = response["result"]["resourceTemplates"].as_array().unwrap();
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0]["uriTemplate"], "keep://codex/{id}");
+    }
+
+    #[test]
+    fn list_commissions_serves_the_catalogue_offline() {
+        let mut server = server();
+        let list = structured(&mut server, "list_commissions", json!({}));
+        let commissions = list["commissions"].as_array().unwrap();
+        assert_eq!(list["count"], commissions.len());
+        assert_eq!(commissions.len(), 4);
+        assert_eq!(commissions[0]["id"], "harlech_watch");
+        assert_eq!(commissions[1]["id"], "malbork_priory");
+        assert_eq!(commissions[2]["id"], "promontory_bastion");
+        assert_eq!(commissions[3]["id"], "winter_keep");
+        assert_eq!(commissions[0]["patron"], "Master James of St George");
+        assert_eq!(commissions[0]["season_limit"], 8);
+        assert_eq!(commissions[0]["starting_silver"], 1_200);
+    }
+
+    #[test]
+    fn get_commission_status_reports_sandbox_and_active_commission() {
+        let mut server = server();
+        let status = structured(&mut server, "get_commission_status", json!({}));
+        assert_eq!(status["active"], false);
+        assert!(status["commission"].is_null());
+
+        server
+            .session
+            .start_commission("promontory_bastion")
+            .expect("curated commission");
+        let status = structured(&mut server, "get_commission_status", json!({}));
+        assert_eq!(status["active"], true);
+        assert_eq!(status["commission"]["brief"]["id"], "promontory_bastion");
+        assert_eq!(status["commission"]["season"], "spring");
+        assert_eq!(status["commission"]["frost_active"], false);
+        assert_eq!(status["commission"]["treasury_silver"], 900);
+        assert!(status["commission"]["goals"].as_array().unwrap().len() >= 3);
+    }
+
+    #[test]
+    fn commission_resource_reports_status_in_both_modes() {
+        let mut server = server();
+        let response = call(
+            &mut server,
+            60,
+            "resources/read",
+            json!({ "uri": "keep://session/commission" }),
+        );
+        let contents = &response["result"]["contents"][0];
+        assert_eq!(contents["mimeType"], "application/json");
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["active"], false);
+        assert!(parsed["commission"].is_null());
+
+        server
+            .session
+            .start_commission("winter_keep")
+            .expect("curated commission");
+        let response = call(
+            &mut server,
+            61,
+            "resources/read",
+            json!({ "uri": "keep://session/commission" }),
+        );
+        let contents = &response["result"]["contents"][0];
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["active"], true);
+        assert_eq!(parsed["commission"]["brief"]["id"], "winter_keep");
     }
 
     #[test]
@@ -2153,7 +2275,7 @@ mod tests {
         let mut server = server();
         let response = call(&mut server, 5, "resources/list", json!({}));
         let resources = response["result"]["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 10);
+        assert_eq!(resources.len(), 11);
         assert_eq!(resources[0]["uri"], "keep://castle/document");
         assert_eq!(resources[1]["uri"], "keep://castle/save");
         assert_eq!(resources[1]["mimeType"], "application/json");
@@ -2161,9 +2283,10 @@ mod tests {
         assert_eq!(resources[4]["uri"], "keep://castle/assessment");
         assert_eq!(resources[5]["uri"], "keep://session/requests");
         assert_eq!(resources[6]["uri"], "keep://session/activity");
-        assert_eq!(resources[7]["uri"], "keep://codex");
-        assert_eq!(resources[8]["uri"], "keep://styles/edwardian_welsh");
-        assert_eq!(resources[9]["uri"], "keep://styles/baltic_brick");
+        assert_eq!(resources[7]["uri"], "keep://session/commission");
+        assert_eq!(resources[8]["uri"], "keep://codex");
+        assert_eq!(resources[9]["uri"], "keep://styles/edwardian_welsh");
+        assert_eq!(resources[10]["uri"], "keep://styles/baltic_brick");
         assert_eq!(resources[4]["mimeType"], "application/json");
 
         let document = call(
@@ -3625,6 +3748,69 @@ mod tests {
         let contents = &one["result"]["contents"][0];
         let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["entry"]["id"], "baltic_brick");
+    }
+
+    #[test]
+    fn live_list_commissions_answers_locally_without_the_http_backend() {
+        let mut server =
+            McpServer::live("http://127.0.0.1:1", "token", AgentPermission::DirectEdit).unwrap();
+        let list = structured(&mut server, "list_commissions", json!({}));
+        assert_eq!(list["count"], 4);
+        assert_eq!(list["commissions"][0]["id"], "harlech_watch");
+    }
+
+    #[test]
+    fn live_get_commission_status_forwards_and_deserialises_the_response() {
+        let mut offline = server();
+        offline
+            .session
+            .start_commission("promontory_bastion")
+            .expect("curated commission");
+        let active = structured(&mut offline, "get_commission_status", json!({}));
+
+        let mock = spawn_mock(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": active
+        })]);
+        let requests = Arc::clone(&mock.requests);
+        let mut server = McpServer::live(&mock.url, "token", AgentPermission::DirectEdit).unwrap();
+
+        let status = structured(&mut server, "get_commission_status", json!({}));
+        assert_eq!(status["active"], true);
+        assert_eq!(status["commission"]["brief"]["id"], "promontory_bastion");
+
+        mock.finish();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("\"method\":\"get_commission_status\""));
+    }
+
+    #[test]
+    fn live_commission_resource_forwards_to_the_game() {
+        let mock = spawn_mock(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "active": false, "commission": null }
+        })]);
+        let requests = Arc::clone(&mock.requests);
+        let mut server = McpServer::live(&mock.url, "token", AgentPermission::DirectEdit).unwrap();
+
+        let response = call(
+            &mut server,
+            62,
+            "resources/read",
+            json!({ "uri": "keep://session/commission" }),
+        );
+        let contents = &response["result"]["contents"][0];
+        assert_eq!(contents["mimeType"], "application/json");
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["active"], false);
+
+        mock.finish();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("\"method\":\"get_commission_status\""));
     }
 
     #[test]

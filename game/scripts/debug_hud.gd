@@ -23,6 +23,7 @@ signal cutaway_position_changed(position: float)
 signal terrain_tool_requested(kind: String)
 signal photo_requested()
 signal codex_requested()
+signal commissions_requested()
 
 const REFRESH_INTERVAL := 0.25
 const MAX_ASSESSMENT_FINDINGS := 3
@@ -273,6 +274,12 @@ func _build_ui() -> void:
 	codex_button.focus_mode = Control.FOCUS_NONE
 	codex_button.pressed.connect(func() -> void: codex_requested.emit())
 	file_row.add_child(codex_button)
+
+	var commissions_button := Button.new()
+	commissions_button.text = "Commissions"
+	commissions_button.focus_mode = Control.FOCUS_NONE
+	commissions_button.pressed.connect(func() -> void: commissions_requested.emit())
+	file_row.add_child(commissions_button)
 
 	# Dollhouse cutaway: a plane sweep with a floor-height slider (M3.1).
 	var cutaway_row := HBoxContainer.new()

@@ -979,6 +979,11 @@ pub enum CommandError {
     UnknownWallId(ElementId),
     NotAWallRun(ElementId),
     UnknownElementId(ElementId),
+    /// No curated commission matches the requested id.
+    UnknownCommission(String),
+    /// A season or commission action was requested while free-build mode was
+    /// active (no commission loaded).
+    NoActiveCommission,
     /// A field was supplied that does not apply to the target element's kind.
     InvalidField {
         field: &'static str,
@@ -1062,6 +1067,8 @@ impl fmt::Display for CommandError {
             Self::UnknownWallId(id) => write!(f, "unknown wall_id {id}"),
             Self::NotAWallRun(id) => write!(f, "element {id} is not a wall run"),
             Self::UnknownElementId(id) => write!(f, "unknown element id {id}"),
+            Self::UnknownCommission(id) => write!(f, "unknown commission id {id}"),
+            Self::NoActiveCommission => write!(f, "no commission is active"),
             Self::InvalidField { field, kind } => {
                 write!(f, "{field} does not apply to a {kind}")
             }

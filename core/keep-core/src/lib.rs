@@ -10,6 +10,7 @@
 
 pub mod codex;
 pub mod command;
+pub mod commission;
 pub mod document;
 pub mod fixtures;
 pub mod historian;
@@ -20,6 +21,7 @@ pub mod mesh;
 pub mod picking;
 pub mod plan_render;
 pub mod proposal;
+pub mod salvage;
 pub mod save;
 pub mod session;
 pub mod style;

@@ -93,6 +93,14 @@ func _initialize() -> void:
 		quit(1)
 		return
 
+	if bridge != null:
+		_check_m3_2(bridge, failures)
+
+	if not failures.is_empty():
+		_for_each_failure(failures)
+		quit(1)
+		return
+
 	_check_feel_scripts(failures)
 
 	if not failures.is_empty():
@@ -1706,6 +1714,221 @@ func _check_m3_1_main_methods(failures: Array[String]) -> void:
 		if not host.has_method(method):
 			failures.append("main.gd has no %s()." % method)
 	(host as Node).free()
+
+
+## M3.2: curated commissions, the season calendar with winter frost, mid-build
+## salvage accounting and the commission panel UI.
+func _check_m3_2(bridge: Object, failures: Array[String]) -> void:
+	for method in [
+		"list_commissions",
+		"start_commission",
+		"end_commission",
+		"advance_season",
+		"get_commission_state",
+		"set_build_front_norm",
+	]:
+		if not bridge.has_method(method):
+			failures.append("KeepBridge has no %s() method." % method)
+	if not failures.is_empty():
+		return
+
+	# 1. All four curated briefs carry the picker's display contract.
+	var commissions: Variant = bridge.call("list_commissions")
+	if not (commissions is Array) or (commissions as Array).size() != 4:
+		failures.append("list_commissions() did not return four commissions.")
+		return
+	for entry in (commissions as Array):
+		if not (entry is Dictionary):
+			failures.append("A commission brief is not a Dictionary.")
+			continue
+		var brief: Dictionary = entry
+		for key in [
+			"id",
+			"title",
+			"patron",
+			"description",
+			"site_id",
+			"style_id",
+			"starting_silver",
+			"season_limit",
+			"starting_workforce",
+			"min_structure_score",
+			"min_historian_score",
+		]:
+			if not brief.has(key):
+				failures.append(
+					"Commission brief \"%s\" is missing \"%s\"."
+					% [str(brief.get("id", "")), key]
+				)
+
+	# 2. Starting Harlech switches to the headland and Edwardian Welsh style.
+	var started := _require_ok(
+		bridge.call("start_commission", "harlech_watch"),
+		"start_commission(harlech_watch)",
+		failures
+	)
+	if started.is_empty():
+		return
+	if str(started.get("site_id", "")) != "coastal_headland":
+		failures.append(
+			"start_commission(harlech_watch) reported site_id %s."
+			% str(started.get("site_id", ""))
+		)
+	if str(started.get("style_id", "")) != "edwardian_welsh":
+		failures.append(
+			"start_commission(harlech_watch) reported style_id %s."
+			% str(started.get("style_id", ""))
+		)
+
+	var commission: Variant = started.get("commission", null)
+	if not (commission is Dictionary):
+		failures.append("start_commission() returned no commission Dictionary.")
+		return
+	var state: Dictionary = commission
+	if str(state.get("id", "")) != "harlech_watch":
+		failures.append("start_commission() returned the wrong commission id.")
+	if str(state.get("season", "")) != "spring":
+		failures.append(
+			"A new commission did not start in spring (got %s)."
+			% str(state.get("season", ""))
+		)
+	var goals: Variant = state.get("goals", null)
+	if not (goals is Array) or (goals as Array).is_empty():
+		failures.append("start_commission() returned no goals.")
+
+	var status: Variant = bridge.call("get_commission_state")
+	if not (status is Dictionary) or not bool((status as Dictionary).get("active", false)):
+		failures.append("get_commission_state() did not report an active commission.")
+
+	# 3. Spring -> summer -> autumn -> winter, with frost in winter.
+	var season_state: Dictionary = state
+	for expected in ["summer", "autumn", "winter"]:
+		var advanced := _require_ok(
+			bridge.call("advance_season"), "advance_season()", failures
+		)
+		if advanced.is_empty():
+			return
+		var next_commission: Variant = advanced.get("commission", null)
+		if not (next_commission is Dictionary):
+			failures.append("advance_season() returned no commission Dictionary.")
+			return
+		season_state = next_commission
+		if str(season_state.get("season", "")) != expected:
+			failures.append(
+				"advance_season() reached %s, expected %s."
+				% [str(season_state.get("season", "")), expected]
+			)
+	if not bool(season_state.get("frost_active", false)):
+		failures.append("Winter did not report frost_active.")
+
+	# 4. Mid-build salvage: raising a wall at a half-built front reports a
+	# salvage diff, but undoing it must never award extra silver (B1).
+	bridge.call("set_build_front_norm", 0.5)
+	var wall_result := _require_ok(
+		bridge.call("add_wall", Vector2(-10.0, 0.0), Vector2(10.0, 0.0), 8.0, 2.0),
+		"add_wall(mid-build)",
+		failures
+	)
+	if wall_result.is_empty():
+		return
+	var edit_salvage: Variant = wall_result.get("salvage", null)
+	if not (edit_salvage is Dictionary):
+		failures.append("A mid-build edit returned no salvage Dictionary.")
+	var before_undo: Variant = bridge.call("get_commission_state")
+	var treasury_before_undo := 0
+	if before_undo is Dictionary:
+		var before_commission: Variant = (before_undo as Dictionary).get("commission", {})
+		if before_commission is Dictionary:
+			treasury_before_undo = int((before_commission as Dictionary).get("treasury_silver", 0))
+	var undo_result: Variant = bridge.call("undo_last")
+	if not (undo_result is Dictionary):
+		failures.append("undo_last() did not return a Dictionary during salvage.")
+		return
+	var undo_data: Dictionary = undo_result
+	if not bool(undo_data.get("undone", false)):
+		failures.append("undo_last() refused the mid-build salvage edit.")
+	if undo_data.has("salvage"):
+		failures.append("undo_last() awarded mid-build salvage; undo must not mint silver (B1).")
+	var after_undo: Variant = bridge.call("get_commission_state")
+	if after_undo is Dictionary:
+		var after_commission: Variant = (after_undo as Dictionary).get("commission", {})
+		if after_commission is Dictionary:
+			var treasury_after_undo := int(
+				(after_commission as Dictionary).get("treasury_silver", 0)
+			)
+			if treasury_after_undo > treasury_before_undo:
+				failures.append(
+					"undo_last() increased the treasury (%d -> %d)."
+					% [treasury_before_undo, treasury_after_undo]
+				)
+	if edit_salvage is Dictionary:
+		var salvage_data: Dictionary = edit_salvage
+		for key in [
+			"unchanged_built_blocks",
+			"dismantled_blocks",
+			"added_blocks",
+			"salvage_credit_silver",
+			"preserved_fraction",
+		]:
+			if not salvage_data.has(key):
+				failures.append("salvage is missing \"%s\"." % key)
+		if float(salvage_data.get("preserved_fraction", 1.0)) > 1.0:
+			failures.append("Mid-build salvage preserved_fraction exceeds one.")
+
+	# 5. Ending the commission returns cleanly to the sandbox.
+	_require_ok(bridge.call("end_commission"), "end_commission()", failures)
+	var sandbox: Variant = bridge.call("get_commission_state")
+	if not (sandbox is Dictionary) or bool((sandbox as Dictionary).get("active", true)):
+		failures.append("end_commission() did not return to the sandbox.")
+
+	# 6. The commission panel instantiates, exposes its API and refreshes.
+	var script: Variant = load("res://scripts/commission_panel.gd")
+	if not (script is GDScript):
+		failures.append("commission_panel.gd did not load as a GDScript.")
+	else:
+		var panel: Variant = (script as GDScript).new()
+		if panel == null or not (panel is CanvasLayer):
+			failures.append("CommissionPanel is not a CanvasLayer.")
+		else:
+			root.add_child(panel as CanvasLayer)
+			for signal_name in [
+				"commission_selected",
+				"advance_season_requested",
+				"exit_commission_requested",
+			]:
+				if not panel.has_signal(signal_name):
+					failures.append("CommissionPanel has no %s signal." % signal_name)
+			for method in [
+				"set_commissions",
+				"open_picker",
+				"close_picker",
+				"refresh",
+				"is_picker_open",
+			]:
+				if not panel.has_method(method):
+					failures.append("CommissionPanel has no %s()." % method)
+			panel.call("set_commissions", commissions)
+			if int(panel.call("get_commission_count")) != 4:
+				failures.append("CommissionPanel did not keep the four briefs.")
+			panel.call("refresh", {"active": true, "commission": season_state})
+			if not bool(panel.call("is_commission_active")):
+				failures.append("CommissionPanel did not activate on refresh().")
+			panel.call("refresh", {"active": false})
+			if bool(panel.call("is_commission_active")):
+				failures.append("CommissionPanel did not clear on sandbox refresh().")
+			panel.call("open_picker")
+			if not bool(panel.call("is_picker_open")):
+				failures.append("CommissionPanel.open_picker() did not open the picker.")
+			panel.call("close_picker")
+			if bool(panel.call("is_picker_open")):
+				failures.append("CommissionPanel.close_picker() did not close the picker.")
+			(panel as Node).free()
+
+	if failures.is_empty():
+		print(
+			"M3.2 commissions OK: 4 briefs, seasons spring→winter, frost, "
+			+ "mid-build salvage, panel"
+		)
 
 
 ## Contract for the construction-FX element footprints emitted by keep-gd.

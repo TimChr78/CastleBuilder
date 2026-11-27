@@ -28,6 +28,7 @@ use keep_core::command::{
     MAX_WALL_THICKNESS_MM, MIN_TOWER_HEIGHT_MM, MIN_TOWER_RADIUS_MM, MIN_WALL_HEIGHT_MM,
     MIN_WALL_THICKNESS_MM,
 };
+use keep_core::commission::{list_commissions, CommissionState, Season};
 use keep_core::document::{CastleDocument, Element, RangeKind, TerrainBrushKind, TowerPlan};
 use keep_core::historian::{assess_historian, HistorianCategory, HistorianReport};
 use keep_core::interior::{build_interior_props, SectionPlane};
@@ -79,6 +80,8 @@ pub struct KeepBridge {
     next_render_view_id: i64,
     /// Active architectural style pack id (`edwardian_welsh` by default).
     style_id: String,
+    /// Visual construction front in `0.0..=1.0`, used for mid-build salvage.
+    build_front_norm: f32,
 }
 
 #[godot_api]
@@ -97,6 +100,7 @@ impl INode for KeepBridge {
             pending_render_view: None,
             next_render_view_id: 1,
             style_id: "edwardian_welsh".to_string(),
+            build_front_norm: 1.0,
         };
         bridge.ensure_control_agents();
         bridge.sync_style_id();
@@ -215,6 +219,87 @@ impl KeepBridge {
         entries
     }
 
+    // -----------------------------------------------------------------------
+    // M3.2: commissions, seasons and mid-build salvage
+    // -----------------------------------------------------------------------
+
+    /// Describe every curated commission brief.
+    #[func]
+    fn list_commissions(&self) -> Array<VarDictionary> {
+        let mut commissions: Array<VarDictionary> = Array::new();
+        for brief in list_commissions() {
+            commissions.push(&commission_brief_dictionary(&brief));
+        }
+        commissions
+    }
+
+    /// Load a curated commission, switching to its site and style and clearing
+    /// the castle. The returned scene also carries the live commission state.
+    #[func]
+    fn start_commission(&mut self, commission_id: GString) -> VarDictionary {
+        let id = commission_id.to_string();
+        match self.session.start_commission(&id) {
+            Ok(state) => {
+                self.style_id = self.session.style_id().to_string();
+                self.sync_style_id();
+                // A commission resets the site/style and castle but must keep the
+                // live MCP and demo agents available for proposals (M3.2).
+                self.ensure_control_agents();
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result.set("commission", &commission_dictionary(&state));
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Leave commission mode and return to the free-build sandbox.
+    #[func]
+    fn end_commission(&mut self) -> VarDictionary {
+        self.session.end_commission();
+        let mut result = VarDictionary::new();
+        result.set("ok", true);
+        result
+    }
+
+    /// Advance one season, applying frost, the deterministic event and upkeep.
+    #[func]
+    fn advance_season(&mut self) -> VarDictionary {
+        match self.session.advance_season() {
+            Ok(state) => {
+                let mut result = VarDictionary::new();
+                result.set("ok", true);
+                result.set("commission", &commission_dictionary(&state));
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Current commission state: `{ active, commission? }`.
+    #[func]
+    fn get_commission_state(&self) -> VarDictionary {
+        let mut result = VarDictionary::new();
+        match self.session.commission() {
+            Some(state) => {
+                result.set("active", true);
+                result.set("commission", &commission_dictionary(state));
+            }
+            None => {
+                result.set("active", false);
+            }
+        }
+        result
+    }
+
+    /// Tell the session how much of the castle is visually built so an edit can
+    /// credit the stone it dismantles (M3.2 mid-build salvage).
+    #[func]
+    fn set_build_front_norm(&mut self, front: f32) {
+        self.build_front_norm = front.clamp(0.0, 1.0);
+    }
+
     /// Build the fixed M0a look scene (one battered wall, one round tower).
     #[func]
     fn build_m0a_showcase(&mut self) -> VarDictionary {
@@ -321,12 +406,8 @@ impl KeepBridge {
             thickness_mm,
             batter_mm: None,
         };
-        match self
-            .session
-            .apply_batch(self.player_author.clone(), vec![op])
-        {
-            Ok(_) => {
-                let mut result = self.session_scene();
+        match self.apply_edit(vec![op]) {
+            Ok(mut result) => {
                 result.set("ok", true);
                 result
             }
@@ -347,12 +428,8 @@ impl KeepBridge {
             height_mm,
             batter_mm: None,
         };
-        match self
-            .session
-            .apply_batch(self.player_author.clone(), vec![op])
-        {
-            Ok(_) => {
-                let mut result = self.session_scene();
+        match self.apply_edit(vec![op]) {
+            Ok(mut result) => {
                 result.set("ok", true);
                 result
             }
@@ -399,9 +476,8 @@ impl KeepBridge {
                 orientation_deg: Some(orientation_deg),
             });
         }
-        match self.session.apply_batch(self.player_author.clone(), ops) {
-            Ok(_) => {
-                let mut result = self.session_scene();
+        match self.apply_edit(ops) {
+            Ok(mut result) => {
                 result.set("ok", true);
                 result
             }
@@ -424,12 +500,8 @@ impl KeepBridge {
             batter_mm: None,
             plinth_height_mm: None,
         };
-        match self
-            .session
-            .apply_batch(self.player_author.clone(), vec![op])
-        {
-            Ok(_) => {
-                let mut result = self.session_scene();
+        match self.apply_edit(vec![op]) {
+            Ok(mut result) => {
                 result.set("ok", true);
                 result
             }
@@ -461,12 +533,8 @@ impl KeepBridge {
             roof_pitch_deg: None,
             orientation_deg: Some(orientation_deg),
         };
-        match self
-            .session
-            .apply_batch(self.player_author.clone(), vec![op])
-        {
-            Ok(_) => {
-                let mut result = self.session_scene();
+        match self.apply_edit(vec![op]) {
+            Ok(mut result) => {
                 result.set("ok", true);
                 result
             }
@@ -486,12 +554,8 @@ impl KeepBridge {
             height_mm: None,
             tower_radius_mm: None,
         };
-        match self
-            .session
-            .apply_batch(self.player_author.clone(), vec![op])
-        {
-            Ok(_) => {
-                let mut result = self.session_scene();
+        match self.apply_edit(vec![op]) {
+            Ok(mut result) => {
                 result.set("ok", true);
                 result
             }
@@ -516,12 +580,8 @@ impl KeepBridge {
             width_mm: quantise_m(width_m),
             depth_mm: quantise_m(depth_m),
         };
-        match self
-            .session
-            .apply_batch(self.player_author.clone(), vec![op])
-        {
-            Ok(_) => {
-                let mut result = self.session_scene();
+        match self.apply_edit(vec![op]) {
+            Ok(mut result) => {
                 result.set("ok", true);
                 result
             }
@@ -556,12 +616,8 @@ impl KeepBridge {
             radius_mm: quantise_m(radius_m),
             delta_mm: quantise_m(delta_m),
         };
-        match self
-            .session
-            .apply_batch(self.player_author.clone(), vec![op])
-        {
-            Ok(_) => {
-                let mut result = self.session_scene();
+        match self.apply_edit(vec![op]) {
+            Ok(mut result) => {
                 result.set("ok", true);
                 result
             }
@@ -588,12 +644,8 @@ impl KeepBridge {
                 return result;
             }
         };
-        match self
-            .session
-            .apply_batch(self.player_author.clone(), vec![op])
-        {
-            Ok(_) => {
-                let mut result = self.session_scene();
+        match self.apply_edit(vec![op]) {
+            Ok(mut result) => {
                 result.set("ok", true);
                 result
             }
@@ -607,6 +659,9 @@ impl KeepBridge {
     fn undo_last(&mut self) -> VarDictionary {
         match self.session.undo_last(&self.player_author) {
             Ok(undo) => {
+                // Undo must not award mid-build salvage (B1): the restored
+                // masonry is already charged in the core session, so rebuild
+                // the scene without running the salvage diff.
                 let mut result = self.session_scene();
                 result.set("undone", true);
                 result.set("ok", true);
@@ -908,9 +963,10 @@ impl KeepBridge {
     /// return the rebuilt scene (architecture sections 4.2 and 7.7).
     #[func]
     fn accept_proposal(&mut self, proposal_id: GString) -> VarDictionary {
+        let before = self.session.document().clone();
         match self.session.accept_proposal(&proposal_id.to_string()) {
             Ok(_) => {
-                let mut result = self.session_scene();
+                let mut result = self.scene_after_edit(before);
                 result.set("ok", true);
                 result.set("proposal_id", &proposal_id);
                 result
@@ -1385,6 +1441,10 @@ impl KeepBridge {
                 let entries: Vec<Value> = feed[start..].iter().map(activity_value).collect();
                 json!({ "count": entries.len(), "entries": entries })
             }
+            "get_commission_status" => json!({
+                "active": self.session.commission().is_some(),
+                "commission": self.session.commission(),
+            }),
             "apply_operations" => {
                 // B4: direct edits require an active direct-edit participant.
                 self.session
@@ -1477,6 +1537,40 @@ impl KeepBridge {
 
 /// Rebuild the current session document into a scene dictionary.
 impl KeepBridge {
+    /// Apply one interactive batch and return the rebuilt scene. While the
+    /// construction front is mid-build, the stone dismantled by the edit is
+    /// credited back to the active commission and reported to the UI.
+    fn apply_edit(
+        &mut self,
+        ops: Vec<CommandOp>,
+    ) -> Result<VarDictionary, keep_core::command::CommandError> {
+        let before = self.session.document().clone();
+        self.session.apply_batch(self.player_author.clone(), ops)?;
+        Ok(self.scene_after_edit(before))
+    }
+
+    /// Rebuild the scene after an edit, attaching mid-build salvage feedback
+    /// when the construction front is neither bare ground nor finished.
+    fn scene_after_edit(&mut self, before: CastleDocument) -> VarDictionary {
+        let mut result = self.session_scene();
+        // Only an active commission accounts for mid-build salvage (M1). In
+        // sandbox mode the extra masonry diff is pure cost with no effect.
+        if self.session.commission().is_some()
+            && self.build_front_norm > 0.01
+            && self.build_front_norm < 0.99
+        {
+            let diff = keep_core::salvage::diff_mid_build_edit(
+                &before,
+                self.session.document(),
+                self.session.terrain(),
+                self.build_front_norm,
+            );
+            self.session.record_mid_build_salvage(&diff);
+            result.set("salvage", &salvage_dictionary(&diff));
+        }
+        result
+    }
+
     fn active_style(&self) -> StylePack {
         StylePack::find(&self.style_id).unwrap_or_default()
     }
@@ -2062,6 +2156,85 @@ fn historian_category_key(category: HistorianCategory) -> &'static str {
         HistorianCategory::Defensive => "defensive",
         HistorianCategory::Domestic => "domestic",
     }
+}
+
+/// One curated commission brief in the shape the picker renders.
+fn commission_brief_dictionary(brief: &keep_core::commission::CommissionBrief) -> VarDictionary {
+    let mut entry = VarDictionary::new();
+    entry.set("id", &GString::from(&brief.id));
+    entry.set("title", &GString::from(&brief.title));
+    entry.set("patron", &GString::from(&brief.patron));
+    entry.set("description", &GString::from(&brief.description));
+    entry.set("site_id", &GString::from(&brief.site_id));
+    entry.set("style_id", &GString::from(&brief.style_id));
+    entry.set("starting_silver", brief.starting_silver);
+    entry.set("season_limit", i64::from(brief.season_limit));
+    entry.set("starting_workforce", i64::from(brief.starting_workforce));
+    entry.set("min_structure_score", i64::from(brief.min_structure_score));
+    entry.set("min_historian_score", i64::from(brief.min_historian_score));
+    entry.set("min_towers", brief.min_towers as i64);
+    entry.set("min_walls", brief.min_walls as i64);
+    entry
+}
+
+/// Live commission state: the brief plus the seasonal ledger and goal checklist.
+fn commission_dictionary(state: &CommissionState) -> VarDictionary {
+    let mut result = commission_brief_dictionary(&state.brief);
+    result.set("year", i64::from(state.year));
+    result.set("season", &GString::from(season_key(state.season)));
+    result.set("seasons_elapsed", i64::from(state.seasons_elapsed));
+    result.set("treasury_silver", state.treasury_silver);
+    result.set("spent_silver", state.spent_silver);
+    result.set("salvage_silver", state.salvage_silver);
+    result.set("workforce", i64::from(state.workforce));
+    result.set("patron_patience", i64::from(state.patron_patience));
+    result.set("frost_active", state.frost_active);
+    result.set("walls_thatched", state.walls_thatched);
+
+    let mut event = VarDictionary::new();
+    if let Some(active) = &state.active_event {
+        event.set("id", &GString::from(&active.id));
+        event.set("title", &GString::from(&active.title));
+        event.set("description", &GString::from(&active.description));
+        event.set("silver_delta", active.silver_delta);
+        event.set("patience_delta", i64::from(active.patience_delta));
+        event.set("workforce_delta", i64::from(active.workforce_delta));
+    }
+    result.set("active_event", &event);
+
+    let mut goals: Array<VarDictionary> = Array::new();
+    for goal in &state.goals {
+        let mut entry = VarDictionary::new();
+        entry.set("id", &GString::from(&goal.id));
+        entry.set("label", &GString::from(&goal.label));
+        entry.set("met", goal.met);
+        goals.push(&entry);
+    }
+    result.set("goals", &goals);
+    result.set("completed", state.completed);
+    result.set("failed", state.failed);
+    result.set("status_note", &GString::from(&state.status_note));
+    result
+}
+
+fn season_key(season: Season) -> &'static str {
+    match season {
+        Season::Spring => "spring",
+        Season::Summer => "summer",
+        Season::Autumn => "autumn",
+        Season::Winter => "winter",
+    }
+}
+
+/// Mid-build salvage report consumed by the HUD and the headless tests.
+fn salvage_dictionary(diff: &keep_core::salvage::SalvageDiff) -> VarDictionary {
+    let mut result = VarDictionary::new();
+    result.set("unchanged_built_blocks", diff.unchanged_built_blocks as i64);
+    result.set("dismantled_blocks", diff.dismantled_blocks as i64);
+    result.set("added_blocks", diff.added_blocks as i64);
+    result.set("salvage_credit_silver", diff.salvage_credit_silver);
+    result.set("preserved_fraction", f64::from(diff.preserved_fraction));
+    result
 }
 
 fn range_kind_from_key(key: &str) -> RangeKind {

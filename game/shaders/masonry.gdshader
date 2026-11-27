@@ -58,6 +58,12 @@ uniform float build_drop_height : hint_range(0.0, 4.0) = 1.2;
 // hidden without alpha tests, keeping the shadow pass cheap and correct.
 uniform float build_hide_depth : hint_range(0.0, 1000.0) = 400.0;
 
+// --- Winter frost & wall-top thatching (M3.2) --------------------------
+// 0 = summer, 1 = deep winter. On upward-facing masonry this lays a crisp rime
+// dusting once the build is finished, or a straw thatch cap while the wall is
+// still rising: fresh mortar must be protected from the frost.
+uniform float winter_frost : hint_range(0.0, 1.0) = 0.0;
+
 // --- Surface detail (metres) ------------------------------------------
 uniform float bevel_width : hint_range(0.0, 0.20) = 0.045;
 uniform float bevel_strength : hint_range(0.0, 2.0) = 0.90;
@@ -462,6 +468,38 @@ void fragment() {
 	vec3 fill = sky_fill_color.rgb * (sky_fill_strength * sky_vis);
 	vec3 bounce = bounce_color.rgb * (bounce_strength * (sun_facing * 0.35 + ground_facing * 0.65));
 	EMISSION = albedo * (fill + bounce);
+	}
+
+	// --- Winter frost / wall-top thatch (M3.2) ------------------------
+	// Only upward-facing surfaces collect snow, and an unfinished wall top is
+	// capped with golden winter straw so the curing mortar is not frosted.
+	if (winter_frost > 0.0) {
+		vec3 wn = normalize(v_world_normal);
+		float upward = smoothstep(0.55, 0.85, wn.y);
+		if (upward > 0.0) {
+			float frost_noise = fbm3(v_world_pos * 2.7 + vec3(11.0, 3.0, 7.0));
+			if (build_front < 0.99) {
+				// Directional straw grain running along the wall top.
+				float straw_grain = 0.5 + 0.5 * sin(
+					v_world_pos.x * 42.0 + v_world_pos.z * 13.0 + frost_noise * 7.0
+				);
+				vec3 thatch = vec3(0.68, 0.57, 0.34) * (0.86 + 0.22 * straw_grain);
+				float thatch_mix = clamp(
+					upward * winter_frost * (0.72 + 0.18 * frost_noise), 0.0, 0.92
+				);
+				ALBEDO = mix(ALBEDO, thatch, thatch_mix);
+				ROUGHNESS = mix(ROUGHNESS, 0.94, upward * winter_frost);
+			} else {
+				vec3 rime = vec3(0.84, 0.89, 0.94) * (0.90 + 0.14 * frost_noise);
+				float frost_mix = clamp(
+					upward * winter_frost * (0.38 + 0.46 * frost_noise), 0.0, 0.90
+				);
+				ALBEDO = mix(ALBEDO, rime, frost_mix);
+				ROUGHNESS = mix(ROUGHNESS, 0.55, upward * winter_frost * 0.6);
+				SPECULAR = mix(SPECULAR, 0.50, upward * winter_frost * 0.4);
+				EMISSION = mix(EMISSION, rime * 0.04, upward * winter_frost * 0.3);
+			}
+		}
 	}
 
 	// --- Warm masonry cross-section on the cut ------------------------

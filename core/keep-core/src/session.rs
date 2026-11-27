@@ -18,6 +18,10 @@ use crate::command::{
     execute_batch, sanitize_name, uuid_v7, validate_element_budget, AuthorId, AuthorKind,
     CommandError, CommandOp, CommandPayload, InverseRecord, LoggedCommand,
 };
+use crate::commission::{
+    deterministic_seasonal_event, estimate_castle_cost_silver, evaluate_commission_goals,
+    find_commission, CommissionState, Season, STARTING_PATIENCE,
+};
 use crate::document::{CastleDocument, Element, ElementId, Opening};
 use crate::historian::assess_historian;
 use crate::junction::junction_partners;
@@ -27,6 +31,7 @@ use crate::proposal::{
     AgentRequest, AgentState, Proposal, ProposalError, ProposalStatus, RequestError, RequestStatus,
     MAX_ACTIVITY_ENTRIES,
 };
+use crate::salvage::SalvageDiff;
 use crate::style::StylePack;
 use crate::terrain::SiteTerrain;
 use crate::validate::validate_structure;
@@ -144,6 +149,8 @@ pub struct Session {
     pub(crate) activity: Vec<ActivityEntry>,
     /// Monotonic activity feed sequence.
     pub(crate) next_activity_seq: u64,
+    /// Active curated commission, or `None` in free-build sandbox mode.
+    pub(crate) commission: Option<CommissionState>,
 }
 
 impl Session {
@@ -182,6 +189,7 @@ impl Session {
             next_request_seq: 1,
             activity: Vec::new(),
             next_activity_seq: 1,
+            commission: None,
         }
     }
 
@@ -214,6 +222,223 @@ impl Session {
     /// somehow cleared or corrupted.
     fn active_style(&self) -> StylePack {
         StylePack::find(&self.active_style_id).unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
+    // Commissions: curated briefs, seasons and salvage (M3.2)
+    // -----------------------------------------------------------------------
+
+    /// The active commission, or `None` in free-build sandbox mode.
+    pub fn commission(&self) -> Option<&CommissionState> {
+        self.commission.as_ref()
+    }
+
+    /// Load a curated commission. This switches to the brief's site and style,
+    /// clears the castle and the proposal overlays, and starts a fresh season
+    /// calendar. Existing activity and agents are kept so the transition is
+    /// visible in the feed.
+    pub fn start_commission(
+        &mut self,
+        commission_id: &str,
+    ) -> Result<CommissionState, CommandError> {
+        let brief = find_commission(commission_id)
+            .ok_or_else(|| CommandError::UnknownCommission(commission_id.to_string()))?;
+        let terrain = SiteTerrain::for_site(&brief.site_id)
+            .ok_or_else(|| CommandError::UnknownCommission(commission_id.to_string()))?;
+        if StylePack::find(&brief.style_id).is_none() {
+            return Err(CommandError::UnknownCommission(commission_id.to_string()));
+        }
+
+        self.site_id = brief.site_id.clone();
+        self.terrain = terrain;
+        self.active_style_id = brief.style_id.clone();
+        self.initial_document = CastleDocument::new();
+        self.document = CastleDocument::new();
+        self.command_log.clear();
+        self.undone_seqs.clear();
+        self.next_element_id = 1;
+        self.next_seq = 1;
+        self.clock_ms = DEFAULT_CLOCK_MS;
+        self.proposals.clear();
+        self.next_proposal_seq = 1;
+        self.requests.clear();
+        self.next_request_seq = 1;
+
+        let style = self.active_style();
+        let goals = evaluate_commission_goals(&brief, &self.document, &self.terrain, &style);
+        let state = CommissionState {
+            brief: brief.clone(),
+            year: 1,
+            season: Season::Spring,
+            seasons_elapsed: 0,
+            treasury_silver: brief.starting_silver,
+            spent_silver: 0,
+            salvage_silver: 0,
+            workforce: brief.starting_workforce,
+            patron_patience: STARTING_PATIENCE,
+            frost_active: false,
+            walls_thatched: false,
+            active_event: None,
+            goals,
+            completed: false,
+            failed: false,
+            status_note: format!("Commission accepted: {}.", brief.title),
+        };
+        self.commission = Some(state.clone());
+        self.record_activity(
+            "host",
+            "commission_started",
+            format!("{}: {}", brief.id, brief.title),
+        );
+        Ok(state)
+    }
+
+    /// Leave commission mode and return to the free-build sandbox.
+    pub fn end_commission(&mut self) {
+        if let Some(state) = self.commission.take() {
+            self.record_activity(
+                "host",
+                "commission_ended",
+                format!("{}: {}", state.brief.id, state.brief.title),
+            );
+        }
+    }
+
+    /// Re-evaluate goals and completion against the current document.
+    pub fn refresh_commission(&mut self) {
+        // A completed commission is sticky (M3): later edits must not be able
+        // to un-complete a result the patron has already accepted.
+        if self
+            .commission
+            .as_ref()
+            .is_some_and(|state| state.completed || state.failed)
+        {
+            return;
+        }
+        let Some(brief) = self.commission.as_ref().map(|state| state.brief.clone()) else {
+            return;
+        };
+        let style = StylePack::find(&brief.style_id).unwrap_or_default();
+        let goals = evaluate_commission_goals(&brief, &self.document, &self.terrain, &style);
+        let Some(state) = self.commission.as_mut() else {
+            return;
+        };
+        state.goals = goals;
+        update_commission_completion(state);
+    }
+
+    /// Advance one season, applying frost, a deterministic event, seasonal
+    /// upkeep and the patron's reaction. Completed or failed commissions are
+    /// left frozen so a finished result is never overwritten by idling.
+    pub fn advance_season(&mut self) -> Result<CommissionState, CommandError> {
+        let Some(mut state) = self.commission.clone() else {
+            return Err(CommandError::NoActiveCommission);
+        };
+        if state.completed || state.failed {
+            return Ok(state);
+        }
+
+        let (next_season, year_incremented) = state.season.next();
+        state.season = next_season;
+        if year_incremented {
+            state.year += 1;
+        }
+        state.seasons_elapsed += 1;
+        state.frost_active = next_season.is_frost();
+        state.walls_thatched = state.frost_active && !self.document.is_empty();
+        state.active_event = Some(deterministic_seasonal_event(
+            &state.brief.id,
+            state.seasons_elapsed,
+            next_season,
+        ));
+
+        if let Some(event) = state.active_event.clone() {
+            state.treasury_silver += event.silver_delta;
+            state.patron_patience = clamp_u32(
+                state.patron_patience as i64 + i64::from(event.patience_delta),
+                0,
+                100,
+            );
+            state.workforce = clamp_u32(
+                state.workforce as i64 + i64::from(event.workforce_delta),
+                0,
+                500,
+            );
+        }
+
+        // Modest seasonal upkeep: the household and workforce must be fed.
+        let upkeep = 6 + i64::from(state.workforce) / 20;
+        state.treasury_silver -= upkeep;
+        state.spent_silver += upkeep;
+
+        let style = StylePack::find(&state.brief.style_id).unwrap_or_default();
+        state.goals =
+            evaluate_commission_goals(&state.brief, &self.document, &self.terrain, &style);
+        let all_met = state.goals.iter().all(|goal| goal.met);
+
+        if state.seasons_elapsed > state.brief.season_limit && !all_met {
+            state.patron_patience = state.patron_patience.saturating_sub(15);
+            state.status_note = format!(
+                "{} {} — the season limit has passed and the patron is losing patience.",
+                state.season.label(),
+                state.year
+            );
+        } else if state.frost_active && !all_met {
+            state.patron_patience = state.patron_patience.saturating_sub(4);
+            state.status_note = format!(
+                "{} {} — frost slows the works. {}",
+                state.season.label(),
+                state.year,
+                event_text(&state)
+            );
+        } else {
+            state.status_note = format!(
+                "{} {} — {}",
+                state.season.label(),
+                state.year,
+                event_text(&state)
+            );
+        }
+
+        state.failed = state.patron_patience == 0
+            || (state.seasons_elapsed > state.brief.season_limit && !all_met);
+        update_commission_completion(&mut state);
+
+        self.commission = Some(state.clone());
+        self.record_activity(
+            "host",
+            "season_advanced",
+            format!(
+                "{} {}: {} silver, {} patience",
+                state.season.label(),
+                state.year,
+                state.treasury_silver,
+                state.patron_patience
+            ),
+        );
+        Ok(state)
+    }
+
+    /// Credit dismantled mid-build stone back to an active commission.
+    pub fn record_mid_build_salvage(&mut self, diff: &SalvageDiff) {
+        if diff.salvage_credit_silver <= 0 {
+            return;
+        }
+        let credit = diff.salvage_credit_silver;
+        if let Some(state) = self.commission.as_mut() {
+            state.treasury_silver += credit;
+            state.salvage_silver += credit;
+        } else {
+            return;
+        }
+        self.record_activity(
+            "host",
+            "mid_build_salvage",
+            format!(
+                "{} dismantled blocks salvaged for {} silver",
+                diff.dismantled_blocks, credit
+            ),
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -328,6 +553,13 @@ impl Session {
             junctions.extend(junction_partners(&application.document, &self.terrain, *id));
         }
 
+        let commission_costs = self.commission.as_ref().map(|_| {
+            (
+                estimate_castle_cost_silver(&self.document, &self.terrain),
+                estimate_castle_cost_silver(&application.document, &self.terrain),
+            )
+        });
+
         self.document = application.document;
         self.next_element_id = application.next_element_id;
         self.command_log.push(LoggedCommand {
@@ -342,6 +574,19 @@ impl Session {
         });
         self.next_seq += 1;
         self.clock_ms += 1;
+
+        if let Some((old_cost, new_cost)) = commission_costs {
+            if let Some(state) = self.commission.as_mut() {
+                // New masonry is paid for out of the treasury. Dismantling does
+                // not refund here; that is the separate salvage path.
+                let delta = new_cost - old_cost;
+                if delta > 0 {
+                    state.spent_silver += delta;
+                    state.treasury_silver -= delta;
+                }
+            }
+            self.refresh_commission();
+        }
 
         Ok(ApplyOutcome {
             seq,
@@ -413,8 +658,30 @@ impl Session {
         target.inverse.apply(&mut restored);
         validate_element_budget(restored.len(), restored.opening_count())
             .map_err(UndoError::Command)?;
+
+        // Undo must never mint silver. Rebuilding masonry that an undo
+        // restores costs the same as placing it fresh (B1): charge any net
+        // increase before the commission is refreshed.
+        let commission_costs = self.commission.as_ref().map(|_| {
+            (
+                estimate_castle_cost_silver(&self.document, &self.terrain),
+                estimate_castle_cost_silver(&restored, &self.terrain),
+            )
+        });
+
         self.document = restored;
         self.undone_seqs.insert(target.seq);
+
+        if let Some((cost_before, cost_after)) = commission_costs {
+            if cost_after > cost_before {
+                let delta = cost_after - cost_before;
+                if let Some(state) = self.commission.as_mut() {
+                    state.spent_silver += delta;
+                    state.treasury_silver -= delta;
+                }
+            }
+            self.refresh_commission();
+        }
 
         let seq = self.next_seq;
         let command_id = uuid_v7(self.clock_ms, seq);
@@ -1056,6 +1323,32 @@ fn document_hash_hex(document: &CastleDocument) -> String {
     format!("{:016x}", document.document_hash())
 }
 
+/// Clamp a signed value into an unsigned range without panicking on overflow.
+fn clamp_u32(value: i64, min: u32, max: u32) -> u32 {
+    value.clamp(i64::from(min), i64::from(max)) as u32
+}
+
+/// Plain-language summary of the active seasonal event.
+fn event_text(state: &CommissionState) -> String {
+    match &state.active_event {
+        Some(event) => format!("{} — {}", event.title, event.description),
+        None => "no notable event".to_string(),
+    }
+}
+
+/// Mark a commission complete when every goal is met, the treasury is not in
+/// debt and it has not already failed.
+fn update_commission_completion(state: &mut CommissionState) {
+    let all_met = state.goals.iter().all(|goal| goal.met);
+    state.completed = all_met && state.treasury_silver >= 0 && !state.failed;
+    if state.completed {
+        state.status_note = format!(
+            "Commission complete — every goal met with {} silver remaining.",
+            state.treasury_silver
+        );
+    }
+}
+
 /// Keep a colour readable by the UI and free of control characters.
 fn sanitize_color_hex(value: &str) -> String {
     let trimmed = value.trim();
@@ -1123,7 +1416,7 @@ pub(crate) fn max_existing_id(document: &CastleDocument) -> ElementId {
 mod tests {
     use super::*;
     use crate::command::{AuthorKind, MAX_BATCH_OPS};
-    use crate::document::{BatteredWall, OpeningKind, RoundTower};
+    use crate::document::{BatteredWall, OpeningKind, RangeKind, RoundTower};
 
     fn player() -> AuthorId {
         AuthorId::player("alex").unwrap()
@@ -1659,5 +1952,230 @@ mod tests {
             before.terrain_mesh.positions
         );
         assert!(session.document().ditches().next().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Commissions (M3.2)
+    // -----------------------------------------------------------------------
+
+    fn hall(centre: [i64; 2]) -> CommandOp {
+        CommandOp::CreateRange {
+            ref_id: None,
+            name: "Great hall".into(),
+            kind: RangeKind::Hall,
+            centre_mm: centre,
+            length_mm: None,
+            width_mm: None,
+            wall_height_mm: None,
+            roof_pitch_deg: None,
+            orientation_deg: None,
+        }
+    }
+
+    fn ditch() -> CommandOp {
+        CommandOp::CreateDitch {
+            ref_id: None,
+            name: "Approach ditch".into(),
+            start_mm: [0, -18_000],
+            end_mm: [0, 18_000],
+            width_mm: 4_000,
+            depth_mm: 1_800,
+        }
+    }
+
+    fn promontory_castle_ops() -> Vec<CommandOp> {
+        vec![
+            wall("West curtain", [-16_000, -10_000], [-16_000, 10_000]),
+            wall("East curtain", [16_000, -10_000], [16_000, 10_000]),
+            tower("North drum", [-16_000, -10_000]),
+            tower("South drum", [-16_000, 10_000]),
+            hall([0, 0]),
+            ditch(),
+        ]
+    }
+
+    #[test]
+    fn starting_a_commission_loads_its_site_style_and_empty_castle() {
+        let mut session = Session::new_empty();
+        assert!(session.commission().is_none());
+
+        let state = session.start_commission("promontory_bastion").unwrap();
+        assert_eq!(state.brief.id, "promontory_bastion");
+        assert_eq!(session.site_id(), "m0a_promontory");
+        assert_eq!(session.style_id(), "edwardian_welsh");
+        assert_eq!(session.document().len(), 0);
+        assert_eq!(state.season, Season::Spring);
+        assert_eq!(state.year, 1);
+        assert_eq!(state.treasury_silver, state.brief.starting_silver);
+        assert!(!state.completed);
+        assert!(!state.failed);
+        assert!(!state.goals.iter().all(|goal| goal.met));
+        assert!(session
+            .activity_feed()
+            .iter()
+            .any(|entry| entry.action == "commission_started"));
+
+        assert_eq!(
+            session.start_commission("not_a_commission").unwrap_err(),
+            CommandError::UnknownCommission("not_a_commission".to_string())
+        );
+
+        session.end_commission();
+        assert!(session.commission().is_none());
+    }
+
+    #[test]
+    fn advancing_to_winter_sets_frost_and_thatching() {
+        let mut session = Session::new_empty();
+        session.start_commission("promontory_bastion").unwrap();
+        session
+            .apply_batch(player(), vec![wall("Curtain", [-8_000, 0], [8_000, 0])])
+            .unwrap();
+
+        let summer = session.advance_season().unwrap();
+        assert_eq!(summer.season, Season::Summer);
+        assert!(!summer.frost_active);
+
+        let autumn = session.advance_season().unwrap();
+        assert_eq!(autumn.season, Season::Autumn);
+        assert!(!autumn.frost_active);
+
+        let winter = session.advance_season().unwrap();
+        assert_eq!(winter.season, Season::Winter);
+        assert!(winter.frost_active);
+        assert!(winter.walls_thatched);
+        assert_eq!(winter.seasons_elapsed, 3);
+        assert!(winter.active_event.is_some());
+        assert!(session
+            .activity_feed()
+            .iter()
+            .any(|entry| entry.action == "season_advanced"));
+
+        // The next advance rolls the year and returns to spring.
+        let spring = session.advance_season().unwrap();
+        assert_eq!(spring.season, Season::Spring);
+        assert_eq!(spring.year, 2);
+        assert!(!spring.frost_active);
+    }
+
+    #[test]
+    fn meeting_every_goal_completes_the_commission() {
+        let mut session = Session::new_empty();
+        session.start_commission("promontory_bastion").unwrap();
+        session
+            .apply_batch(player(), promontory_castle_ops())
+            .unwrap();
+        session.refresh_commission();
+
+        let state = session.commission().unwrap();
+        let unmet: Vec<&str> = state
+            .goals
+            .iter()
+            .filter(|goal| !goal.met)
+            .map(|goal| goal.id.as_str())
+            .collect();
+        assert!(unmet.is_empty(), "unmet goals: {unmet:?} ({state:?})");
+        assert!(state.completed);
+        assert!(state.treasury_silver >= 0);
+        assert!(state.spent_silver > 0);
+    }
+
+    #[test]
+    fn running_out_of_seasons_fails_the_commission() {
+        let mut session = Session::new_empty();
+        session.start_commission("promontory_bastion").unwrap();
+        let limit = session.commission().unwrap().brief.season_limit;
+
+        let mut state = session.commission().unwrap().clone();
+        for _ in 0..=limit {
+            state = session.advance_season().unwrap();
+        }
+        assert!(state.seasons_elapsed > limit);
+        assert!(state.failed, "{state:?}");
+
+        // A finished commission no longer advances the calendar.
+        let frozen = session.advance_season().unwrap();
+        assert_eq!(frozen.seasons_elapsed, state.seasons_elapsed);
+    }
+
+    #[test]
+    fn mid_build_salvage_credits_the_treasury() {
+        let mut session = Session::new_empty();
+        session.start_commission("promontory_bastion").unwrap();
+        session
+            .apply_batch(player(), vec![wall("Curtain", [-8_000, 0], [8_000, 0])])
+            .unwrap();
+        let before = session.commission().unwrap().clone();
+
+        let diff = SalvageDiff {
+            unchanged_built_blocks: 10,
+            dismantled_blocks: 300,
+            added_blocks: 0,
+            salvage_credit_silver: 18,
+            preserved_fraction: 0.5,
+        };
+        session.record_mid_build_salvage(&diff);
+        let after = session.commission().unwrap();
+        assert_eq!(after.treasury_silver, before.treasury_silver + 18);
+        assert_eq!(after.salvage_silver, before.salvage_silver + 18);
+    }
+
+    #[test]
+    fn delete_and_undo_mid_build_cannot_mint_silver() {
+        let mut session = Session::new_empty();
+        let started = session.start_commission("promontory_bastion").unwrap();
+        let starting_treasury = started.treasury_silver;
+        session
+            .apply_batch(player(), vec![wall("Curtain", [-8_000, 0], [8_000, 0])])
+            .unwrap();
+
+        let mut previous_treasury = session.commission().unwrap().treasury_silver;
+        for cycle in 0..5 {
+            // Mid-build deletion: tear the wall down and (as the bridge does
+            // when the construction front is partial) credit salvage for it.
+            session
+                .apply_batch(player(), vec![CommandOp::DeleteElement { id: 1 }])
+                .unwrap();
+            let diff = SalvageDiff {
+                unchanged_built_blocks: 0,
+                dismantled_blocks: 300,
+                added_blocks: 0,
+                salvage_credit_silver: 18,
+                preserved_fraction: 0.5,
+            };
+            session.record_mid_build_salvage(&diff);
+
+            // Undo restores the masonry. Rebuilding it must be paid for, so
+            // the cycle can never end with more silver than it began with.
+            session.undo_last(&player()).unwrap();
+            let treasury = session.commission().unwrap().treasury_silver;
+            assert!(
+                treasury <= previous_treasury,
+                "cycle {cycle} minted silver: {previous_treasury} -> {treasury}"
+            );
+            assert!(
+                treasury <= starting_treasury,
+                "cycle {cycle} exceeded starting treasury: {starting_treasury} -> {treasury}"
+            );
+            previous_treasury = treasury;
+        }
+
+        assert!(
+            previous_treasury < starting_treasury,
+            "repeated delete + undo should drain the treasury, not preserve it"
+        );
+    }
+
+    #[test]
+    fn sandbox_batches_ignore_commission_accounting() {
+        let mut session = Session::new_empty();
+        session
+            .apply_batch(player(), vec![wall("A wall", [0, 0], [10_000, 0])])
+            .unwrap();
+        assert!(session.commission().is_none());
+        assert_eq!(
+            session.advance_season().unwrap_err(),
+            CommandError::NoActiveCommission
+        );
     }
 }
