@@ -7,6 +7,11 @@
 //! deterministic `keep-core` pipeline. The returned dictionary is Godot
 //! scenery, never the source of truth.
 
+mod control_server;
+
+use std::sync::mpsc::Sender;
+use std::time::Instant;
+
 use godot::builtin::{
     Array, Color, GString, PackedColorArray, PackedFloat32Array, PackedInt32Array,
     PackedVector2Array, PackedVector3Array, VarArray, VarDictionary, Vector2, Vector3, Vector3i,
@@ -15,7 +20,9 @@ use godot::classes::mesh::{ArrayCustomFormat, ArrayFormat, ArrayType, PrimitiveT
 use godot::classes::{ArrayMesh, INode, Node};
 use godot::obj::{EngineBitfield, EngineEnum};
 use godot::prelude::*;
+use serde_json::{json, Value};
 
+use control_server::{ControlServer, PendingRequest, RpcError, RpcReply};
 use keep_core::command::{
     AuthorId, CommandOp, MAX_TOWER_HEIGHT_MM, MAX_TOWER_RADIUS_MM, MAX_WALL_HEIGHT_MM,
     MAX_WALL_THICKNESS_MM, MIN_TOWER_HEIGHT_MM, MIN_TOWER_RADIUS_MM, MIN_WALL_HEIGHT_MM,
@@ -24,13 +31,32 @@ use keep_core::command::{
 use keep_core::document::{CastleDocument, Element, TowerPlan};
 use keep_core::mesh::{ChunkMeshData, SceneData};
 use keep_core::picking::SnapKind;
+use keep_core::plan_render::{render_plan_svg, PlanView};
+use keep_core::proposal::{
+    AgentParticipant, AgentPermission, AgentState, Proposal, ProposalStatus,
+};
 use keep_core::session::Session;
 use keep_core::style::StylePack;
 use keep_core::terrain::{SiteTerrain, TerrainMeshData};
 use keep_core::validate::{validate_structure, Severity};
+use keep_proto::{
+    build_castle_response, build_element_list_response, RenderViewResponse, DEFAULT_PLAN_VIEW,
+};
 
 /// Site the M1 vertical slice starts on.
 const M1_SITE_ID: &str = "coastal_headland";
+
+/// The single fixed participant that every authenticated HTTP control request
+/// acts as. Request parameters can never select or register another agent.
+const CONTROL_AGENT_ID: &str = "mcp-agent";
+/// Agent id that authors the in-game demo proposal.
+const DEMO_AGENT_ID: &str = "mason";
+
+/// What executing one control request produced.
+enum ControlOutcome {
+    Reply(Value),
+    RenderView(i64),
+}
 
 /// The only class the game needs for M0a/M0b.
 #[derive(GodotClass)]
@@ -41,12 +67,18 @@ pub struct KeepBridge {
     session: Session,
     /// Author used for every local interactive edit.
     player_author: AuthorId,
+    /// Running localhost JSON-RPC control server, if started.
+    control_server: Option<ControlServer>,
+    /// A `render_view` capture that `main.gd` still has to fulfill.
+    pending_render_view: Option<(i64, Sender<RpcReply>)>,
+    /// Monotonic id for `render_view` capture requests.
+    next_render_view_id: i64,
 }
 
 #[godot_api]
 impl INode for KeepBridge {
     fn init(base: Base<Node>) -> Self {
-        Self {
+        let mut bridge = Self {
             base,
             session: Session::from_document(
                 M1_SITE_ID,
@@ -55,7 +87,12 @@ impl INode for KeepBridge {
             ),
             player_author: AuthorId::player("local")
                 .expect("built-in local player author id is always valid"),
-        }
+            control_server: None,
+            pending_render_view: None,
+            next_render_view_id: 1,
+        };
+        bridge.ensure_control_agents();
+        bridge
     }
 }
 
@@ -64,11 +101,11 @@ impl KeepBridge {
     /// Build the M1 Edwardian showcase on the coastal headland.
     #[func]
     fn build_m1_edwardian(&mut self) -> VarDictionary {
-        self.session = Session::from_document(
+        self.replace_session(Session::from_document(
             M1_SITE_ID,
             SiteTerrain::for_site(M1_SITE_ID).expect("coastal_headland is a curated site"),
             keep_core::fixtures::m1_edwardian_document(),
-        );
+        ));
         self.session_scene()
     }
 
@@ -85,7 +122,7 @@ impl KeepBridge {
             );
             return result;
         };
-        self.session = Session::from_document(site, terrain, CastleDocument::new());
+        self.replace_session(Session::from_document(site, terrain, CastleDocument::new()));
         let mut result = self.session_scene();
         result.set("ok", true);
         result
@@ -108,33 +145,33 @@ impl KeepBridge {
     /// Build the fixed M0a look scene (one battered wall, one round tower).
     #[func]
     fn build_m0a_showcase(&mut self) -> VarDictionary {
-        self.session = Session::from_document(
+        self.replace_session(Session::from_document(
             "m0a_promontory",
             SiteTerrain::m0a_promontory(),
             keep_core::fixtures::m0a_showcase_document(),
-        );
+        ));
         self.session_scene()
     }
 
     /// Build the M0b junction and void look scene.
     #[func]
     fn build_m0b_showcase(&mut self) -> VarDictionary {
-        self.session = Session::from_document(
+        self.replace_session(Session::from_document(
             "m0a_promontory",
             SiteTerrain::m0a_promontory(),
             keep_core::fixtures::m0b_showcase_document(),
-        );
+        ));
         self.session_scene()
     }
 
     /// Build the large concentric-castle stress scene (~200k blocks).
     #[func]
     fn build_stress_200k(&mut self) -> VarDictionary {
-        self.session = Session::from_document(
+        self.replace_session(Session::from_document(
             "m0a_promontory",
             SiteTerrain::m0a_promontory(),
             keep_core::fixtures::stress_200k_document(),
-        );
+        ));
         self.session_scene()
     }
 
@@ -436,7 +473,7 @@ impl KeepBridge {
     fn load_castle_json(&mut self, json: GString) -> VarDictionary {
         match Session::from_save_json(&json.to_string()) {
             Ok(session) => {
-                self.session = session;
+                self.replace_session(session);
                 let mut result = self.session_scene();
                 result.set("ok", true);
                 result
@@ -444,10 +481,551 @@ impl KeepBridge {
             Err(error) => error_dictionary(&error),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // M1.3: localhost control server, proposals and the in-game agent panel
+    // -----------------------------------------------------------------------
+
+    /// Start the loopback JSON-RPC control server (architecture sections 7.2
+    /// and 7.6). `preferred_port` is tried first; a busy port falls back to an
+    /// ephemeral one. Returns the URL, actual port and per-session token.
+    #[func]
+    fn start_control_server(&mut self, preferred_port: i32) -> VarDictionary {
+        self.control_server = None;
+        self.pending_render_view = None;
+        self.ensure_control_agents();
+
+        let mut result = VarDictionary::new();
+        match ControlServer::start(preferred_port) {
+            Ok(server) => {
+                let url = server.url();
+                let port = i64::from(server.port);
+                let token = server.token.clone();
+                self.control_server = Some(server);
+                result.set("ok", true);
+                result.set("url", &GString::from(&url));
+                result.set("port", port);
+                result.set("token", &GString::from(&token));
+                result.set("error", &GString::from(""));
+            }
+            Err(error) => {
+                result.set("ok", false);
+                result.set("url", &GString::from(""));
+                result.set("port", 0i64);
+                result.set("token", &GString::from(""));
+                result.set("error", &GString::from(&error));
+            }
+        }
+        result
+    }
+
+    /// Drain queued control requests and execute them on the main thread.
+    ///
+    /// The listener thread never touches Godot: it only forwards the parsed
+    /// JSON-RPC envelope here. The returned flags tell `main.gd` what visually
+    /// changed, and `render_view_request_id` asks it to capture a PNG.
+    #[func]
+    fn poll_control(&mut self) -> VarDictionary {
+        let mut dirty = false;
+        let mut proposals_changed = false;
+        let mut render_view_request_id: i64 = -1;
+
+        loop {
+            let Some(request) = self
+                .control_server
+                .as_ref()
+                .and_then(ControlServer::drain_live)
+            else {
+                break;
+            };
+            let PendingRequest {
+                method,
+                params,
+                reply,
+                deadline,
+            } = request;
+            if Instant::now() >= deadline {
+                // The HTTP worker has already given up on this request. Drop it
+                // without executing it so a stalled client cannot mutate state
+                // after its deadline.
+                let _ = reply.send(RpcReply::Err(RpcError::new(
+                    -32_000,
+                    "request expired before it reached the game thread",
+                )));
+                continue;
+            }
+
+            let before_hash = self.session.document().document_hash();
+            let before_proposals = proposal_signature(&self.session);
+            let outcome = self.execute_control(&method, &params);
+            if self.session.document().document_hash() != before_hash {
+                dirty = true;
+            }
+            if proposal_signature(&self.session) != before_proposals {
+                proposals_changed = true;
+            }
+
+            match outcome {
+                Ok(ControlOutcome::Reply(value)) => {
+                    let _ = reply.send(RpcReply::Ok(value));
+                }
+                Ok(ControlOutcome::RenderView(request_id)) => {
+                    if self.pending_render_view.is_some() {
+                        let _ = reply.send(RpcReply::Err(RpcError::new(
+                            -32_000,
+                            "a render_view capture is already pending",
+                        )));
+                    } else {
+                        self.pending_render_view = Some((request_id, reply));
+                        render_view_request_id = request_id;
+                    }
+                }
+                Err(error) => {
+                    let _ = reply.send(RpcReply::Err(error));
+                }
+            }
+        }
+
+        let mut result = VarDictionary::new();
+        result.set("dirty", dirty);
+        result.set("proposals_changed", proposals_changed);
+        result.set("render_view_request_id", render_view_request_id);
+        result
+    }
+
+    /// Fulfil a queued `render_view` request with a base64 PNG (768x512).
+    #[func]
+    fn complete_render_view(&mut self, request_id: i64, png_base64: GString, error: GString) {
+        let Some((pending_id, reply)) = self.pending_render_view.take() else {
+            return;
+        };
+        if pending_id != request_id {
+            self.pending_render_view = Some((pending_id, reply));
+            return;
+        }
+        let message = error.to_string();
+        let outcome = if message.trim().is_empty() {
+            let view = RenderViewResponse {
+                width: 768,
+                height: 512,
+                mime_type: "image/png".to_string(),
+                image_base64: png_base64.to_string(),
+            };
+            match serde_json::to_value(view) {
+                Ok(value) => RpcReply::Ok(value),
+                Err(error) => RpcReply::Err(RpcError::new(
+                    -32_000,
+                    format!("render_view could not be serialised: {error}"),
+                )),
+            }
+        } else {
+            RpcReply::Err(RpcError::new(
+                -32_000,
+                format!("render_view failed: {message}"),
+            ))
+        };
+        let _ = reply.send(outcome);
+    }
+
+    /// Rebuild the current document on demand. `main.gd` calls this when
+    /// `poll_control()` reports that an agent changed the castle.
+    #[func]
+    fn get_scene_snapshot(&self) -> VarDictionary {
+        self.session_scene()
+    }
+
+    /// Everything the in-game agent panel needs (section 7.7).
+    #[func]
+    fn get_agent_panel_state(&self) -> VarDictionary {
+        let mut result = VarDictionary::new();
+        let url = self
+            .control_server
+            .as_ref()
+            .map(ControlServer::url)
+            .unwrap_or_default();
+        result.set("server_url", &GString::from(&url));
+        result.set("server_running", self.control_server.is_some());
+
+        let mut agents: Array<VarDictionary> = Array::new();
+        for agent in self.session.agents() {
+            let mut entry = VarDictionary::new();
+            entry.set("id", &GString::from(&agent.id));
+            entry.set("name", &GString::from(&agent.name));
+            entry.set("color", &GString::from(&agent.color_hex));
+            entry.set(
+                "permission",
+                &GString::from(permission_key(agent.permission)),
+            );
+            entry.set("state", &GString::from(state_key(agent.state)));
+            agents.push(&entry);
+        }
+        result.set("agents", &agents);
+
+        let mut proposals: Array<VarDictionary> = Array::new();
+        for proposal in self.session.proposals() {
+            let mut entry = VarDictionary::new();
+            entry.set("id", &GString::from(&proposal.id));
+            entry.set("title", &GString::from(&proposal.title));
+            entry.set("author", &GString::from(&proposal.author.to_string()));
+            entry.set("summary", &GString::from(&proposal.summary));
+            entry.set("semantic_diff", &GString::from(&proposal.semantic_diff));
+            entry.set("structure_before", i64::from(proposal.structure_before));
+            entry.set("structure_after", i64::from(proposal.structure_after));
+            entry.set("structure_delta", i64::from(proposal.structure_delta));
+            entry.set("status", &GString::from(status_key(proposal.status)));
+            entry.set(
+                "reject_reason",
+                &GString::from(proposal.reject_reason.as_deref().unwrap_or("")),
+            );
+            entry.set("op_count", proposal.ops.len() as i64);
+            proposals.push(&entry);
+        }
+        result.set("proposals", &proposals);
+        result
+    }
+
+    /// Change one agent's permission from the panel toggle.
+    #[func]
+    fn set_agent_permission(&mut self, agent_id: GString, permission: GString) -> bool {
+        let permission = permission_from_key(&permission.to_string());
+        self.session
+            .set_agent_permission(&agent_id.to_string(), permission)
+            .is_ok()
+    }
+
+    /// Human approval: apply a submitted proposal as one atomic batch and
+    /// return the rebuilt scene (architecture sections 4.2 and 7.7).
+    #[func]
+    fn accept_proposal(&mut self, proposal_id: GString) -> VarDictionary {
+        match self.session.accept_proposal(&proposal_id.to_string()) {
+            Ok(_) => {
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result.set("proposal_id", &proposal_id);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Refuse a submitted proposal; the live document stays untouched.
+    #[func]
+    fn reject_proposal(&mut self, proposal_id: GString, reason: GString) -> VarDictionary {
+        let reason = reason.to_string();
+        let reason = if reason.trim().is_empty() {
+            None
+        } else {
+            Some(reason.as_str())
+        };
+        match self
+            .session
+            .reject_proposal(&proposal_id.to_string(), reason)
+        {
+            Ok(_) => {
+                let mut result = VarDictionary::new();
+                result.set("ok", true);
+                result.set("proposal_id", &proposal_id);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Build the translucent ghost scene for one proposal. Only the elements
+    /// the proposal adds or modifies are included.
+    #[func]
+    fn build_proposal_ghost(&self, proposal_id: GString) -> VarDictionary {
+        match self
+            .session
+            .build_proposal_ghost_scene(&proposal_id.to_string())
+        {
+            Some(scene) => {
+                let mut result = scene_to_dictionary(
+                    scene,
+                    self.session.document(),
+                    self.session.terrain(),
+                    self.session.document().document_hash(),
+                    self.session.site_id(),
+                );
+                result.set("ok", true);
+                result
+            }
+            None => {
+                let mut result = VarDictionary::new();
+                result.set("ok", false);
+                result.set("chunks", &Array::<VarDictionary>::new());
+                result.set(
+                    "error",
+                    &GString::from("proposal ghost could not be generated"),
+                );
+                result
+            }
+        }
+    }
+
+    /// Create and submit a realistic demo proposal (a flanking tower plus a
+    /// curtain extension), so the panel's Accept/Reject flow is immediately
+    /// testable in game.
+    #[func]
+    fn create_demo_proposal(&mut self) -> VarDictionary {
+        self.ensure_control_agents();
+        let author = match AuthorId::agent(DEMO_AGENT_ID) {
+            Ok(author) => author,
+            Err(error) => return error_dictionary(&error),
+        };
+        let proposal = match self
+            .session
+            .begin_proposal(author.clone(), "Flanking tower & curtain extension")
+        {
+            Ok(proposal) => proposal,
+            Err(error) => return error_dictionary(&error),
+        };
+        let ops = vec![
+            CommandOp::CreateWallRun {
+                ref_id: None,
+                name: "South curtain extension".to_string(),
+                start_mm: [-32_000, 5_100],
+                end_mm: [-43_000, 5_100],
+                height_mm: 9_000,
+                thickness_mm: 2_400,
+                batter_mm: Some(900),
+            },
+            CommandOp::CreateTower {
+                ref_id: None,
+                name: "South-west flanking tower".to_string(),
+                centre_mm: [-43_000, 5_100],
+                radius_mm: 3_600,
+                height_mm: 13_000,
+                batter_mm: Some(600),
+            },
+        ];
+        if let Err(error) = self.session.stage_proposal_ops(&proposal.id, &author, ops) {
+            return error_dictionary(&error);
+        }
+        let submitted = match self.session.submit_proposal(
+            &proposal.id,
+            &author,
+            "Adds a round flanking tower and extends the south curtain by 11 m.",
+        ) {
+            Ok(proposal) => proposal,
+            Err(error) => return error_dictionary(&error),
+        };
+
+        let mut result = VarDictionary::new();
+        result.set("ok", true);
+        result.set("proposal_id", &GString::from(&submitted.id));
+        result.set("title", &GString::from(&submitted.title));
+        result.set("summary", &GString::from(&submitted.summary));
+        result.set("semantic_diff", &GString::from(&submitted.semantic_diff));
+        result.set("structure_before", i64::from(submitted.structure_before));
+        result.set("structure_after", i64::from(submitted.structure_after));
+        result
+    }
 }
 
 impl KeepBridge {
-    /// Rebuild the current session document into a scene dictionary.
+    /// Register the built-in panel agents on a freshly built session. Sessions
+    /// are replaced by every mode/site load, so presence is re-established here.
+    fn ensure_control_agents(&mut self) {
+        self.ensure_agent(CONTROL_AGENT_ID, "MCP Agent", "#4fa3ff");
+        self.ensure_agent(DEMO_AGENT_ID, "Mason", "#e8b04b");
+    }
+
+    fn ensure_agent(&mut self, id: &str, name: &str, color_hex: &str) {
+        if self.session.agent(id).is_none() {
+            let _ = self
+                .session
+                .register_agent(id, name, color_hex, AgentPermission::ProposalOnly);
+        }
+    }
+
+    /// Replace the authoritative session while carrying registered agent
+    /// permissions and states across the swap (M1.3 M6). A session swap must
+    /// never silently re-promote an agent the human demoted to read-only.
+    fn replace_session(&mut self, session: Session) {
+        let registered: Vec<AgentParticipant> = self.session.agents().cloned().collect();
+        self.session = session;
+        self.ensure_control_agents();
+        for agent in registered {
+            let _ = self.session.register_agent(
+                &agent.id,
+                &agent.name,
+                &agent.color_hex,
+                agent.permission,
+            );
+            self.session.set_agent_state(&agent.id, agent.state);
+        }
+    }
+
+    /// Execute one control-protocol method on the authoritative session.
+    fn execute_control(
+        &mut self,
+        method: &str,
+        params: &Value,
+    ) -> Result<ControlOutcome, RpcError> {
+        // B3: every authenticated HTTP request acts as the same fixed
+        // registered participant. `params.agent_id` is never consulted, so a
+        // caller cannot impersonate a direct-edit agent or register one.
+        let author = AuthorId::agent(CONTROL_AGENT_ID)
+            .map_err(|error| RpcError::new(-32_602, format!("invalid agent id: {error}")))?;
+
+        let value = match method {
+            "get_castle" => serde_json::to_value(build_castle_response(&self.session))
+                .map_err(response_error)?,
+            "list_elements" => serde_json::to_value(build_element_list_response(&self.session))
+                .map_err(response_error)?,
+            "get_assessment" => assessment_json(self.session.document(), self.session.terrain()),
+            "list_styles" => json!({ "styles": StylePack::list() }),
+            "get_style" => {
+                let id = required_string(params, "id")?;
+                let pack = StylePack::find(&id)
+                    .ok_or_else(|| RpcError::new(-32_602, format!("unknown style id '{id}'")))?;
+                json!({ "style": pack })
+            }
+            "get_site" => {
+                let available = SiteTerrain::list_sites();
+                let site = available
+                    .iter()
+                    .find(|info| info.id == self.session.site_id())
+                    .cloned();
+                json!({ "site": site, "available_sites": available })
+            }
+            "render_plan" => {
+                let view = params
+                    .get("view")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_PLAN_VIEW);
+                let plan_view = match view {
+                    "top_plan" => PlanView::TopPlan,
+                    "elevation_north" => PlanView::ElevationNorth,
+                    other => {
+                        return Err(RpcError::new(
+                            -32_602,
+                            format!("unknown plan view '{other}'"),
+                        ))
+                    }
+                };
+                let svg =
+                    render_plan_svg(self.session.document(), self.session.terrain(), plan_view);
+                json!({
+                    "view": view,
+                    "document_hash": format!(
+                        "{:016x}",
+                        self.session.document().document_hash()
+                    ),
+                    "mime_type": "image/svg+xml",
+                    "svg": svg,
+                })
+            }
+            "begin_proposal" => {
+                let title = params
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Agent proposal");
+                let proposal = self
+                    .session
+                    .begin_proposal(author, title)
+                    .map_err(proposal_error)?;
+                json!({ "proposal": proposal_value(&proposal) })
+            }
+            "stage_proposal_ops" => {
+                let proposal_id = required_string(params, "proposal_id")?;
+                let ops = operations_from_params(params)?;
+                let proposal = self
+                    .session
+                    .stage_proposal_ops(&proposal_id, &author, ops)
+                    .map_err(proposal_error)?;
+                json!({ "proposal": proposal_value(&proposal) })
+            }
+            "submit_proposal" => {
+                let proposal_id = required_string(params, "proposal_id")?;
+                let summary = params.get("summary").and_then(Value::as_str).unwrap_or("");
+                let proposal = self
+                    .session
+                    .submit_proposal(&proposal_id, &author, summary)
+                    .map_err(proposal_error)?;
+                json!({ "proposal": proposal_value(&proposal) })
+            }
+            "list_proposals" => {
+                let proposals: Vec<Value> = self.session.proposals().map(proposal_value).collect();
+                json!({ "count": proposals.len(), "proposals": proposals })
+            }
+            "apply_operations" => {
+                // B4: direct edits require an active direct-edit participant.
+                self.session
+                    .ensure_agent_active(&author, AgentPermission::DirectEdit)
+                    .map_err(permission_error)?;
+                let ops = operations_from_params(params)?;
+                let applied_count = ops.len();
+                let outcome = self
+                    .session
+                    .apply_batch(author, ops)
+                    .map_err(command_error)?;
+                let scene = self.session.build_scene();
+                json!({
+                    "applied_count": applied_count,
+                    "created_ids": outcome.created_ids,
+                    "document_hash": format!(
+                        "{:016x}",
+                        self.session.document().document_hash()
+                    ),
+                    "layout_hash": format!("{:016x}", scene.layout_hash),
+                    "block_count": scene.block_count,
+                    "chunk_count": scene.chunks.len(),
+                    "summary": outcome.summary,
+                })
+            }
+            "undo" => {
+                // B4: undo is a direct edit and needs the same active gate.
+                self.session
+                    .ensure_agent_active(&author, AgentPermission::DirectEdit)
+                    .map_err(permission_error)?;
+                let undo = self.session.undo_last(&author).map_err(undo_error)?;
+                let scene = self.session.build_scene();
+                json!({
+                    "seq": undo.undo_seq,
+                    "compensated_seq": undo.target_seq,
+                    "document_hash": format!(
+                        "{:016x}",
+                        self.session.document().document_hash()
+                    ),
+                    "layout_hash": format!("{:016x}", scene.layout_hash),
+                    "block_count": scene.block_count,
+                    "chunk_count": scene.chunks.len(),
+                    "summary": undo.summary,
+                })
+            }
+            "get_history" => {
+                let entries: Vec<Value> = self
+                    .session
+                    .history()
+                    .iter()
+                    .map(|command| {
+                        json!({
+                            "seq": command.seq,
+                            "command_id": command.command_id,
+                            "author": command.author.to_string(),
+                            "summary": command.summary,
+                            "touched_elements": command.touched_elements,
+                            "undone": self.session.is_undone(command.seq),
+                        })
+                    })
+                    .collect();
+                json!({ "count": entries.len(), "entries": entries })
+            }
+            "render_view" => {
+                let request_id = self.next_render_view_id;
+                self.next_render_view_id += 1;
+                return Ok(ControlOutcome::RenderView(request_id));
+            }
+            other => return Err(RpcError::new(-32_601, format!("unknown method '{other}'"))),
+        };
+        Ok(ControlOutcome::Reply(value))
+    }
+}
+
+/// Rebuild the current session document into a scene dictionary.
+impl KeepBridge {
     fn session_scene(&self) -> VarDictionary {
         let scene = self.session.build_scene();
         let mut result = scene_to_dictionary(
@@ -467,6 +1045,115 @@ fn error_dictionary(message: &impl std::fmt::Display) -> VarDictionary {
     result.set("ok", false);
     result.set("error", &GString::from(&message.to_string()));
     result
+}
+
+// ---------------------------------------------------------------------------
+// Control protocol helpers
+// ---------------------------------------------------------------------------
+
+fn required_string(params: &Value, key: &str) -> Result<String, RpcError> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| RpcError::new(-32_602, format!("missing string parameter '{key}'")))
+}
+
+fn operations_from_params(params: &Value) -> Result<Vec<CommandOp>, RpcError> {
+    let operations = params
+        .get("operations")
+        .ok_or_else(|| RpcError::new(-32_602, "missing operations array"))?;
+    serde_json::from_value::<Vec<CommandOp>>(operations.clone())
+        .map_err(|error| RpcError::new(-32_602, format!("invalid operations: {error}")))
+}
+
+fn command_error(error: keep_core::command::CommandError) -> RpcError {
+    RpcError::new(-32_000, error.to_string())
+}
+
+fn proposal_error(error: keep_core::proposal::ProposalError) -> RpcError {
+    RpcError::new(-32_000, error.to_string())
+}
+
+fn permission_error(error: keep_core::proposal::ProposalError) -> RpcError {
+    RpcError::new(-32_003, format!("permission denied: {error}"))
+}
+
+fn response_error(error: serde_json::Error) -> RpcError {
+    RpcError::new(
+        -32_000,
+        format!("response could not be serialised: {error}"),
+    )
+}
+
+fn undo_error(error: keep_core::session::UndoError) -> RpcError {
+    RpcError::new(-32_000, error.to_string())
+}
+
+fn proposal_value(proposal: &Proposal) -> Value {
+    serde_json::to_value(proposal).unwrap_or(Value::Null)
+}
+
+/// Cheap fingerprint of the proposal set, used to tell `main.gd` when the
+/// panel and ghost overlays need rebuilding.
+fn proposal_signature(session: &Session) -> Vec<(String, &'static str, usize, String)> {
+    session
+        .proposals()
+        .map(|proposal| {
+            (
+                proposal.id.clone(),
+                status_key(proposal.status),
+                proposal.ops.len(),
+                proposal.summary.clone(),
+            )
+        })
+        .collect()
+}
+
+fn permission_key(permission: AgentPermission) -> &'static str {
+    match permission {
+        AgentPermission::ReadOnly => "read_only",
+        AgentPermission::ProposalOnly => "proposal_only",
+        AgentPermission::DirectEdit => "direct_edit",
+    }
+}
+
+fn permission_from_key(key: &str) -> AgentPermission {
+    match key.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "read_only" | "readonly" => AgentPermission::ReadOnly,
+        "direct_edit" | "directedit" => AgentPermission::DirectEdit,
+        _ => AgentPermission::ProposalOnly,
+    }
+}
+
+fn state_key(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Idle => "idle",
+        AgentState::Thinking => "thinking",
+        AgentState::BuildingProposal => "building_proposal",
+        AgentState::WaitingForApproval => "waiting",
+        AgentState::Paused => "paused",
+    }
+}
+
+fn status_key(status: ProposalStatus) -> &'static str {
+    match status {
+        ProposalStatus::Draft => "draft",
+        ProposalStatus::Submitted => "submitted",
+        ProposalStatus::Accepted => "accepted",
+        ProposalStatus::Rejected => "rejected",
+    }
+}
+
+fn assessment_json(document: &CastleDocument, terrain: &SiteTerrain) -> Value {
+    let style = StylePack::edwardian_welsh();
+    let report = validate_structure(document, terrain, &style);
+    json!({
+        "score": report.score,
+        "passed": report.passed,
+        "style_id": style.id,
+        "findings": report.findings,
+    })
 }
 
 fn quantise_m(value: f32) -> i64 {

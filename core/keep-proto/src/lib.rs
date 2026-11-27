@@ -13,6 +13,8 @@
 
 use std::collections::BTreeMap;
 
+use keep_core::document::{CastleDocument, Element, TowerPlan};
+use keep_core::session::Session;
 use serde::{Deserialize, Serialize};
 
 // One command engine for every transport: the wire protocol re-exports the
@@ -36,6 +38,9 @@ pub use keep_core::command::{
 // The structural assessment, style packs and curated sites are the same types
 // the core and the game host use, so the wire protocol never carries a drifting
 // copy of the validation vocabulary (architecture sections 6.1 and 7.6).
+pub use keep_core::proposal::{
+    AgentParticipant, AgentPermission, AgentState, Proposal, ProposalStatus,
+};
 pub use keep_core::style::StylePack;
 pub use keep_core::terrain::SiteInfo;
 pub use keep_core::validate::{AssessmentReport, Finding as AssessmentFinding, Severity};
@@ -140,6 +145,61 @@ pub struct GetSiteResponse {
     pub available_sites: Vec<SiteInfo>,
 }
 
+/// Request for the `begin_proposal` tool.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeginProposalRequest {
+    /// Sanitised human-readable title for the proposal card.
+    pub title: String,
+}
+
+/// Request for the `stage_proposal_ops` tool.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StageProposalOpsRequest {
+    pub proposal_id: String,
+    pub operations: Vec<Operation>,
+}
+
+/// Request for the `submit_proposal` tool.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitProposalRequest {
+    pub proposal_id: String,
+    pub summary: String,
+}
+
+/// Result of every proposal lifecycle tool (`begin`, `stage`, `submit`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalResponse {
+    pub proposal: Proposal,
+}
+
+/// Result of the `list_proposals` tool.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListProposalsResponse {
+    pub count: usize,
+    pub proposals: Vec<Proposal>,
+}
+
+/// Request for the live-only `render_view` tool. Every field is optional: an
+/// empty request renders the default camera preset.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub struct RenderViewRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yaw_deg: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitch_deg: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance_m: Option<f32>,
+}
+
+/// A live render returned by the game as base64-encoded image bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderViewResponse {
+    pub width: u32,
+    pub height: u32,
+    pub mime_type: String,
+    pub image_base64: String,
+}
+
 /// Compact description of one element.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElementSummary {
@@ -211,6 +271,143 @@ pub struct ElementListResponse {
     pub opening_count: usize,
     pub elements: Vec<ElementSummary>,
     pub openings: Vec<OpeningSummary>,
+}
+
+/// Format a hash the same way every transport does: 16 lowercase hex digits.
+fn hex_hash(hash: u64) -> String {
+    format!("{hash:016x}")
+}
+
+/// Compact summaries of every element in the document, in stable id order.
+///
+/// Shared by every transport so the offline sidecar, the live control server
+/// and tests never drift in how they describe an element (M1.3 B2).
+pub fn element_summaries(document: &CastleDocument) -> Vec<ElementSummary> {
+    document
+        .elements()
+        .map(|element| match element {
+            Element::BatteredWall(wall) => ElementSummary {
+                id: wall.id,
+                kind: "wall".to_string(),
+                name: wall.name.clone(),
+                height_mm: wall.height_mm,
+                thickness_mm: wall.thickness_mm,
+                start_mm: Some(wall.start_mm),
+                end_mm: Some(wall.end_mm),
+                centre_mm: None,
+                radius_mm: None,
+                length_mm: Some(wall.length_mm()),
+                plan: None,
+                orientation_deg: None,
+                passage_width_mm: None,
+                passage_height_mm: None,
+                depth_mm: None,
+            },
+            Element::RoundTower(tower) => ElementSummary {
+                id: tower.id,
+                kind: "tower".to_string(),
+                name: tower.name.clone(),
+                height_mm: tower.height_mm,
+                thickness_mm: tower.thickness_mm,
+                start_mm: None,
+                end_mm: None,
+                centre_mm: Some(tower.centre_mm),
+                radius_mm: Some(tower.radius_mm),
+                length_mm: None,
+                plan: Some(
+                    match tower.plan {
+                        TowerPlan::Round => "round",
+                        TowerPlan::Square => "square",
+                        TowerPlan::DShaped => "d_shaped",
+                    }
+                    .to_string(),
+                ),
+                orientation_deg: Some(tower.orientation_deg),
+                passage_width_mm: None,
+                passage_height_mm: None,
+                depth_mm: None,
+            },
+            Element::Gatehouse(gatehouse) => ElementSummary {
+                id: gatehouse.id,
+                kind: "gatehouse".to_string(),
+                name: gatehouse.name.clone(),
+                height_mm: gatehouse.height_mm,
+                thickness_mm: gatehouse.depth_mm,
+                start_mm: None,
+                end_mm: None,
+                centre_mm: Some(gatehouse.centre_mm),
+                radius_mm: Some(gatehouse.tower_radius_mm),
+                length_mm: None,
+                plan: None,
+                orientation_deg: Some(gatehouse.orientation_deg),
+                passage_width_mm: Some(gatehouse.passage_width_mm),
+                passage_height_mm: Some(gatehouse.passage_height_mm),
+                depth_mm: Some(gatehouse.depth_mm),
+            },
+            Element::Ditch(ditch) => ElementSummary {
+                id: ditch.id,
+                kind: "ditch".to_string(),
+                name: ditch.name.clone(),
+                height_mm: 0,
+                thickness_mm: ditch.width_mm,
+                start_mm: Some(ditch.start_mm),
+                end_mm: Some(ditch.end_mm),
+                centre_mm: None,
+                radius_mm: None,
+                length_mm: Some(ditch.length_mm()),
+                plan: None,
+                orientation_deg: None,
+                passage_width_mm: None,
+                passage_height_mm: None,
+                depth_mm: Some(ditch.depth_mm),
+            },
+        })
+        .collect()
+}
+
+/// Compact summaries of every opening in the document, in stable id order.
+pub fn opening_summaries(document: &CastleDocument) -> Vec<OpeningSummary> {
+    document
+        .openings()
+        .map(|opening| OpeningSummary {
+            id: opening.id,
+            wall_id: opening.wall_id,
+            kind: "arrow_loop".to_string(),
+            name: opening.name.clone(),
+            t_permille: opening.t_permille,
+            sill_height_mm: opening.sill_height_mm,
+            height_mm: opening.height_mm,
+            outer_slit_mm: opening.outer_slit_mm,
+            inner_splay_width_mm: opening.inner_splay_width_mm,
+        })
+        .collect()
+}
+
+/// Build the `get_castle` response: hashes, counts and element/openings lists.
+pub fn build_castle_response(session: &Session) -> GetCastleResponse {
+    let scene = session.build_scene();
+    let document = session.document();
+    GetCastleResponse {
+        document_hash: hex_hash(document.document_hash()),
+        layout_hash: hex_hash(scene.layout_hash),
+        element_count: document.len(),
+        opening_count: document.opening_count(),
+        block_count: scene.block_count,
+        chunk_count: scene.chunk_count(),
+        elements: element_summaries(document),
+        openings: opening_summaries(document),
+    }
+}
+
+/// Build the `list_elements` response from the session's live document.
+pub fn build_element_list_response(session: &Session) -> ElementListResponse {
+    let document = session.document();
+    ElementListResponse {
+        element_count: document.len(),
+        opening_count: document.opening_count(),
+        elements: element_summaries(document),
+        openings: opening_summaries(document),
+    }
 }
 
 /// Request for a plan or elevation render.
@@ -546,6 +743,86 @@ fn get_site_schema() -> serde_json::Value {
     })
 }
 
+fn proposal_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "author": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["player", "agent", "system"] },
+                    "id": { "type": "string" }
+                },
+                "required": ["kind", "id"]
+            },
+            "title": { "type": "string" },
+            "summary": { "type": "string" },
+            "base_document_hash": { "type": "string" },
+            "base_next_element_id": { "type": "integer", "minimum": 0 },
+            "ops": {
+                "type": "array",
+                "items": operation_schema()
+            },
+            "created_element_ids": {
+                "type": "array",
+                "items": { "type": "integer", "minimum": 0 }
+            },
+            "semantic_diff": { "type": "string" },
+            "structure_before": { "type": "integer", "minimum": 0 },
+            "structure_after": { "type": "integer", "minimum": 0 },
+            "structure_delta": { "type": "integer" },
+            "status": {
+                "type": "string",
+                "enum": ["draft", "submitted", "accepted", "rejected"]
+            },
+            "reject_reason": { "type": ["string", "null"] }
+        },
+        "required": [
+            "id", "author", "title", "summary", "base_document_hash", "ops",
+            "created_element_ids", "semantic_diff", "structure_before",
+            "structure_after", "structure_delta", "status"
+        ]
+    })
+}
+
+fn proposal_response_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "proposal": proposal_schema()
+        },
+        "required": ["proposal"]
+    })
+}
+
+fn list_proposals_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "proposals": {
+                "type": "array",
+                "items": proposal_schema()
+            }
+        },
+        "required": ["count", "proposals"]
+    })
+}
+
+fn render_view_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "width": { "type": "integer", "minimum": 1 },
+            "height": { "type": "integer", "minimum": 1 },
+            "mime_type": { "type": "string" },
+            "image_base64": { "type": "string" }
+        },
+        "required": ["width", "height", "mime_type", "image_base64"]
+    })
+}
+
 fn operation_schema() -> serde_json::Value {
     let ref_id = serde_json::json!({
         "type": "string",
@@ -836,6 +1113,106 @@ pub fn tool_definitions() -> serde_json::Value {
                 "additionalProperties": false
             },
             "outputSchema": get_site_schema(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "begin_proposal",
+            "description": "Begin a draft proposal overlay for human review. Staged operations never touch the live castle until a human accepts the proposal in-game.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS }
+                },
+                "required": ["title"],
+                "additionalProperties": false
+            },
+            "outputSchema": proposal_response_schema(),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "stage_proposal_ops",
+            "description": "Stage an additional atomic batch of operations onto a draft proposal. The batch is replayed on a fork to compute the diff and structural delta; the live castle is untouched.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "proposal_id": { "type": "string", "minLength": 1 },
+                    "operations": {
+                        "type": "array",
+                        "items": operation_schema(),
+                        "minItems": 0,
+                        "maxItems": MAX_BATCH_OPS
+                    }
+                },
+                "required": ["proposal_id", "operations"],
+                "additionalProperties": false
+            },
+            "outputSchema": proposal_response_schema(),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "submit_proposal",
+            "description": "Submit a non-empty draft proposal for human approval. Only the human can accept or reject it in-game.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "proposal_id": { "type": "string", "minLength": 1 },
+                    "summary": { "type": "string", "maxLength": 256 }
+                },
+                "required": ["proposal_id", "summary"],
+                "additionalProperties": false
+            },
+            "outputSchema": proposal_response_schema(),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "list_proposals",
+            "description": "List every proposal overlay with status, semantic diff and structural delta. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "outputSchema": list_proposals_schema(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "render_view",
+            "description": "Render a live camera view of the running game as a PNG. Requires live mode; offline clients use render_plan instead. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "yaw_deg": { "type": "number" },
+                    "pitch_deg": { "type": "number" },
+                    "distance_m": { "type": "number", "exclusiveMinimum": 0 }
+                },
+                "additionalProperties": false
+            },
+            "outputSchema": render_view_schema(),
             "annotations": {
                 "readOnlyHint": true,
                 "destructiveHint": false,
@@ -1216,7 +1593,12 @@ mod tests {
                 "get_assessment",
                 "list_styles",
                 "get_style",
-                "get_site"
+                "get_site",
+                "begin_proposal",
+                "stage_proposal_ops",
+                "submit_proposal",
+                "list_proposals",
+                "render_view"
             ]
         );
         for tool in tools {
@@ -1379,7 +1761,7 @@ mod tests {
         assert_eq!(modify["additionalProperties"], false);
 
         // Assessment and style reads are pure reads, so hosts may auto-approve.
-        for tool in tools.iter().skip(6) {
+        for tool in tools.iter().skip(6).take(4) {
             assert_eq!(tool["annotations"]["readOnlyHint"], true);
             assert_eq!(tool["annotations"]["destructiveHint"], false);
             assert_eq!(tool["annotations"]["idempotentHint"], true);
@@ -1390,6 +1772,35 @@ mod tests {
             json!(["info", "warning", "error"])
         );
         assert_eq!(tools[8]["inputSchema"]["required"], json!(["id"]));
+
+        // Proposal lifecycle writes are non-destructive edits that hosts must
+        // not auto-approve, while listing proposals is a pure read.
+        for tool in tools.iter().take(13).skip(10) {
+            assert_eq!(tool["annotations"]["readOnlyHint"], false);
+            assert_eq!(tool["annotations"]["destructiveHint"], false);
+            assert_eq!(tool["annotations"]["idempotentHint"], false);
+            assert_eq!(
+                tool["outputSchema"]["properties"]["proposal"]["properties"]["status"]["enum"],
+                json!(["draft", "submitted", "accepted", "rejected"])
+            );
+        }
+        assert_eq!(
+            tools[10]["inputSchema"]["properties"]["title"]["maxLength"],
+            MAX_NAME_CHARS
+        );
+        assert_eq!(
+            tools[11]["inputSchema"]["properties"]["operations"]["maxItems"],
+            MAX_BATCH_OPS
+        );
+        assert_eq!(
+            tools[12]["inputSchema"]["required"],
+            json!(["proposal_id", "summary"])
+        );
+        assert_eq!(tools[13]["annotations"]["readOnlyHint"], true);
+        assert_eq!(tools[13]["annotations"]["idempotentHint"], true);
+        assert_eq!(tools[14]["name"], "render_view");
+        assert_eq!(tools[14]["annotations"]["readOnlyHint"], true);
+        assert_eq!(tools[14]["outputSchema"]["required"][3], "image_base64");
 
         // Round-trip every tool definition through JSON to make sure it is
         // actually serialisable and stable.
@@ -1533,5 +1944,211 @@ mod tests {
             serde_json::from_value::<GetSiteResponse>(value).unwrap(),
             get_site
         );
+    }
+
+    #[test]
+    fn proposal_and_render_view_wire_types_round_trip() {
+        let proposal = Proposal {
+            id: "prop_0001".into(),
+            author: keep_core::command::AuthorId::agent("mcp-offline").unwrap(),
+            title: "North curtain".into(),
+            summary: "A new north curtain".into(),
+            base_document_hash: "0000000000000001".into(),
+            base_next_element_id: 2,
+            ops: vec![Operation::DeleteElement { id: 1 }],
+            created_element_ids: vec![1],
+            semantic_diff: "-1 wall".into(),
+            structure_before: 50,
+            structure_after: 60,
+            structure_delta: 10,
+            status: ProposalStatus::Submitted,
+            reject_reason: None,
+        };
+        let response = ProposalResponse {
+            proposal: proposal.clone(),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["proposal"]["status"], "submitted");
+        assert_eq!(value["proposal"]["author"]["kind"], "agent");
+        assert_eq!(
+            serde_json::from_value::<ProposalResponse>(value).unwrap(),
+            response
+        );
+
+        let list = ListProposalsResponse {
+            count: 1,
+            proposals: vec![proposal],
+        };
+        let value = serde_json::to_value(&list).unwrap();
+        assert_eq!(value["count"], 1);
+        assert_eq!(
+            serde_json::from_value::<ListProposalsResponse>(value).unwrap(),
+            list
+        );
+
+        let request = StageProposalOpsRequest {
+            proposal_id: "prop_0001".into(),
+            operations: vec![Operation::DeleteElement { id: 2 }],
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["operations"][0]["op"], "delete_element");
+        assert_eq!(
+            serde_json::from_value::<StageProposalOpsRequest>(value).unwrap(),
+            request
+        );
+        assert_eq!(
+            serde_json::from_value::<BeginProposalRequest>(json!({ "title": "Tower" })).unwrap(),
+            BeginProposalRequest {
+                title: "Tower".into()
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<SubmitProposalRequest>(json!({
+                "proposal_id": "prop_0001",
+                "summary": "ok"
+            }))
+            .unwrap(),
+            SubmitProposalRequest {
+                proposal_id: "prop_0001".into(),
+                summary: "ok".into()
+            }
+        );
+
+        // Omitted camera fields round-trip as `None`.
+        assert_eq!(
+            serde_json::from_value::<RenderViewRequest>(json!({})).unwrap(),
+            RenderViewRequest::default()
+        );
+        let render = RenderViewResponse {
+            width: 768,
+            height: 512,
+            mime_type: "image/png".into(),
+            image_base64: "iVBORw0KGgo=".into(),
+        };
+        let value = serde_json::to_value(&render).unwrap();
+        assert_eq!(value["mime_type"], "image/png");
+        assert_eq!(
+            serde_json::from_value::<RenderViewResponse>(value).unwrap(),
+            render
+        );
+    }
+
+    #[test]
+    fn shared_response_builders_describe_every_element_kind() {
+        let mut session = Session::new_empty();
+        session
+            .apply_batch(
+                keep_core::command::AuthorId::player("alex").unwrap(),
+                vec![
+                    Operation::CreateWallRun {
+                        ref_id: None,
+                        name: "North curtain".into(),
+                        start_mm: [-8_000, 0],
+                        end_mm: [8_000, 0],
+                        height_mm: 9_000,
+                        thickness_mm: 2_400,
+                        batter_mm: None,
+                    },
+                    Operation::CreateTower {
+                        ref_id: None,
+                        name: "Drum tower".into(),
+                        centre_mm: [12_000, 0],
+                        radius_mm: 4_000,
+                        height_mm: 14_000,
+                        batter_mm: None,
+                    },
+                    Operation::CreateGatehouse {
+                        ref_id: None,
+                        name: "Great gate".into(),
+                        centre_mm: [0, 30_000],
+                        orientation_deg: Some(90),
+                        passage_width_mm: None,
+                        height_mm: None,
+                        tower_radius_mm: None,
+                    },
+                    Operation::CreateDitch {
+                        ref_id: None,
+                        name: "Approach ditch".into(),
+                        start_mm: [0, -30_000],
+                        end_mm: [0, -10_000],
+                        width_mm: 4_000,
+                        depth_mm: 2_000,
+                    },
+                    Operation::AddArrowLoop {
+                        wall_id: Some(1),
+                        wall_ref: None,
+                        t_permille: 400,
+                        sill_height_mm: 1_800,
+                        height_mm: None,
+                        outer_slit_mm: None,
+                        inner_splay_width_mm: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let castle = build_castle_response(&session);
+        assert_eq!(castle.element_count, 4);
+        assert_eq!(castle.opening_count, 1);
+        assert_eq!(castle.elements.len(), 4);
+        assert_eq!(castle.openings.len(), 1);
+        assert_eq!(castle.element_count, session.document().len());
+        assert_eq!(
+            castle.document_hash,
+            format!("{:016x}", session.document().document_hash())
+        );
+        let scene = session.build_scene();
+        assert_eq!(castle.layout_hash, format!("{:016x}", scene.layout_hash));
+        assert_eq!(castle.block_count, scene.block_count);
+        assert_eq!(castle.chunk_count, scene.chunk_count());
+
+        let kinds: Vec<_> = castle
+            .elements
+            .iter()
+            .map(|element| element.kind.as_str())
+            .collect();
+        assert_eq!(kinds, vec!["wall", "tower", "gatehouse", "ditch"]);
+        assert_eq!(castle.elements[0].length_mm, Some(16_000));
+        assert_eq!(castle.elements[1].plan.as_deref(), Some("round"));
+        assert_eq!(castle.elements[2].passage_width_mm, Some(3_200));
+        assert_eq!(castle.elements[3].depth_mm, Some(2_000));
+        assert_eq!(castle.openings[0].wall_id, 1);
+        assert_eq!(castle.openings[0].kind, "arrow_loop");
+
+        let list = build_element_list_response(&session);
+        assert_eq!(list.element_count, castle.element_count);
+        assert_eq!(list.opening_count, castle.opening_count);
+        assert_eq!(list.elements, castle.elements);
+        assert_eq!(list.openings, castle.openings);
+
+        // Both responses serialise through the same wire types the MCP tools
+        // advertise.
+        let value = serde_json::to_value(&castle).unwrap();
+        assert_eq!(value["elements"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            serde_json::from_value::<GetCastleResponse>(value).unwrap(),
+            castle
+        );
+        let value = serde_json::to_value(&list).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ElementListResponse>(value).unwrap(),
+            list
+        );
+    }
+
+    #[test]
+    fn shared_response_builders_handle_an_empty_castle() {
+        let session = Session::new_empty();
+        let castle = build_castle_response(&session);
+        assert_eq!(castle.element_count, 0);
+        assert_eq!(castle.opening_count, 0);
+        assert!(castle.elements.is_empty());
+        assert!(castle.openings.is_empty());
+
+        let list = build_element_list_response(&session);
+        assert_eq!(list.element_count, 0);
+        assert_eq!(list.opening_count, 0);
+        assert!(list.elements.is_empty());
+        assert!(list.openings.is_empty());
     }
 }

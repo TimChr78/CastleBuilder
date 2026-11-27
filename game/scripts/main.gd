@@ -21,6 +21,12 @@ const DEBUG_HUD_SCRIPT := preload("res://scripts/debug_hud.gd")
 const CONSTRUCTION_FX_SCRIPT := preload("res://scripts/construction_fx.gd")
 const BUILD_AUDIO_SCRIPT := preload("res://scripts/build_audio.gd")
 const DESIGN_TOOL_SCRIPT := preload("res://scripts/design_tool.gd")
+const AGENT_PANEL_SCRIPT := preload("res://scripts/agent_panel.gd")
+
+## Preferred loopback port for the live MCP/JSON-RPC control server.
+const CONTROL_PORT := 17731
+## Captured render_view size requested by agents (architecture section 7.3).
+const RENDER_VIEW_SIZE := Vector2i(768, 512)
 
 # Chunk visibility ranges in metres. Keep aligned with the M0a budget. LOD0
 # extends far enough that the default framing (~50 m) always shows full detail.
@@ -41,6 +47,13 @@ var _sun: DirectionalLight3D
 var _fx: Node3D
 var _audio: Node
 var _design_tool: Node3D
+var _agent_panel: CanvasLayer
+var _ghost_root: Node3D
+var _ghost_material: StandardMaterial3D
+var _ghost_nodes: Array[MeshInstance3D] = []
+var _ghost_visibility: Dictionary = {}
+var _control_token := ""
+var _control_url := ""
 
 var _masonry_material: ShaderMaterial
 var _terrain_material: ShaderMaterial
@@ -62,8 +75,10 @@ func _ready() -> void:
 	_setup_hud()
 	_setup_feel()
 	_setup_bridge()
+	_setup_agent_layer()
 
 	if _bridge != null:
+		_start_control_server()
 		_rebuild("m1")
 
 
@@ -92,6 +107,8 @@ func _process(delta: float) -> void:
 			if _tick_timer <= 0.0:
 				_audio.call("play_stone_tick", _build_front)
 				_tick_timer = randf_range(0.08, 0.18)
+
+	_poll_control()
 
 
 func _make_materials() -> void:
@@ -364,6 +381,231 @@ func _setup_bridge() -> void:
 		_design_tool.call("set_bridge", _bridge)
 
 
+## Build the in-game agent panel and the proposal ghost overlay root.
+func _setup_agent_layer() -> void:
+	_ghost_material = StandardMaterial3D.new()
+	_ghost_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_ghost_material.albedo_color = Color(0.25, 0.85, 0.95, 0.42)
+	_ghost_material.emission_enabled = true
+	_ghost_material.emission = Color(0.25, 0.85, 0.95)
+	_ghost_material.emission_energy_multiplier = 1.6
+	_ghost_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+	_ghost_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+
+	_ghost_root = Node3D.new()
+	_ghost_root.name = "ProposalGhosts"
+	add_child(_ghost_root)
+
+	_agent_panel = AGENT_PANEL_SCRIPT.new()
+	_agent_panel.name = "AgentPanel"
+	add_child(_agent_panel)
+	_agent_panel.connect(
+		"permission_changed", Callable(self, "_on_agent_permission_changed")
+	)
+	_agent_panel.connect(
+		"proposal_accept_requested", Callable(self, "_on_proposal_accept_requested")
+	)
+	_agent_panel.connect(
+		"proposal_reject_requested", Callable(self, "_on_proposal_reject_requested")
+	)
+	_agent_panel.connect("ghost_toggled", Callable(self, "_on_ghost_toggled"))
+	_agent_panel.connect("demo_proposal_requested", Callable(self, "_on_demo_proposal_requested"))
+
+
+func _start_control_server() -> void:
+	if _bridge == null or not _bridge.has_method("start_control_server"):
+		return
+	# Headless verification must not hold the preferred port; an ephemeral bind
+	# still exercises the exact same security and request path.
+	var port := CONTROL_PORT
+	if DisplayServer.get_name() == "headless":
+		port = 0
+	var result: Variant = _bridge.call("start_control_server", port)
+	if not (result is Dictionary):
+		push_warning("Keepwright: start_control_server() did not return a Dictionary.")
+		return
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		push_warning(
+			"Keepwright: control server failed to start: %s" % str(data.get("error", "unknown"))
+		)
+		_agent_panel.call("set_server", "", false, "")
+		return
+	_control_url = str(data.get("url", ""))
+	_control_token = str(data.get("token", ""))
+	_agent_panel.call("set_server", _control_url, true, _control_token)
+	print("Keepwright: control server listening on %s" % _control_url)
+
+
+## Drain queued agent requests, refresh the scene/panel and fulfil render_view.
+func _poll_control() -> void:
+	if _bridge == null or not _bridge.has_method("poll_control"):
+		return
+	var result: Variant = _bridge.call("poll_control")
+	if not (result is Dictionary):
+		return
+	var state: Dictionary = result
+
+	var render_id := int(state.get("render_view_request_id", -1))
+	if render_id >= 0:
+		_fulfill_render_view(render_id)
+
+	if bool(state.get("dirty", false)):
+		var snapshot: Variant = _bridge.call("get_scene_snapshot")
+		if snapshot is Dictionary:
+			_apply_scene(snapshot as Dictionary, false, false)
+		_refresh_agent_panel()
+
+	if bool(state.get("proposals_changed", false)):
+		_refresh_agent_panel()
+		_refresh_ghosts()
+
+
+func _fulfill_render_view(request_id: int) -> void:
+	if _bridge == null or not _bridge.has_method("complete_render_view"):
+		return
+	var viewport := get_viewport()
+	var image: Image = null
+	if viewport != null and viewport.get_texture() != null:
+		image = viewport.get_texture().get_image()
+	if image == null or image.is_empty():
+		_bridge.call(
+			"complete_render_view", request_id, "", "viewport capture is unavailable"
+		)
+		return
+	image.resize(RENDER_VIEW_SIZE.x, RENDER_VIEW_SIZE.y, Image.INTERPOLATE_BILINEAR)
+	var png := image.save_png_to_buffer()
+	var encoded := Marshalls.raw_to_base64(png)
+	_bridge.call("complete_render_view", request_id, encoded, "")
+
+
+func _refresh_agent_panel() -> void:
+	if _agent_panel == null or _bridge == null:
+		return
+	if not _bridge.has_method("get_agent_panel_state"):
+		return
+	var state: Variant = _bridge.call("get_agent_panel_state")
+	if state is Dictionary:
+		_agent_panel.call("refresh", state as Dictionary)
+		_ghost_visibility = _agent_panel.call("get_ghost_visibility")
+
+
+func _refresh_ghosts() -> void:
+	_clear_ghosts()
+	if _bridge == null or _ghost_root == null:
+		return
+	if not _bridge.has_method("get_agent_panel_state"):
+		return
+	var state: Variant = _bridge.call("get_agent_panel_state")
+	if not (state is Dictionary):
+		return
+	var proposals: Variant = (state as Dictionary).get("proposals", [])
+	if not (proposals is Array):
+		return
+	for entry in (proposals as Array):
+		if not (entry is Dictionary):
+			continue
+		var proposal: Dictionary = entry
+		if str(proposal.get("status", "")) != "submitted":
+			continue
+		var proposal_id := str(proposal.get("id", ""))
+		if not bool(_ghost_visibility.get(proposal_id, true)):
+			continue
+		var ghost: Variant = _bridge.call("build_proposal_ghost", proposal_id)
+		if not (ghost is Dictionary) or not bool((ghost as Dictionary).get("ok", false)):
+			continue
+		_add_ghost_chunks((ghost as Dictionary).get("chunks", []))
+
+
+func _add_ghost_chunks(chunks: Variant) -> void:
+	if not (chunks is Array):
+		return
+	for entry in (chunks as Array):
+		if not (entry is Dictionary):
+			continue
+		var mesh: Variant = (entry as Dictionary).get("lod0", null)
+		if not (mesh is ArrayMesh):
+			continue
+		var instance := MeshInstance3D.new()
+		instance.mesh = mesh as ArrayMesh
+		instance.material_override = _ghost_material
+		instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		instance.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+		_ghost_root.add_child(instance)
+		_ghost_nodes.append(instance)
+
+
+func _clear_ghosts() -> void:
+	for instance in _ghost_nodes:
+		if is_instance_valid(instance):
+			instance.queue_free()
+	_ghost_nodes.clear()
+
+
+func _on_demo_proposal_requested() -> void:
+	if _bridge == null or not _bridge.has_method("create_demo_proposal"):
+		return
+	var result: Variant = _bridge.call("create_demo_proposal")
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_hud.call(
+			"show_error",
+			"Demo proposal failed: %s" % str(_dictionary_error(result))
+		)
+		return
+	_hud.call("clear_error")
+	_hud.call(
+		"set_tool_status",
+		"Demo proposal %s ready — review it in AGENTS & MCP"
+		% str((result as Dictionary).get("proposal_id", ""))
+	)
+	_refresh_agent_panel()
+	_refresh_ghosts()
+
+
+func _on_proposal_accept_requested(proposal_id: String) -> void:
+	if _bridge == null or not _bridge.has_method("accept_proposal"):
+		return
+	var result: Variant = _bridge.call("accept_proposal", proposal_id)
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_hud.call("show_error", "Proposal rejected: %s" % str(_dictionary_error(result)))
+		return
+	_apply_scene(result as Dictionary, false, false)
+	_hud.call("clear_error")
+	_hud.call("set_tool_status", "Proposal %s accepted and applied" % proposal_id)
+	_refresh_agent_panel()
+	_refresh_ghosts()
+
+
+func _on_proposal_reject_requested(proposal_id: String, reason: String) -> void:
+	if _bridge == null or not _bridge.has_method("reject_proposal"):
+		return
+	var result: Variant = _bridge.call("reject_proposal", proposal_id, reason)
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_hud.call("show_error", "Reject failed: %s" % str(_dictionary_error(result)))
+		return
+	_hud.call("set_tool_status", "Proposal %s rejected" % proposal_id)
+	_refresh_agent_panel()
+	_refresh_ghosts()
+
+
+func _on_agent_permission_changed(agent_id: String, permission: String) -> void:
+	if _bridge == null or not _bridge.has_method("set_agent_permission"):
+		return
+	_bridge.call("set_agent_permission", agent_id, permission)
+	_refresh_agent_panel()
+
+
+func _on_ghost_toggled(proposal_id: String, visible: bool) -> void:
+	_ghost_visibility[proposal_id] = visible
+	_refresh_ghosts()
+
+
+func _dictionary_error(result: Variant) -> String:
+	if result is Dictionary:
+		return str((result as Dictionary).get("error", "unknown error"))
+	return "no dictionary returned"
+
+
 func _rebuild(mode: String) -> void:
 	if _bridge == null:
 		_hud.call("show_error", "Cannot build: KeepBridge is unavailable.")
@@ -403,6 +645,8 @@ func _rebuild(mode: String) -> void:
 
 	var data: Dictionary = result
 	_apply_scene(data, true, true)
+	_refresh_agent_panel()
+	_refresh_ghosts()
 	_hud.call("set_mode_label", label)
 	_hud.call("clear_error")
 
@@ -684,6 +928,8 @@ func _on_hud_site_requested(site_id: String) -> void:
 		_hud.call("show_error", "Site rejected: %s" % str(data.get("error", "unknown error")))
 		return
 	_apply_scene(data, true, true)
+	_refresh_agent_panel()
+	_refresh_ghosts()
 	_hud.call("set_mode_label", "Empty site — %s" % site_id)
 	_hud.call("clear_error")
 	_hud.call("set_tool_status", "Loaded empty site %s" % site_id)
@@ -945,6 +1191,8 @@ func _on_load_requested() -> void:
 		_hud.call("show_error", "Load failed: %s" % str(data.get("error", "unknown error")))
 		return
 	_apply_scene(data, true, true)
+	_refresh_agent_panel()
+	_refresh_ghosts()
 	_hud.call("clear_error")
 	_hud.call("set_tool_status", "Loaded castle.keep.json")
 

@@ -16,6 +16,7 @@ pub mod masonry;
 pub mod mesh;
 pub mod picking;
 pub mod plan_render;
+pub mod proposal;
 pub mod save;
 pub mod session;
 pub mod style;

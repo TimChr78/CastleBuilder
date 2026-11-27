@@ -1,29 +1,36 @@
-//! Offline MCP sidecar for Keepwright.
+//! MCP sidecar for Keepwright.
 //!
-//! This crate links `keep-core` directly (architecture section 7.2, offline
-//! mode): no game process, no GPU and no async runtime. It speaks line-delimited
-//! JSON-RPC 2.0 over stdio, which makes it deterministic, cheap to spawn and
-//! trivial to replay in tests.
+//! Offline mode links `keep-core` directly (architecture section 7.2): no game
+//! process, no GPU and no async runtime. Live mode forwards tool calls to a
+//! running game over a loopback HTTP/1.1 JSON-RPC connection ([`LiveClient`]).
+//! Either way it speaks line-delimited JSON-RPC 2.0 over stdio, which makes it
+//! deterministic, cheap to spawn and trivial to replay in tests.
 //!
 //! The protocol handler is a plain library type ([`McpServer`]) so every tool,
 //! error case and atomic rollback can be unit tested without a subprocess. The
 //! `keep-mcp` binary is a small stdin/stdout loop around it.
 
 use keep_core::command::AuthorId;
-use keep_core::document::{CastleDocument, Element, TowerPlan};
+use keep_core::document::CastleDocument;
 use keep_core::plan_render::{render_plan_svg, PlanView};
+use keep_core::proposal::AgentPermission;
 use keep_core::session::Session;
 use keep_core::style::StylePack;
 use keep_core::terrain::SiteTerrain;
 use keep_core::validate::validate_structure;
 use keep_proto::{
-    ApplyOperationsRequest, ApplyOperationsResponse, AssessmentResponse, ElementListResponse,
-    ElementSummary, GetCastleResponse, GetHistoryResponse, GetSiteResponse, GetStyleResponse,
-    HistoryEntry, ListStylesResponse, OpeningSummary, RenderPlanRequest, RenderPlanResponse,
-    UndoResponse,
+    ApplyOperationsRequest, ApplyOperationsResponse, AssessmentResponse, BeginProposalRequest,
+    ElementListResponse, GetCastleResponse, GetHistoryResponse, GetSiteResponse, GetStyleResponse,
+    HistoryEntry, ListProposalsResponse, ListStylesResponse, ProposalResponse, RenderPlanRequest,
+    RenderPlanResponse, RenderViewRequest, RenderViewResponse, StageProposalOpsRequest,
+    SubmitProposalRequest, UndoResponse,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+
+mod live;
+
+pub use live::LiveClient;
 
 /// MCP protocol revision implemented by this sidecar.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -42,12 +49,24 @@ mod code {
     pub const RESOURCE_NOT_FOUND: i64 = -32002;
 }
 
-/// The offline MCP server: one authoritative [`Session`] plus the agent author
-/// identity used for edits and undos.
+/// Which authoritative backend a request is served from.
+#[derive(Debug)]
+enum Backend {
+    /// `keep-core` linked in-process: no game process, no GPU.
+    Offline,
+    /// Forward every tool call to the running game's loopback control server.
+    Live(LiveClient),
+}
+
+/// The MCP server: one authoritative [`Session`] plus the agent author identity
+/// used for edits and undos. In live mode the session stays empty and tool calls
+/// are forwarded to the game, which owns the real document.
 #[derive(Debug)]
 pub struct McpServer {
     session: Session,
     author: AuthorId,
+    permission: AgentPermission,
+    backend: Backend,
 }
 
 impl Default for McpServer {
@@ -57,37 +76,96 @@ impl Default for McpServer {
 }
 
 impl McpServer {
-    /// Create a server. `empty` starts from an empty document instead of the
-    /// M0b showcase.
+    /// Create a server with direct-edit permission. `empty` starts from an empty
+    /// document instead of the M0b showcase.
     pub fn new(empty: bool) -> Self {
         let document = if empty {
             CastleDocument::new()
         } else {
             keep_core::fixtures::m0b_showcase_document()
         };
-        Self::from_document(
+        Self::with_permission(
             keep_core::session::DEFAULT_SITE_ID,
             SiteTerrain::m0a_promontory(),
             document,
+            AgentPermission::DirectEdit,
         )
     }
 
-    /// Create a server around an explicit site terrain and document.
+    /// Create a server around an explicit site terrain, document and permission.
+    pub fn with_permission(
+        site_id: impl Into<String>,
+        terrain: SiteTerrain,
+        document: CastleDocument,
+        permission: AgentPermission,
+    ) -> Self {
+        let site_id = site_id.into();
+        let mut session = Session::from_document(site_id, terrain, document);
+        session
+            .register_agent(OFFLINE_AUTHOR_ID, "Offline agent", "#4fa3ff", permission)
+            .expect("offline agent identity is valid");
+        Self {
+            session,
+            author: AuthorId::agent(OFFLINE_AUTHOR_ID).expect("offline author id is valid"),
+            permission,
+            backend: Backend::Offline,
+        }
+    }
+
+    /// Create a server around an explicit site terrain and document with the
+    /// historical direct-edit default.
     pub fn from_document(
         site_id: impl Into<String>,
         terrain: SiteTerrain,
         document: CastleDocument,
     ) -> Self {
-        Self {
-            session: Session::from_document(site_id, terrain, document),
-            author: AuthorId::agent(OFFLINE_AUTHOR_ID).expect("offline author id is valid"),
-        }
+        Self::with_permission(site_id, terrain, document, AgentPermission::DirectEdit)
     }
 
     /// Create a server on a curated site, or `None` when the site id is unknown.
     pub fn with_start(site_id: &str, document: CastleDocument) -> Option<Self> {
+        Self::with_start_permission(site_id, document, AgentPermission::DirectEdit)
+    }
+
+    /// Create a server on a curated site with an explicit agent permission.
+    pub fn with_start_permission(
+        site_id: &str,
+        document: CastleDocument,
+        permission: AgentPermission,
+    ) -> Option<Self> {
         SiteTerrain::for_site(site_id)
-            .map(|terrain| Self::from_document(site_id, terrain, document))
+            .map(|terrain| Self::with_permission(site_id, terrain, document, permission))
+    }
+
+    /// Create a live-mode server that forwards tool calls to a running game.
+    /// The URL must be a loopback `http://127.0.0.1:<port>` or
+    /// `http://localhost:<port>`.
+    pub fn live(url: &str, token: &str, permission: AgentPermission) -> Result<Self, String> {
+        let client = LiveClient::connect(url, token)?;
+        let mut session = Session::from_document(
+            keep_core::session::DEFAULT_SITE_ID,
+            SiteTerrain::m0a_promontory(),
+            CastleDocument::new(),
+        );
+        session
+            .register_agent(OFFLINE_AUTHOR_ID, "Offline agent", "#4fa3ff", permission)
+            .expect("offline agent identity is valid");
+        Ok(Self {
+            session,
+            author: AuthorId::agent(OFFLINE_AUTHOR_ID).expect("offline author id is valid"),
+            permission,
+            backend: Backend::Live(client),
+        })
+    }
+
+    /// The agent permission enforced for tool calls.
+    pub fn permission(&self) -> AgentPermission {
+        self.permission
+    }
+
+    /// True when this server forwards tool calls to a running game.
+    pub fn is_live(&self) -> bool {
+        matches!(self.backend, Backend::Live(_))
     }
 
     /// Current castle document (tests and embedders).
@@ -177,6 +255,18 @@ impl McpServer {
             .cloned()
             .unwrap_or_else(|| json!({}));
 
+        if let Some(message) = self.permission_refusal(name) {
+            return json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": tool_error(message)
+            });
+        }
+
+        if self.is_live() {
+            return self.handle_live_tool_call(id, name, arguments);
+        }
+
         let result = match name {
             "get_castle" => self.tool_get_castle().map(|value| tool_result(&value)),
             "list_elements" => self.tool_list_elements().map(|value| tool_result(&value)),
@@ -194,6 +284,20 @@ impl McpServer {
                 .tool_get_style(arguments)
                 .map(|value| tool_result(&value)),
             "get_site" => self.tool_get_site().map(|value| tool_result(&value)),
+            "begin_proposal" => self
+                .tool_begin_proposal(arguments)
+                .map(|value| tool_result(&value)),
+            "stage_proposal_ops" => self
+                .tool_stage_proposal_ops(arguments)
+                .map(|value| tool_result(&value)),
+            "submit_proposal" => self
+                .tool_submit_proposal(arguments)
+                .map(|value| tool_result(&value)),
+            "list_proposals" => self.tool_list_proposals().map(|value| tool_result(&value)),
+            "render_view" => Err(
+                "render_view requires --live mode with a running game; use render_plan offline"
+                    .to_string(),
+            ),
             other => {
                 return error_response(id, code::INVALID_PARAMS, format!("unknown tool: {other}"))
             }
@@ -209,29 +313,96 @@ impl McpServer {
         }
     }
 
+    /// Refuse tools the connected agent's permission forbids (architecture
+    /// section 7.6). Reads and renders are always allowed.
+    fn permission_refusal(&self, tool: &str) -> Option<String> {
+        match self.permission {
+            AgentPermission::DirectEdit => None,
+            AgentPermission::ReadOnly => matches!(
+                tool,
+                "apply_operations"
+                    | "undo"
+                    | "begin_proposal"
+                    | "stage_proposal_ops"
+                    | "submit_proposal"
+            )
+            .then(|| {
+                format!(
+                    "permission denied: read-only agents cannot call '{tool}'. \
+                     Ask the human to raise this agent's permission to proposal-only or direct-edit."
+                )
+            }),
+            AgentPermission::ProposalOnly => match tool {
+                "apply_operations" | "undo" => Some(format!(
+                    "permission denied: proposal-only agents cannot call '{tool}' directly. \
+                     Use begin_proposal, stage_proposal_ops and submit_proposal instead; \
+                     the human accepts or rejects the proposal in-game."
+                )),
+                _ => None,
+            },
+        }
+    }
+
+    fn handle_live_tool_call(&mut self, id: Value, name: &str, arguments: Value) -> Value {
+        let result = self.dispatch_live_tool(name, arguments);
+        match result {
+            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            Err(message) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": tool_error(message)
+            }),
+        }
+    }
+
+    fn dispatch_live_tool(&mut self, name: &str, arguments: Value) -> Result<Value, String> {
+        // Never forward an agent-supplied identity: the game decides who the
+        // caller is from the control token, not from tool arguments (M1.3 B2).
+        let arguments = strip_agent_id(arguments);
+
+        match name {
+            "get_castle" => {
+                let value = self.call_live(name, arguments)?;
+                let response: GetCastleResponse = serde_json::from_value(value)
+                    .map_err(|error| format!("invalid get_castle response: {error}"))?;
+                Ok(tool_result(&response))
+            }
+            "list_elements" => {
+                let value = self.call_live(name, arguments)?;
+                let response: ElementListResponse = serde_json::from_value(value)
+                    .map_err(|error| format!("invalid list_elements response: {error}"))?;
+                Ok(tool_result(&response))
+            }
+            "render_view" => {
+                let request: RenderViewRequest = serde_json::from_value(arguments)
+                    .map_err(|error| format!("invalid arguments: {error}"))?;
+                let params = serde_json::to_value(&request)
+                    .map_err(|error| format!("invalid arguments: {error}"))?;
+                let value = self.call_live(name, params)?;
+                let response: RenderViewResponse = serde_json::from_value(value)
+                    .map_err(|error| format!("invalid render_view response: {error}"))?;
+                Ok(image_tool_result(&response))
+            }
+            _ => self
+                .call_live(name, arguments)
+                .map(|value| tool_result(&value)),
+        }
+    }
+
+    /// Forward one raw request to the live game and return its `result`.
+    fn call_live(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let Backend::Live(client) = &mut self.backend else {
+            return Err("internal error: live backend is not connected".to_string());
+        };
+        client.call(method, params)
+    }
+
     fn tool_get_castle(&self) -> Result<GetCastleResponse, String> {
-        let scene = self.session.build_scene();
-        let document = self.session.document();
-        Ok(GetCastleResponse {
-            document_hash: hex_hash(document.document_hash()),
-            layout_hash: hex_hash(scene.layout_hash),
-            element_count: document.len(),
-            opening_count: document.opening_count(),
-            block_count: scene.block_count,
-            chunk_count: scene.chunk_count(),
-            elements: element_summaries(document),
-            openings: opening_summaries(document),
-        })
+        Ok(keep_proto::build_castle_response(&self.session))
     }
 
     fn tool_list_elements(&self) -> Result<ElementListResponse, String> {
-        let document = self.session.document();
-        Ok(ElementListResponse {
-            element_count: document.len(),
-            opening_count: document.opening_count(),
-            elements: element_summaries(document),
-            openings: opening_summaries(document),
-        })
+        Ok(keep_proto::build_element_list_response(&self.session))
     }
 
     fn tool_render_plan(&self, arguments: Value) -> Result<RenderPlanResponse, String> {
@@ -367,10 +538,56 @@ impl McpServer {
         })
     }
 
-    fn handle_resource_read(&self, params: &Value) -> Result<Value, (i64, String)> {
+    /// Begin a draft proposal overlay owned by this agent.
+    fn tool_begin_proposal(&mut self, arguments: Value) -> Result<ProposalResponse, String> {
+        let request: BeginProposalRequest = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        let proposal = self
+            .session
+            .begin_proposal(self.author.clone(), &request.title)
+            .map_err(|error| error.to_string())?;
+        Ok(ProposalResponse { proposal })
+    }
+
+    /// Stage an additional batch onto a draft proposal without touching the
+    /// live document.
+    fn tool_stage_proposal_ops(&mut self, arguments: Value) -> Result<ProposalResponse, String> {
+        let request: StageProposalOpsRequest = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        let proposal = self
+            .session
+            .stage_proposal_ops(&request.proposal_id, &self.author, request.operations)
+            .map_err(|error| error.to_string())?;
+        Ok(ProposalResponse { proposal })
+    }
+
+    /// Submit a non-empty draft for human approval.
+    fn tool_submit_proposal(&mut self, arguments: Value) -> Result<ProposalResponse, String> {
+        let request: SubmitProposalRequest = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        let proposal = self
+            .session
+            .submit_proposal(&request.proposal_id, &self.author, &request.summary)
+            .map_err(|error| error.to_string())?;
+        Ok(ProposalResponse { proposal })
+    }
+
+    /// Every proposal overlay in stable id order.
+    fn tool_list_proposals(&self) -> Result<ListProposalsResponse, String> {
+        let proposals: Vec<_> = self.session.proposals().cloned().collect();
+        Ok(ListProposalsResponse {
+            count: proposals.len(),
+            proposals,
+        })
+    }
+
+    fn handle_resource_read(&mut self, params: &Value) -> Result<Value, (i64, String)> {
         let Some(uri) = params.get("uri").and_then(Value::as_str) else {
             return Err((code::INVALID_PARAMS, "missing resource uri".into()));
         };
+        if self.is_live() {
+            return self.handle_live_resource_read(uri);
+        }
         match uri {
             "keep://castle/document" => {
                 let castle = self
@@ -410,6 +627,63 @@ impl McpServer {
         }
     }
 
+    /// Serve a resource from the running game (M1.3 H4). The offline dummy
+    /// session is empty, so every read must be forwarded to the live control
+    /// server instead of being answered locally.
+    fn handle_live_resource_read(&mut self, uri: &str) -> Result<Value, (i64, String)> {
+        let (method, params, mime_type) = match uri {
+            "keep://castle/document" => ("get_castle", json!({}), "application/json"),
+            "keep://castle/assessment" => ("get_assessment", json!({}), "application/json"),
+            "keep://castle/plan/top" => (
+                "render_plan",
+                json!({ "view": "top_plan" }),
+                "image/svg+xml",
+            ),
+            "keep://castle/plan/elevation" => (
+                "render_plan",
+                json!({ "view": "elevation_north" }),
+                "image/svg+xml",
+            ),
+            "keep://styles/edwardian_welsh" => (
+                "get_style",
+                json!({ "id": "edwardian_welsh" }),
+                "application/json",
+            ),
+            "keep://castle/save" => {
+                return Err((
+                    code::INVALID_PARAMS,
+                    "keep://castle/save is only available in --offline mode".to_string(),
+                ))
+            }
+            other => {
+                return Err((
+                    code::RESOURCE_NOT_FOUND,
+                    format!("unknown resource: {other}"),
+                ))
+            }
+        };
+
+        let value = self
+            .call_live(method, params)
+            .map_err(|message| (code::INTERNAL_ERROR, message))?;
+        let text = if mime_type == "image/svg+xml" {
+            value
+                .get("svg")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    (
+                        code::INTERNAL_ERROR,
+                        "live render_plan response had no svg field".to_string(),
+                    )
+                })?
+        } else {
+            serde_json::to_string_pretty(&value)
+                .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?
+        };
+        Ok(resource_contents(uri, mime_type, text))
+    }
+
     fn resource_svg(&self, uri: &str, view: PlanView) -> Value {
         let svg = render_plan_svg(self.session.document(), self.session.terrain(), view);
         resource_contents(uri, "image/svg+xml", svg)
@@ -424,7 +698,7 @@ fn initialize_result() -> Value {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Offline Keepwright castle sidecar. Use get_castle, list_elements, render_plan, apply_operations, undo and get_history, plus get_assessment, list_styles, get_style and get_site for structural and style reads."
+        "instructions": "Keepwright castle sidecar. Use get_castle, list_elements, render_plan, apply_operations, undo and get_history, plus get_assessment, list_styles, get_style and get_site for structural and style reads. Use begin_proposal, stage_proposal_ops and submit_proposal to propose edits for the human to accept in-game (list_proposals shows their status). render_view needs live mode; render_plan works offline."
     })
 }
 
@@ -500,6 +774,20 @@ fn tool_error(message: impl Into<String>) -> Value {
     })
 }
 
+/// MCP image content plus the structured render metadata for `render_view`.
+fn image_tool_result(response: &RenderViewResponse) -> Value {
+    let structured = serde_json::to_value(response).expect("render_view result serialises");
+    json!({
+        "content": [{
+            "type": "image",
+            "data": response.image_base64,
+            "mimeType": response.mime_type
+        }],
+        "structuredContent": structured,
+        "isError": false
+    })
+}
+
 fn error_response(id: Value, code: i64, message: impl Into<String>) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -522,110 +810,25 @@ fn truncate_message_field(value: &str, max_chars: usize) -> String {
         .collect()
 }
 
-fn element_summaries(document: &CastleDocument) -> Vec<ElementSummary> {
-    document
-        .elements()
-        .map(|element| match element {
-            Element::BatteredWall(wall) => ElementSummary {
-                id: wall.id,
-                kind: "wall".to_string(),
-                name: wall.name.clone(),
-                height_mm: wall.height_mm,
-                thickness_mm: wall.thickness_mm,
-                start_mm: Some(wall.start_mm),
-                end_mm: Some(wall.end_mm),
-                centre_mm: None,
-                radius_mm: None,
-                length_mm: Some(wall.length_mm()),
-                plan: None,
-                orientation_deg: None,
-                passage_width_mm: None,
-                passage_height_mm: None,
-                depth_mm: None,
-            },
-            Element::RoundTower(tower) => ElementSummary {
-                id: tower.id,
-                kind: "tower".to_string(),
-                name: tower.name.clone(),
-                height_mm: tower.height_mm,
-                thickness_mm: tower.thickness_mm,
-                start_mm: None,
-                end_mm: None,
-                centre_mm: Some(tower.centre_mm),
-                radius_mm: Some(tower.radius_mm),
-                length_mm: None,
-                plan: Some(
-                    match tower.plan {
-                        TowerPlan::Round => "round",
-                        TowerPlan::Square => "square",
-                        TowerPlan::DShaped => "d_shaped",
-                    }
-                    .to_string(),
-                ),
-                orientation_deg: Some(tower.orientation_deg),
-                passage_width_mm: None,
-                passage_height_mm: None,
-                depth_mm: None,
-            },
-            Element::Gatehouse(gatehouse) => ElementSummary {
-                id: gatehouse.id,
-                kind: "gatehouse".to_string(),
-                name: gatehouse.name.clone(),
-                height_mm: gatehouse.height_mm,
-                thickness_mm: gatehouse.depth_mm,
-                start_mm: None,
-                end_mm: None,
-                centre_mm: Some(gatehouse.centre_mm),
-                radius_mm: Some(gatehouse.tower_radius_mm),
-                length_mm: None,
-                plan: None,
-                orientation_deg: Some(gatehouse.orientation_deg),
-                passage_width_mm: Some(gatehouse.passage_width_mm),
-                passage_height_mm: Some(gatehouse.passage_height_mm),
-                depth_mm: Some(gatehouse.depth_mm),
-            },
-            Element::Ditch(ditch) => ElementSummary {
-                id: ditch.id,
-                kind: "ditch".to_string(),
-                name: ditch.name.clone(),
-                height_mm: 0,
-                thickness_mm: ditch.width_mm,
-                start_mm: Some(ditch.start_mm),
-                end_mm: Some(ditch.end_mm),
-                centre_mm: None,
-                radius_mm: None,
-                length_mm: Some(ditch.length_mm()),
-                plan: None,
-                orientation_deg: None,
-                passage_width_mm: None,
-                passage_height_mm: None,
-                depth_mm: Some(ditch.depth_mm),
-            },
-        })
-        .collect()
-}
-
-fn opening_summaries(document: &CastleDocument) -> Vec<OpeningSummary> {
-    document
-        .openings()
-        .map(|opening| OpeningSummary {
-            id: opening.id,
-            wall_id: opening.wall_id,
-            kind: "arrow_loop".to_string(),
-            name: opening.name.clone(),
-            t_permille: opening.t_permille,
-            sill_height_mm: opening.sill_height_mm,
-            height_mm: opening.height_mm,
-            outer_slit_mm: opening.outer_slit_mm,
-            inner_splay_width_mm: opening.inner_splay_width_mm,
-        })
-        .collect()
+/// Drop any agent-supplied `agent_id` from live tool arguments. The live game
+/// authenticates the caller from the control token, so forwarding an identity
+/// from the model would let it act as another agent (M1.3 B2).
+fn strip_agent_id(mut arguments: Value) -> Value {
+    if let Some(object) = arguments.as_object_mut() {
+        object.remove("agent_id");
+    }
+    arguments
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use keep_proto::{MAX_BATCH_OPS, MAX_NAME_CHARS};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
     fn server() -> McpServer {
         McpServer::new(false)
@@ -765,11 +968,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_ten_tools_with_schemas() {
+    fn tools_list_exposes_fifteen_tools_with_schemas() {
         let mut server = server();
         let response = call(&mut server, 4, "tools/list", json!({}));
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 15);
         for tool in tools {
             assert!(tool["inputSchema"].is_object());
             assert!(tool["outputSchema"].is_object());
@@ -788,7 +991,12 @@ mod tests {
                 "get_assessment",
                 "list_styles",
                 "get_style",
-                "get_site"
+                "get_site",
+                "begin_proposal",
+                "stage_proposal_ops",
+                "submit_proposal",
+                "list_proposals",
+                "render_view"
             ]
         );
     }
@@ -1845,5 +2053,517 @@ mod tests {
             server.session().build_scene().layout_hash
         );
         assert_eq!(loaded.history().len(), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // Proposals and permissions (M1.3 wave 2a)
+    // -------------------------------------------------------------------
+
+    fn proposal_server(permission: AgentPermission) -> McpServer {
+        McpServer::with_permission(
+            keep_core::session::DEFAULT_SITE_ID,
+            SiteTerrain::m0a_promontory(),
+            CastleDocument::new(),
+            permission,
+        )
+    }
+
+    #[test]
+    fn proposal_lifecycle_leaves_the_live_document_untouched() {
+        let mut server = proposal_server(AgentPermission::ProposalOnly);
+        let before = structured(&mut server, "get_castle", json!({}));
+
+        let begun = structured(
+            &mut server,
+            "begin_proposal",
+            json!({ "title": "North curtain" }),
+        );
+        assert_eq!(begun["proposal"]["id"], "prop_0001");
+        assert_eq!(begun["proposal"]["status"], "draft");
+        assert_eq!(begun["proposal"]["author"]["kind"], "agent");
+        assert_eq!(begun["proposal"]["author"]["id"], OFFLINE_AUTHOR_ID);
+        assert_eq!(begun["proposal"]["ops"], json!([]));
+
+        let staged = structured(
+            &mut server,
+            "stage_proposal_ops",
+            json!({
+                "proposal_id": "prop_0001",
+                "operations": [sample_wall("north")]
+            }),
+        );
+        assert_eq!(staged["proposal"]["ops"].as_array().unwrap().len(), 1);
+        assert_eq!(staged["proposal"]["status"], "draft");
+        assert!(staged["proposal"]["structure_after"].is_number());
+        assert!(staged["proposal"]["semantic_diff"]
+            .as_str()
+            .unwrap()
+            .contains("wall"));
+
+        let submitted = structured(
+            &mut server,
+            "submit_proposal",
+            json!({
+                "proposal_id": "prop_0001",
+                "summary": "A new north curtain"
+            }),
+        );
+        assert_eq!(submitted["proposal"]["status"], "submitted");
+        assert_eq!(submitted["proposal"]["summary"], "A new north curtain");
+
+        let listed = structured(&mut server, "list_proposals", json!({}));
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["proposals"][0]["id"], "prop_0001");
+        assert_eq!(listed["proposals"][0]["status"], "submitted");
+
+        // The overlay is not the castle: nothing was applied or logged.
+        let after = structured(&mut server, "get_castle", json!({}));
+        assert_eq!(before["document_hash"], after["document_hash"]);
+        assert_eq!(server.document().len(), 0);
+        assert!(server.session().history().is_empty());
+    }
+
+    #[test]
+    fn proposal_only_refuses_direct_edits_with_guidance() {
+        let mut server = proposal_server(AgentPermission::ProposalOnly);
+        let message = tool_error_message(
+            &mut server,
+            "apply_operations",
+            json!({ "operations": [sample_wall("north")] }),
+        );
+        assert!(message.contains("proposal-only"), "got {message}");
+        assert!(message.contains("begin_proposal"), "got {message}");
+        assert!(message.contains("in-game"), "got {message}");
+
+        let message = tool_error_message(&mut server, "undo", json!({}));
+        assert!(message.contains("proposal-only"), "got {message}");
+        assert_eq!(server.document().len(), 0);
+    }
+
+    #[test]
+    fn read_only_refuses_every_write_and_proposal_tool() {
+        let mut server = proposal_server(AgentPermission::ReadOnly);
+
+        // Reads and renders still work.
+        structured(&mut server, "get_castle", json!({}));
+        structured(&mut server, "list_elements", json!({}));
+        structured(&mut server, "render_plan", json!({}));
+        let listed = structured(&mut server, "list_proposals", json!({}));
+        assert_eq!(listed["count"], 0);
+
+        for (tool, arguments) in [
+            (
+                "apply_operations",
+                json!({ "operations": [sample_wall("north")] }),
+            ),
+            ("undo", json!({})),
+            ("begin_proposal", json!({ "title": "Nope" })),
+            (
+                "stage_proposal_ops",
+                json!({ "proposal_id": "prop_0001", "operations": [] }),
+            ),
+            (
+                "submit_proposal",
+                json!({ "proposal_id": "prop_0001", "summary": "Nope" }),
+            ),
+        ] {
+            let message = tool_error_message(&mut server, tool, arguments);
+            assert!(
+                message.contains("read-only"),
+                "{tool} should be refused, got {message}"
+            );
+        }
+
+        let message = tool_error_message(&mut server, "render_view", json!({}));
+        assert!(message.contains("requires --live mode"), "got {message}");
+        assert!(message.contains("render_plan offline"), "got {message}");
+        assert_eq!(server.document().len(), 0);
+        assert!(server.session().proposals().next().is_none());
+    }
+
+    #[test]
+    fn direct_edit_can_still_propose_and_apply() {
+        let mut server = proposal_server(AgentPermission::DirectEdit);
+        assert_eq!(server.permission(), AgentPermission::DirectEdit);
+        let begun = structured(
+            &mut server,
+            "begin_proposal",
+            json!({ "title": "Direct proposal" }),
+        );
+        assert_eq!(begun["proposal"]["status"], "draft");
+        let applied = structured(
+            &mut server,
+            "apply_operations",
+            json!({ "operations": [sample_wall("north")] }),
+        );
+        assert_eq!(applied["applied_count"], 1);
+    }
+
+    #[test]
+    fn proposal_errors_are_tool_errors() {
+        let mut server = proposal_server(AgentPermission::ProposalOnly);
+        let message = tool_error_message(
+            &mut server,
+            "stage_proposal_ops",
+            json!({ "proposal_id": "prop_9999", "operations": [] }),
+        );
+        assert!(message.contains("unknown proposal"), "got {message}");
+
+        structured(&mut server, "begin_proposal", json!({ "title": "Empty" }));
+        let message = tool_error_message(
+            &mut server,
+            "submit_proposal",
+            json!({ "proposal_id": "prop_0001", "summary": "Nothing" }),
+        );
+        assert!(message.contains("no staged operations"), "got {message}");
+
+        let message = tool_error_message(&mut server, "begin_proposal", json!({}));
+        assert!(message.contains("invalid arguments"), "got {message}");
+    }
+
+    // -------------------------------------------------------------------
+    // Live HTTP JSON-RPC mode
+    // -------------------------------------------------------------------
+
+    struct MockServer {
+        url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockServer {
+        fn finish(mut self) {
+            if let Some(handle) = self.handle.take() {
+                handle.join().expect("mock server thread");
+            }
+        }
+    }
+
+    /// A tiny loopback HTTP/1.1 server: one JSON-RPC response per connection.
+    fn spawn_mock(responses: Vec<Value>) -> MockServer {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock server");
+        let port = listener.local_addr().unwrap().port();
+        let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept mock request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    let read = reader.read_line(&mut line).expect("read request line");
+                    if read == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; length];
+                reader.read_exact(&mut body).expect("read request body");
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(format!("{head}\r\n{}", String::from_utf8_lossy(&body)));
+
+                let payload = serde_json::to_string(&response).unwrap();
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                stream.write_all(reply.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        MockServer {
+            url: format!("http://127.0.0.1:{port}"),
+            requests,
+            handle: Some(handle),
+        }
+    }
+
+    fn header_value(request: &str, name: &str) -> Option<String> {
+        request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    #[test]
+    fn live_client_round_trips_tools_with_auth_and_host_headers() {
+        let mock = spawn_mock(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": live_castle_result("0123456789abcdef")
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": { "proposal": { "id": "prop_0001", "status": "draft" } }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "width": 768,
+                    "height": 512,
+                    "mime_type": "image/png",
+                    "image_base64": "aGVsbG8="
+                }
+            }),
+        ]);
+        let expected_host = mock.url.strip_prefix("http://").unwrap().to_string();
+        let requests = Arc::clone(&mock.requests);
+
+        let mut server =
+            McpServer::live(&mock.url, "secret-token", AgentPermission::DirectEdit).unwrap();
+        assert!(server.is_live());
+
+        let castle = structured(&mut server, "get_castle", json!({}));
+        assert_eq!(castle["document_hash"], "0123456789abcdef");
+
+        let begun = structured(
+            &mut server,
+            "begin_proposal",
+            json!({ "title": "Live proposal" }),
+        );
+        assert_eq!(begun["proposal"]["id"], "prop_0001");
+
+        let rendered = call_tool(&mut server, "render_view", json!({ "yaw_deg": 45.0 }));
+        assert_eq!(rendered["isError"], false);
+        assert_eq!(rendered["content"][0]["type"], "image");
+        assert_eq!(rendered["content"][0]["data"], "aGVsbG8=");
+        assert_eq!(rendered["content"][0]["mimeType"], "image/png");
+        assert_eq!(rendered["structuredContent"]["width"], 768);
+        assert_eq!(rendered["structuredContent"]["height"], 512);
+
+        mock.finish();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            assert!(
+                request.starts_with("POST /rpc HTTP/1.1\r\n"),
+                "unexpected request line: {request}"
+            );
+            assert_eq!(
+                header_value(request, "Host").as_deref(),
+                Some(expected_host.as_str())
+            );
+            assert_eq!(
+                header_value(request, "Authorization").as_deref(),
+                Some("Bearer secret-token")
+            );
+            assert_eq!(
+                header_value(request, "Content-Type").as_deref(),
+                Some("application/json")
+            );
+            assert_eq!(
+                header_value(request, "Connection").as_deref(),
+                Some("close")
+            );
+        }
+        assert!(requests[0].contains("\"method\":\"get_castle\""));
+        assert!(requests[1].contains("\"method\":\"begin_proposal\""));
+        assert!(requests[2].contains("\"method\":\"render_view\""));
+    }
+
+    #[test]
+    fn live_mode_rejects_non_loopback_urls() {
+        for url in [
+            "http://example.com:8765",
+            "http://192.168.1.20:8765",
+            "https://127.0.0.1:8765",
+        ] {
+            assert!(
+                McpServer::live(url, "token", AgentPermission::DirectEdit).is_err(),
+                "accepted {url}"
+            );
+        }
+        assert!(LiveClient::connect("http://localhost:1", "token").is_ok());
+    }
+
+    #[test]
+    fn live_mode_enforces_permissions_before_network_calls() {
+        let mut server =
+            McpServer::live("http://127.0.0.1:1", "token", AgentPermission::ProposalOnly).unwrap();
+        let message = tool_error_message(
+            &mut server,
+            "apply_operations",
+            json!({ "operations": [sample_wall("north")] }),
+        );
+        assert!(message.contains("proposal-only"), "got {message}");
+
+        let mut server =
+            McpServer::live("http://127.0.0.1:1", "token", AgentPermission::ReadOnly).unwrap();
+        let message = tool_error_message(&mut server, "begin_proposal", json!({ "title": "Nope" }));
+        assert!(message.contains("read-only"), "got {message}");
+    }
+
+    #[test]
+    fn live_mode_surfaces_control_server_errors_as_tool_errors() {
+        let mock = spawn_mock(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": { "code": -32601, "message": "unknown method" }
+        })]);
+        let mut server = McpServer::live(&mock.url, "token", AgentPermission::DirectEdit).unwrap();
+        let message = tool_error_message(&mut server, "get_castle", json!({}));
+        assert!(message.contains("control server error"), "got {message}");
+        assert!(message.contains("unknown method"), "got {message}");
+        mock.finish();
+    }
+
+    fn live_castle_result(document_hash: &str) -> Value {
+        json!({
+            "document_hash": document_hash,
+            "layout_hash": "fedcba9876543210",
+            "element_count": 1,
+            "opening_count": 0,
+            "block_count": 42,
+            "chunk_count": 1,
+            "elements": [],
+            "openings": []
+        })
+    }
+
+    #[test]
+    fn live_mode_strips_an_agent_supplied_identity() {
+        let mock = spawn_mock(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": live_castle_result("0123456789abcdef")
+        })]);
+        let requests = Arc::clone(&mock.requests);
+        let mut server = McpServer::live(&mock.url, "token", AgentPermission::DirectEdit).unwrap();
+        let castle = structured(
+            &mut server,
+            "get_castle",
+            json!({ "agent_id": "human:owner" }),
+        );
+        assert_eq!(castle["document_hash"], "0123456789abcdef");
+        mock.finish();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].contains("agent_id"),
+            "agent_id must never be forwarded: {}",
+            requests[0]
+        );
+    }
+
+    #[test]
+    fn live_resources_read_forwards_to_the_game_not_the_empty_offline_session() {
+        let mock = spawn_mock(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": live_castle_result("0123456789abcdef")
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "view": "top_plan",
+                    "document_hash": "0123456789abcdef",
+                    "mime_type": "image/svg+xml",
+                    "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>"
+                }
+            }),
+        ]);
+        let requests = Arc::clone(&mock.requests);
+        let mut server = McpServer::live(&mock.url, "token", AgentPermission::DirectEdit).unwrap();
+
+        let document = call(
+            &mut server,
+            20,
+            "resources/read",
+            json!({ "uri": "keep://castle/document" }),
+        );
+        let contents = &document["result"]["contents"][0];
+        assert_eq!(contents["mimeType"], "application/json");
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["document_hash"], "0123456789abcdef");
+        assert_eq!(parsed["block_count"], 42);
+        assert_eq!(
+            parsed["element_count"], 1,
+            "must not return the empty offline session"
+        );
+
+        let plan = call(
+            &mut server,
+            21,
+            "resources/read",
+            json!({ "uri": "keep://castle/plan/top" }),
+        );
+        let contents = &plan["result"]["contents"][0];
+        assert_eq!(contents["mimeType"], "image/svg+xml");
+        assert!(contents["text"].as_str().unwrap().starts_with("<svg "));
+
+        mock.finish();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("\"method\":\"get_castle\""));
+        assert!(requests[1].contains("\"method\":\"render_plan\""));
+        assert!(requests[1].contains("top_plan"));
+    }
+
+    #[test]
+    fn live_save_resource_is_rejected_as_offline_only() {
+        let mut server =
+            McpServer::live("http://127.0.0.1:1", "token", AgentPermission::DirectEdit).unwrap();
+        let response = call(
+            &mut server,
+            22,
+            "resources/read",
+            json!({ "uri": "keep://castle/save" }),
+        );
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("--offline mode"), "got {message}");
+    }
+
+    #[test]
+    fn live_mode_reports_http_status_before_parsing_the_body() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind status mock");
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept status request");
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: close\r\n\r\nbad token\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let mut server = McpServer::live(
+            &format!("http://127.0.0.1:{port}"),
+            "token",
+            AgentPermission::DirectEdit,
+        )
+        .unwrap();
+        let message = tool_error_message(&mut server, "get_castle", json!({}));
+        assert!(message.contains("HTTP 401"), "got {message}");
+        assert!(message.contains("unauthorized"), "got {message}");
+        assert!(
+            !message.contains("valid JSON-RPC"),
+            "status must be reported before JSON parsing: {message}"
+        );
+        handle.join().expect("status mock thread");
     }
 }

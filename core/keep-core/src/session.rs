@@ -15,13 +15,19 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::command::{
-    execute_batch, uuid_v7, validate_element_budget, AuthorId, CommandError, CommandOp,
-    CommandPayload, InverseRecord, LoggedCommand,
+    execute_batch, sanitize_name, uuid_v7, validate_element_budget, AuthorId, AuthorKind,
+    CommandError, CommandOp, CommandPayload, InverseRecord, LoggedCommand,
 };
 use crate::document::{CastleDocument, Element, ElementId, Opening};
 use crate::junction::junction_partners;
 use crate::mesh::{build_scene, SceneData};
+use crate::proposal::{
+    sanitize_summary, AgentParticipant, AgentPermission, AgentState, Proposal, ProposalError,
+    ProposalStatus,
+};
+use crate::style::StylePack;
 use crate::terrain::SiteTerrain;
+use crate::validate::validate_structure;
 
 /// Default site id used by the M0a fixtures.
 pub const DEFAULT_SITE_ID: &str = "m0a_promontory";
@@ -117,6 +123,12 @@ pub struct Session {
     pub(crate) next_seq: u64,
     /// Deterministic monotonic millisecond clock for UUIDv7.
     pub(crate) clock_ms: u64,
+    /// Connected agents, in stable id order (architecture section 7.7).
+    pub(crate) agents: BTreeMap<String, AgentParticipant>,
+    /// Live proposal overlays. Never part of the saved castle (section 4.2).
+    pub(crate) proposals: BTreeMap<String, Proposal>,
+    /// Deterministic proposal id allocator (`prop_0001`, `prop_0002`, ...).
+    pub(crate) next_proposal_seq: u64,
 }
 
 impl Session {
@@ -147,6 +159,9 @@ impl Session {
             next_element_id,
             next_seq: 1,
             clock_ms: DEFAULT_CLOCK_MS,
+            agents: BTreeMap::new(),
+            proposals: BTreeMap::new(),
+            next_proposal_seq: 1,
         }
     }
 
@@ -347,6 +362,355 @@ impl Session {
             &self.command_log,
         )?
         .document)
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent participants (architecture sections 7.6 and 7.7)
+    // -----------------------------------------------------------------------
+
+    /// Register or replace an agent participant. The id uses the same
+    /// sanitisation rules as an [`AuthorId`]; the display name is trimmed and
+    /// length-limited. An empty or malformed colour falls back to neutral grey.
+    pub fn register_agent(
+        &mut self,
+        id: &str,
+        name: &str,
+        color_hex: &str,
+        permission: AgentPermission,
+    ) -> Result<&AgentParticipant, CommandError> {
+        let author = AuthorId::agent(id)?;
+        let name = sanitize_name(name)?;
+        let participant = AgentParticipant {
+            id: author.id.clone(),
+            name,
+            color_hex: sanitize_color_hex(color_hex),
+            permission,
+            state: AgentState::Idle,
+        };
+        self.agents.insert(author.id.clone(), participant);
+        Ok(self
+            .agents
+            .get(&author.id)
+            .expect("agent was inserted immediately above"))
+    }
+
+    /// Change an agent's permission. Unknown ids are refused rather than
+    /// silently created.
+    pub fn set_agent_permission(
+        &mut self,
+        id: &str,
+        permission: AgentPermission,
+    ) -> Result<(), ProposalError> {
+        let agent = self
+            .agents
+            .get_mut(id)
+            .ok_or(ProposalError::PermissionDenied)?;
+        agent.permission = permission;
+        Ok(())
+    }
+
+    /// Update the presence state shown in the agent panel. A no-op for unknown
+    /// ids so UI presence updates stay infallible.
+    pub fn set_agent_state(&mut self, id: &str, state: AgentState) {
+        if let Some(agent) = self.agents.get_mut(id) {
+            agent.state = state;
+        }
+    }
+
+    /// One agent by sanitised id.
+    pub fn agent(&self, id: &str) -> Option<&AgentParticipant> {
+        self.agents.get(id)
+    }
+
+    /// Connected agents in stable id order.
+    pub fn agents(&self) -> impl Iterator<Item = &AgentParticipant> {
+        self.agents.values()
+    }
+
+    // -----------------------------------------------------------------------
+    // Proposals: forked overlays, human-approved (architecture section 4.2)
+    // -----------------------------------------------------------------------
+
+    /// Begin a draft proposal against the current document. Read-only and
+    /// paused agents are refused (sections 7.6 and 7.7).
+    pub fn begin_proposal(
+        &mut self,
+        author: AuthorId,
+        title: &str,
+    ) -> Result<Proposal, ProposalError> {
+        self.ensure_agent_active(&author, AgentPermission::ProposalOnly)?;
+        let title = sanitize_name(title)?;
+        let id = format!("prop_{:04}", self.next_proposal_seq);
+        self.next_proposal_seq += 1;
+        let proposal = Proposal {
+            id: id.clone(),
+            author,
+            title,
+            summary: String::new(),
+            base_document_hash: document_hash_hex(&self.document),
+            base_next_element_id: self.next_element_id,
+            ops: Vec::new(),
+            created_element_ids: Vec::new(),
+            semantic_diff: String::new(),
+            structure_before: 0,
+            structure_after: 0,
+            structure_delta: 0,
+            status: ProposalStatus::Draft,
+            reject_reason: None,
+        };
+        self.proposals.insert(id, proposal.clone());
+        if proposal.author.kind == AuthorKind::Agent {
+            if let Some(agent) = self.agents.get_mut(&proposal.author.id) {
+                agent.state = AgentState::BuildingProposal;
+            }
+        }
+        Ok(proposal)
+    }
+
+    /// Stage additional operations onto a draft proposal. The staged batch is
+    /// replayed atomically on a **fork** of the live document to validate it,
+    /// compute the semantic diff and structural delta, and record preview ids.
+    /// The live document, id allocator and command log are untouched.
+    pub fn stage_proposal_ops(
+        &mut self,
+        proposal_id: &str,
+        author: &AuthorId,
+        ops: Vec<CommandOp>,
+    ) -> Result<Proposal, ProposalError> {
+        let proposal = self
+            .proposals
+            .get(proposal_id)
+            .cloned()
+            .ok_or(ProposalError::UnknownProposal)?;
+        if proposal.author != *author {
+            return Err(ProposalError::NotOwner);
+        }
+        self.ensure_agent_active(author, AgentPermission::ProposalOnly)?;
+        if proposal.status != ProposalStatus::Draft {
+            return Err(ProposalError::NotDraft);
+        }
+
+        let mut combined = proposal.ops.clone();
+        combined.extend(ops);
+        let application = execute_batch(&self.document, self.next_element_id, &combined)?;
+
+        let style = StylePack::default();
+        let structure_before = validate_structure(&self.document, &self.terrain, &style).score;
+        let structure_after =
+            validate_structure(&application.document, &self.terrain, &style).score;
+
+        // Preview ids of everything the proposal adds or modifies. Deleted ids
+        // are excluded: they have nothing to render in the ghost overlay.
+        let mut created_element_ids: Vec<ElementId> = application
+            .touched_elements
+            .iter()
+            .copied()
+            .filter(|id| application.document.get(*id).is_some())
+            .collect();
+        created_element_ids.sort_unstable();
+        created_element_ids.dedup();
+
+        let updated = Proposal {
+            ops: combined,
+            created_element_ids,
+            semantic_diff: application.summary,
+            structure_before,
+            structure_after,
+            structure_delta: structure_after as i32 - structure_before as i32,
+            ..proposal
+        };
+        self.proposals
+            .insert(proposal_id.to_string(), updated.clone());
+        Ok(updated)
+    }
+
+    /// Submit a non-empty draft for human approval.
+    pub fn submit_proposal(
+        &mut self,
+        proposal_id: &str,
+        author: &AuthorId,
+        summary: &str,
+    ) -> Result<Proposal, ProposalError> {
+        let mut proposal = self
+            .proposals
+            .get(proposal_id)
+            .cloned()
+            .ok_or(ProposalError::UnknownProposal)?;
+        if proposal.author != *author {
+            return Err(ProposalError::NotOwner);
+        }
+        // A permission downgrade or pause after staging still blocks the
+        // submission, not just the earlier lifecycle calls (M1.3 B4).
+        self.ensure_agent_active(author, AgentPermission::ProposalOnly)?;
+        if proposal.status != ProposalStatus::Draft {
+            return Err(ProposalError::NotDraft);
+        }
+        if proposal.ops.is_empty() {
+            return Err(ProposalError::EmptyProposal);
+        }
+        proposal.summary = sanitize_summary(summary)?;
+        proposal.status = ProposalStatus::Submitted;
+        self.proposals
+            .insert(proposal_id.to_string(), proposal.clone());
+        if proposal.author.kind == AuthorKind::Agent {
+            if let Some(agent) = self.agents.get_mut(&proposal.author.id) {
+                agent.state = AgentState::WaitingForApproval;
+            }
+        }
+        Ok(proposal)
+    }
+
+    /// Accept a submitted proposal as one atomic batch attributed to the
+    /// agent. This is the human approval step: it is deliberately only exposed
+    /// on the host/session, never to the proposal-only agent surface. Refuses
+    /// with [`ProposalError::StaleBase`] when the castle changed underneath.
+    pub fn accept_proposal(&mut self, proposal_id: &str) -> Result<ApplyOutcome, ProposalError> {
+        let mut proposal = self
+            .proposals
+            .get(proposal_id)
+            .cloned()
+            .ok_or(ProposalError::UnknownProposal)?;
+        if proposal.status != ProposalStatus::Submitted {
+            return Err(ProposalError::NotSubmitted);
+        }
+        // The id allocator is monotonic, so comparing it with the recorded
+        // value in addition to the document hash catches delete-and-recreate
+        // cycles that leave the hash unchanged (M1.3 Medium #1).
+        if proposal.base_document_hash != document_hash_hex(&self.document)
+            || proposal.base_next_element_id != self.next_element_id
+        {
+            return Err(ProposalError::StaleBase);
+        }
+
+        let outcome = self.apply_batch(proposal.author.clone(), proposal.ops.clone())?;
+        proposal.status = ProposalStatus::Accepted;
+        self.proposals
+            .insert(proposal_id.to_string(), proposal.clone());
+        if proposal.author.kind == AuthorKind::Agent {
+            if let Some(agent) = self.agents.get_mut(&proposal.author.id) {
+                agent.state = AgentState::Idle;
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Reject a submitted proposal. The live document and command log stay
+    /// exactly as they were; only the overlay records the decision.
+    pub fn reject_proposal(
+        &mut self,
+        proposal_id: &str,
+        reason: Option<&str>,
+    ) -> Result<Proposal, ProposalError> {
+        let mut proposal = self
+            .proposals
+            .get(proposal_id)
+            .cloned()
+            .ok_or(ProposalError::UnknownProposal)?;
+        if proposal.status != ProposalStatus::Submitted {
+            return Err(ProposalError::NotSubmitted);
+        }
+        let reason = match reason {
+            Some(reason) => Some(sanitize_summary(reason)?),
+            None => None,
+        };
+        proposal.status = ProposalStatus::Rejected;
+        proposal.reject_reason = reason;
+        self.proposals
+            .insert(proposal_id.to_string(), proposal.clone());
+        if proposal.author.kind == AuthorKind::Agent {
+            if let Some(agent) = self.agents.get_mut(&proposal.author.id) {
+                agent.state = AgentState::Idle;
+            }
+        }
+        Ok(proposal)
+    }
+
+    /// All proposals in stable id order.
+    pub fn proposals(&self) -> impl Iterator<Item = &Proposal> {
+        self.proposals.values()
+    }
+
+    /// One proposal by id.
+    pub fn proposal(&self, id: &str) -> Option<&Proposal> {
+        self.proposals.get(id)
+    }
+
+    /// Build a translucent-overlay scene for a proposal: only the elements the
+    /// proposal adds or modifies, taken from a fresh fork of the live document.
+    /// Unchanged castle elements are deliberately omitted so the ghost cannot
+    /// double-draw the real castle. Returns `None` for unknown proposals or
+    /// when the staged operations no longer replay cleanly.
+    pub fn build_proposal_ghost_scene(&self, proposal_id: &str) -> Option<SceneData> {
+        let proposal = self.proposals.get(proposal_id)?;
+        // Only live overlays (draft or awaiting approval) may draw a ghost.
+        // Accepted, rejected or empty proposals have nothing to preview
+        // (M1.3 Medium #3).
+        if !matches!(
+            proposal.status,
+            ProposalStatus::Draft | ProposalStatus::Submitted
+        ) || proposal.ops.is_empty()
+        {
+            return None;
+        }
+        let application =
+            execute_batch(&self.document, self.next_element_id, &proposal.ops).ok()?;
+
+        let mut ghost = CastleDocument::new();
+        for id in &proposal.created_element_ids {
+            if let Some(element) = application.document.get(*id) {
+                ghost.insert(element.clone());
+            }
+        }
+        // Openings are voids inside their wall, so they only matter when their
+        // parent wall is part of the ghost.
+        for id in &proposal.created_element_ids {
+            for opening in application.document.openings_for_wall(*id) {
+                ghost.insert_opening(opening.clone());
+            }
+        }
+        Some(build_scene(&ghost, &self.terrain))
+    }
+
+    /// Shared gate for every agent-facing mutation: the author must be a
+    /// registered agent holding *at least* `required` permission and must not
+    /// be paused. Player and system authors always pass (M1.3 B4).
+    pub fn ensure_agent_active(
+        &self,
+        author: &AuthorId,
+        required: AgentPermission,
+    ) -> Result<(), ProposalError> {
+        if author.kind != AuthorKind::Agent {
+            return Ok(());
+        }
+        let agent = self
+            .agents
+            .get(&author.id)
+            .ok_or(ProposalError::PermissionDenied)?;
+        if agent.state == AgentState::Paused {
+            return Err(ProposalError::PermissionDenied);
+        }
+        if agent.permission.level() < required.level() {
+            return Err(ProposalError::PermissionDenied);
+        }
+        Ok(())
+    }
+}
+
+/// Hex document hash used for proposal base checks.
+fn document_hash_hex(document: &CastleDocument) -> String {
+    format!("{:016x}", document.document_hash())
+}
+
+/// Keep a colour readable by the UI and free of control characters.
+fn sanitize_color_hex(value: &str) -> String {
+    let trimmed = value.trim();
+    let valid = !trimmed.is_empty()
+        && trimmed.len() <= 16
+        && trimmed.chars().all(|c| c == '#' || c.is_ascii_hexdigit());
+    if valid {
+        trimmed.to_string()
+    } else {
+        "#888888".to_string()
     }
 }
 

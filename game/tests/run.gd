@@ -61,6 +61,14 @@ func _initialize() -> void:
 		quit(1)
 		return
 
+	if bridge != null:
+		_check_control_and_proposals(bridge, failures)
+
+	if not failures.is_empty():
+		_for_each_failure(failures)
+		quit(1)
+		return
+
 	_check_feel_scripts(failures)
 
 	if not failures.is_empty():
@@ -652,6 +660,182 @@ func _check_m1(bridge: Object, failures: Array[String]) -> void:
 		print(
 			"M1.2 bridge OK: blocks=%d chunks=%d sites=3 fix=ok"
 			% [int(m1.get("block_count", 0)), int(m1.get("chunk_count", 0))]
+		)
+
+
+## M1.3 Wave 2b: localhost control server, demo proposals, ghost overlays and
+## the in-game agent panel.
+func _check_control_and_proposals(bridge: Object, failures: Array[String]) -> void:
+	for method in [
+		"start_control_server",
+		"poll_control",
+		"complete_render_view",
+		"get_agent_panel_state",
+		"set_agent_permission",
+		"accept_proposal",
+		"reject_proposal",
+		"build_proposal_ghost",
+		"create_demo_proposal",
+		"get_scene_snapshot",
+	]:
+		if not bridge.has_method(method):
+			failures.append("KeepBridge has no %s() method." % method)
+	if not failures.is_empty():
+		return
+
+	var base_result: Variant = bridge.call("build_m1_edwardian")
+	if not (base_result is Dictionary):
+		failures.append("build_m1_edwardian(control test) did not return a Dictionary.")
+		return
+	var base: Dictionary = base_result
+	var base_hash := str(base.get("document_hash", ""))
+	var base_history := int(base.get("history_len", -1))
+
+	# 1. Ephemeral loopback control server with a 32-hex session token.
+	var server := _require_ok(
+		bridge.call("start_control_server", 0), "start_control_server(0)", failures
+	)
+	if server.is_empty():
+		return
+	var port := int(server.get("port", 0))
+	var url := str(server.get("url", ""))
+	var token := str(server.get("token", ""))
+	if port <= 0:
+		failures.append("start_control_server(0) did not return an ephemeral port.")
+	if url != "127.0.0.1:%d" % port:
+		failures.append("start_control_server() URL %s does not match port %d." % [url, port])
+	if not url.begins_with("127.0.0.1:"):
+		failures.append("start_control_server() did not bind loopback: %s" % url)
+	if token.length() != 32 or not token.is_valid_hex_number():
+		failures.append("start_control_server() token is not 32 hex characters: %s" % token)
+
+	var poll: Variant = bridge.call("poll_control")
+	if not (poll is Dictionary):
+		failures.append("poll_control() did not return a Dictionary.")
+	else:
+		var poll_data: Dictionary = poll
+		for key in ["dirty", "proposals_changed", "render_view_request_id"]:
+			if not poll_data.has(key):
+				failures.append("poll_control() is missing \"%s\"." % key)
+
+	var panel_state: Variant = bridge.call("get_agent_panel_state")
+	if not (panel_state is Dictionary):
+		failures.append("get_agent_panel_state() did not return a Dictionary.")
+	else:
+		var panel_data: Dictionary = panel_state
+		if not bool(panel_data.get("server_running", false)):
+			failures.append("get_agent_panel_state() reports the server as stopped.")
+		if str(panel_data.get("server_url", "")) != url:
+			failures.append("get_agent_panel_state() server_url does not match the server.")
+		var agents: Variant = panel_data.get("agents", null)
+		if not (agents is Array) or (agents as Array).is_empty():
+			failures.append("get_agent_panel_state() returned no agents.")
+		var listed: Variant = panel_data.get("proposals", null)
+		if not (listed is Array):
+			failures.append("get_agent_panel_state().proposals is not an Array.")
+
+	# 2. Demo proposal -> non-empty ghost chunks -> reject leaves the document.
+	var demo := _require_ok(
+		bridge.call("create_demo_proposal"), "create_demo_proposal()", failures
+	)
+	if demo.is_empty():
+		return
+	var demo_id := str(demo.get("proposal_id", ""))
+	if demo_id.is_empty():
+		failures.append("create_demo_proposal() returned an empty proposal_id.")
+	if str(demo.get("semantic_diff", "")).is_empty():
+		failures.append("create_demo_proposal() returned an empty semantic_diff.")
+
+	var ghost := _require_ok(
+		bridge.call("build_proposal_ghost", demo_id), "build_proposal_ghost()", failures
+	)
+	if not ghost.is_empty():
+		var chunks: Variant = ghost.get("chunks", null)
+		if not (chunks is Array) or (chunks as Array).is_empty():
+			failures.append("build_proposal_ghost() returned no chunks.")
+		if int(ghost.get("block_count", 0)) <= 0:
+			failures.append("build_proposal_ghost() returned no blocks.")
+
+	var pending_state: Variant = bridge.call("get_agent_panel_state")
+	if pending_state is Dictionary:
+		var found_submitted := false
+		for entry in ((pending_state as Dictionary).get("proposals", []) as Array):
+			if entry is Dictionary and str((entry as Dictionary).get("id", "")) == demo_id:
+				found_submitted = str((entry as Dictionary).get("status", "")) == "submitted"
+		if not found_submitted:
+			failures.append("get_agent_panel_state() did not list the demo as submitted.")
+
+	var rejected := _require_ok(
+		bridge.call("reject_proposal", demo_id, "Not this time"),
+		"reject_proposal()",
+		failures
+	)
+	if not rejected.is_empty():
+		var after_reject := _require_ok(
+			bridge.call("save_castle_json"), "save_castle_json(after reject)", failures
+		)
+		if not after_reject.is_empty():
+			if str(after_reject.get("document_hash", "")) != base_hash:
+				failures.append("reject_proposal() changed the live document hash.")
+			if int(after_reject.get("history_len", -1)) != base_history:
+				failures.append("reject_proposal() changed the command history.")
+
+	# 3. A second demo proposal accepted commits as one attributed batch.
+	var demo_two := _require_ok(
+		bridge.call("create_demo_proposal"), "create_demo_proposal(second)", failures
+	)
+	if demo_two.is_empty():
+		return
+	var demo_two_id := str(demo_two.get("proposal_id", ""))
+	if demo_two_id == demo_id:
+		failures.append("create_demo_proposal() reused the rejected proposal id.")
+
+	var accepted := _require_ok(
+		bridge.call("accept_proposal", demo_two_id), "accept_proposal()", failures
+	)
+	if not accepted.is_empty():
+		if str(accepted.get("document_hash", "")) == base_hash:
+			failures.append("accept_proposal() did not change the document hash.")
+		if int(accepted.get("history_len", -1)) != base_history + 1:
+			failures.append(
+				"accept_proposal() did not append exactly one history entry (got %d)."
+				% int(accepted.get("history_len", -1))
+			)
+		if int(accepted.get("block_count", 0)) <= 0:
+			failures.append("accept_proposal() returned no masonry after applying.")
+
+	# 4. The panel script builds, exposes its API and survives a refresh.
+	var panel_script: Variant = load("res://scripts/agent_panel.gd")
+	if not (panel_script is GDScript):
+		failures.append("agent_panel.gd did not load as a GDScript.")
+	else:
+		var panel: Variant = (panel_script as GDScript).new()
+		if panel == null or not (panel is CanvasLayer):
+			failures.append("AgentPanel is not a CanvasLayer.")
+		else:
+			root.add_child(panel as CanvasLayer)
+			for method in ["set_server", "refresh", "get_ghost_visibility"]:
+				if not panel.has_method(method):
+					failures.append("AgentPanel has no %s()." % method)
+			for signal_name in [
+				"permission_changed",
+				"proposal_accept_requested",
+				"proposal_reject_requested",
+				"ghost_toggled",
+				"demo_proposal_requested",
+			]:
+				if not panel.has_signal(signal_name):
+					failures.append("AgentPanel has no %s signal." % signal_name)
+			panel.call("set_server", "127.0.0.1:17731", true, "token")
+			panel.call("refresh", {"agents": [], "proposals": []})
+			if not (panel.call("get_ghost_visibility") is Dictionary):
+				failures.append("AgentPanel.get_ghost_visibility() is not a Dictionary.")
+			(panel as Node).free()
+
+	if failures.is_empty():
+		print(
+			"M1.3 control + proposals OK: %s token=%s… ghost+accept/reject"
+			% [url, token.substr(0, 6)]
 		)
 
 

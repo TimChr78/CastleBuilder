@@ -133,7 +133,7 @@ fn offline_binary_completes_a_full_mcp_session() {
     assert_eq!(responses[0]["result"]["serverInfo"]["name"], "keep-mcp");
     assert_eq!(
         responses[1]["result"]["tools"].as_array().unwrap().len(),
-        10
+        15
     );
 
     let castle = &responses[2]["result"]["structuredContent"];
