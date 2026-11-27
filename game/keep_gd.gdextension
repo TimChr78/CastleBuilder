@@ -1,0 +1,11 @@
+[configuration]
+
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = "4.7"
+
+[libraries]
+
+linux.debug.x86_64 = "res://../core/target/debug/libkeep_gd.so"
+linux.release.x86_64 = "res://../core/target/release/libkeep_gd.so"
+windows.debug.x86_64 = "res://../core/target/debug/keep_gd.dll"
+windows.release.x86_64 = "res://../core/target/release/keep_gd.dll"

@@ -28,6 +28,7 @@ cargo clippy --manifest-path core/Cargo.toml --all-targets
 
 # Godot headless verification
 godot --headless --path game --quit
+godot --headless --path game --script res://tests/run.gd
 ```
 
 ## Development Workflow

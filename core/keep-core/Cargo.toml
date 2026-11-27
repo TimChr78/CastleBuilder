@@ -1,0 +1,12 @@
+[package]
+name = "keep-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.100"
+description = "Engine-agnostic deterministic castle document, terrain, masonry and meshing core for Keepwright"
+license = "MIT"
+
+[dependencies]
+libm = "0.2.16"
+
+[dev-dependencies]

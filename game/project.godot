@@ -1,0 +1,38 @@
+; Engine configuration file.
+; Keepwright — M0a look and performance spike.
+; Edited by hand (no editor-generated uid churn) so agent diffs stay clean.
+;
+; Toolchain is pinned in tools/versions.toml: Godot 4.7.2, gdext 0.5.6.
+
+config_version=5
+
+[application]
+
+config/name="Keepwright"
+config/description="Procedural medieval castle builder — M0a look and performance spike."
+run/main_scene="res://scenes/main.tscn"
+config/features=PackedStringArray("4.7", "Forward Plus")
+
+[display]
+
+window/size/viewport_width=1600
+window/size/viewport_height=900
+window/size/window_width_override=1600
+window/size/window_height_override=900
+window/stretch/mode="canvas_items"
+
+[rendering]
+
+renderer/rendering_method="forward_plus"
+renderer/rendering_method.mobile="gl_compatibility"
+textures/default_filters/anisotropic_filtering_level=4
+anti_aliasing/quality/msaa_3d=1
+anti_aliasing/quality/screen_space_aa=1
+anti_aliasing/quality/use_debanding=true
+lights_and_shadows/directional_shadow/size=4096
+lights_and_shadows/directional_shadow/soft_shadow_filter_quality=3
+lights_and_shadows/directional_shadow/16_bits=false
+lights_and_shadows/positional_shadow/atlas_size=4096
+environment/ssao/quality=3
+environment/ssao/half_size=false
+environment/screen_space_reflection/roughness_quality=2
