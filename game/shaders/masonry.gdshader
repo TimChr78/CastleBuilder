@@ -4,7 +4,7 @@
 //   UV      : local block-face UV in [0, 1]
 //   COLOR   : r = baked sky/hemisphere AO, g = warm/cool tint, b = age, a = jitter seed
 //   CUSTOM0 : r = build_index_norm [0,1], g = course_index, b = block width (m),
-//             a = block height (m)
+//             a = block height (m), negative when the block is a roof tile
 //
 // Bevelled edges and mortar joints are produced procedurally from UV, so ordinary
 // 6-10 triangle blocks read as crisp dressed stone without extra geometry.
@@ -18,6 +18,16 @@ uniform vec4 stone_light : source_color = vec4(0.80, 0.75, 0.63, 1.0);
 uniform vec4 stone_warm : source_color = vec4(0.69, 0.59, 0.44, 1.0);
 uniform vec4 stone_cool : source_color = vec4(0.55, 0.58, 0.57, 1.0);
 uniform vec4 mortar_color : source_color = vec4(0.47, 0.44, 0.38, 1.0);
+// 0 = limestone ashlar, 1 = Baltic weathered red brick.
+uniform int material_palette = 0;
+// --- Baltic red brick palette ------------------------------------------
+uniform vec4 brick_light : source_color = vec4(0.56, 0.24, 0.17, 1.0);
+uniform vec4 brick_warm : source_color = vec4(0.48, 0.20, 0.14, 1.0);
+uniform vec4 brick_cool : source_color = vec4(0.42, 0.17, 0.13, 1.0);
+uniform vec4 brick_mortar : source_color = vec4(0.76, 0.72, 0.65, 1.0);
+// --- Medieval roof slate (shared by both palettes) ---------------------
+uniform vec4 slate_light : source_color = vec4(0.18, 0.21, 0.25, 1.0);
+uniform vec4 slate_dark : source_color = vec4(0.11, 0.13, 0.16, 1.0);
 uniform vec4 sky_fill_color : source_color = vec4(0.33, 0.45, 0.63, 1.0);
 uniform vec4 bounce_color : source_color = vec4(0.96, 0.66, 0.36, 1.0);
 
@@ -247,14 +257,19 @@ void fragment() {
 		// Sub-pixel grain would alias on distant shells; fade it to its mean.
 		float grain_mix = mix(0.5, grain, 1.0 - smoothstep(0.05, 0.18, aa_m));
 
-		vec3 stone = mix(stone_cool.rgb, stone_warm.rgb, smoothstep(0.12, 0.92, cell_tint));
-		stone = mix(stone_light.rgb, stone, 0.55);
+		vec3 pal_light = material_palette == 1 ? brick_light.rgb : stone_light.rgb;
+		vec3 pal_warm = material_palette == 1 ? brick_warm.rgb : stone_warm.rgb;
+		vec3 pal_cool = material_palette == 1 ? brick_cool.rgb : stone_cool.rgb;
+		vec3 pal_mortar = material_palette == 1 ? brick_mortar.rgb : mortar_color.rgb;
+
+		vec3 stone = mix(pal_cool, pal_warm, smoothstep(0.12, 0.92, cell_tint));
+		stone = mix(pal_light, stone, 0.55);
 		stone *= cell_bright;
 		stone *= mix(1.0, 0.78 + 0.42 * grain_mix, grain_strength);
 		stone *= mix(vec3(1.0), vec3(0.86, 0.90, 0.80), age * 0.55);
 		stone *= 1.0 - streaks * 0.32 * weathering_strength;
 
-		vec3 joint = mortar_color.rgb * (0.85 + 0.30 * patches);
+		vec3 joint = pal_mortar * (0.85 + 0.30 * patches);
 		vec3 albedo = mix(stone, joint, mortar * 0.92);
 		albedo = weathered_stone(albedo, wp, wn, fresh_lift);
 
@@ -286,10 +301,11 @@ void fragment() {
 	vec4 custom = v_custom;
 
 	// Blocks may be different sizes, so convert UV distance to metres using the
-	// per-block dimensions. Fall back to a sensible size if the attribute is
-	// missing (e.g. a future simplified LOD mesh).
-	float dims_valid = step(0.001, custom.b) * step(0.001, custom.a);
-	vec2 block_size_m = mix(vec2(0.40, 0.25), vec2(custom.b, custom.a), dims_valid);
+	// per-block dimensions. Roof tiles encode their height as a negative value,
+	// so read the magnitude and keep the sign as an explicit roof flag.
+	float block_height_m = abs(custom.a);
+	float dims_valid = step(0.001, custom.b) * step(0.001, block_height_m);
+	vec2 block_size_m = mix(vec2(0.40, 0.25), vec2(custom.b, block_height_m), dims_valid);
 	vec2 edge_uv = min(uv, vec2(1.0) - uv);
 	vec2 edge_m = edge_uv * block_size_m;
 	float edge_distance = min(edge_m.x, edge_m.y);
@@ -372,15 +388,28 @@ void fragment() {
 	float tint = clamp(v_color.g, 0.0, 1.0);
 	float seed = clamp(v_color.a, 0.0, 1.0);
 
-	vec3 stone = mix(stone_cool.rgb, stone_warm.rgb, smoothstep(0.12, 0.92, tint));
-	stone = mix(stone_light.rgb, stone, 0.55);
+	vec3 pal_light = material_palette == 1 ? brick_light.rgb : stone_light.rgb;
+	vec3 pal_warm = material_palette == 1 ? brick_warm.rgb : stone_warm.rgb;
+	vec3 pal_cool = material_palette == 1 ? brick_cool.rgb : stone_cool.rgb;
+	vec3 pal_mortar = material_palette == 1 ? brick_mortar.rgb : mortar_color.rgb;
+
+	vec3 stone = mix(pal_cool, pal_warm, smoothstep(0.12, 0.92, tint));
+	stone = mix(pal_light, stone, 0.55);
 	stone *= 1.0 + (seed - 0.5) * 0.12;
 	stone *= mix(1.0, 0.78 + 0.42 * grain_mix, grain_strength);
 	stone *= mix(vec3(1.0), vec3(0.86, 0.90, 0.80), age * 0.55);
 	stone *= 1.0 - streaks * 0.32 * weathering_strength;
 
-	vec3 joint = mortar_color.rgb * (0.85 + 0.30 * patches_mix);
+	vec3 joint = pal_mortar * (0.85 + 0.30 * patches_mix);
 	vec3 albedo = mix(stone, joint, mortar * 0.92);
+
+	// Explicit roof flag: only blocks the generator tagged as slate carry the
+	// negative encoded height. Short bricks and gatehouse courses stay stone.
+	float slate = (custom.a < 0.0) ? 1.0 : 0.0;
+	vec3 slate_albedo = mix(slate_dark.rgb, slate_light.rgb, smoothstep(0.12, 0.92, tint));
+	slate_albedo *= 0.88 + (seed - 0.5) * 0.24;
+	slate_albedo *= mix(1.0, 0.82 + 0.36 * grain_mix, grain_strength * 0.7);
+	albedo = mix(albedo, slate_albedo, slate);
 	albedo = weathered_stone(albedo, wp, wn, fresh_lift);
 
 	ALBEDO = albedo;

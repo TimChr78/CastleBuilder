@@ -349,6 +349,7 @@ func _setup_hud() -> void:
 	_hud.connect("timelapse_requested", Callable(self, "_on_hud_timelapse_requested"))
 	_hud.connect("mute_toggled", Callable(self, "_on_hud_mute_toggled"))
 	_hud.connect("mode_requested", Callable(self, "_on_hud_mode_requested"))
+	_hud.connect("style_requested", Callable(self, "_on_hud_style_requested"))
 	_hud.connect("site_requested", Callable(self, "_on_hud_site_requested"))
 	_hud.connect("tool_requested", Callable(self, "_on_hud_tool_requested"))
 	_hud.connect("fix_requested", Callable(self, "_on_hud_fix_requested"))
@@ -376,6 +377,8 @@ func _setup_feel() -> void:
 	)
 	_design_tool.connect("gatehouse_committed", Callable(self, "_on_gatehouse_committed"))
 	_design_tool.connect("ditch_committed", Callable(self, "_on_ditch_committed"))
+	_design_tool.connect("keep_committed", Callable(self, "_on_keep_committed"))
+	_design_tool.connect("range_committed", Callable(self, "_on_range_committed"))
 	_design_tool.connect("snap_feedback", Callable(self, "_on_snap_feedback"))
 	_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.NONE)
 
@@ -732,6 +735,9 @@ func _rebuild(mode: String) -> void:
 		"stress":
 			method = "build_stress_200k"
 			label = "200k Stress Test"
+		"m2":
+			method = "build_m2_baltic"
+			label = "M2 Baltic Brick"
 		_:
 			method = "build_m1_edwardian"
 			label = "M1 Edwardian"
@@ -793,6 +799,16 @@ func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 	var assessment: Variant = data.get("assessment", {})
 	if assessment is Dictionary:
 		_hud.call("set_assessment", assessment as Dictionary)
+
+	var historian: Variant = data.get("historian", {})
+	if historian is Dictionary:
+		_hud.call("set_historian", historian as Dictionary)
+
+	var style_id := str(data.get("style_id", "edwardian_welsh"))
+	_hud.call("set_style_selection", style_id)
+	if _masonry_material != null:
+		var palette_index := 1 if str(data.get("material_palette", "limestone")) == "red_brick" else 0
+		_masonry_material.set_shader_parameter("material_palette", palette_index)
 
 	if reset_play:
 		_hud.call("clear_error")
@@ -1096,9 +1112,33 @@ func _on_hud_tool_requested(tool: String) -> void:
 		"ditch":
 			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.DITCH)
 			_hud.call("set_tool_status", "Tool: Ditch — drag LMB across the approach")
+		"keep":
+			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.KEEP)
+			_hud.call("set_tool_status", "Tool: Keep — click LMB to place a great keep")
+		"hall":
+			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.HALL)
+			_hud.call("set_tool_status", "Tool: Hall — click LMB to place a pitched-roof range")
 		_:
 			_design_tool.call("set_mode", DESIGN_TOOL_SCRIPT.Mode.NONE)
 			_hud.call("set_tool_status", "Tool: View — orbit around the site")
+
+
+func _on_hud_style_requested(style_id: String) -> void:
+	if _bridge == null or not _bridge.has_method("set_style"):
+		_hud.call("show_error", "Cannot switch style: KeepBridge.set_style() is unavailable.")
+		return
+	var result: Variant = _bridge.call("set_style", style_id)
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_hud.call("show_error", "Style rejected: %s" % _dictionary_error(result))
+		return
+	# Rebuild the scene dictionary so the shader palette and historian line follow
+	# the new active pack without changing the document.
+	if _bridge.has_method("get_scene_snapshot"):
+		var snapshot: Variant = _bridge.call("get_scene_snapshot")
+		if snapshot is Dictionary:
+			_apply_scene(snapshot as Dictionary, false, false)
+	_hud.call("clear_error")
+	_hud.call("set_tool_status", "Style: %s" % style_id)
 
 
 func _on_hud_site_requested(site_id: String) -> void:
@@ -1281,6 +1321,50 @@ func _on_ditch_committed(start_m: Vector2, end_m: Vector2, width_m: float, depth
 		return
 	_apply_scene(data, false, false)
 	_hud.call("set_tool_status", "Ditch added: %.1f m — Ctrl+Z to undo" % length)
+
+
+func _on_keep_committed(center_m: Vector2, orientation_deg: int) -> void:
+	if _audio != null:
+		_audio.call("play_place_thud", 1.1)
+	print(
+		"Keepwright: keep committed — centre %s, orientation %d°"
+		% [str(center_m), orientation_deg]
+	)
+	if _bridge == null or not _bridge.has_method("add_keep"):
+		_hud.call("set_tool_status", "Keep committed at %s" % str(center_m))
+		return
+	var result: Variant = _bridge.call("add_keep", center_m, orientation_deg)
+	if not (result is Dictionary):
+		_hud.call("show_error", "KeepBridge.add_keep() did not return a Dictionary.")
+		return
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		_hud.call("show_error", "Keep rejected: %s" % str(data.get("error", "unknown error")))
+		return
+	_apply_scene(data, false, false)
+	_hud.call("set_tool_status", "Keep added — Ctrl+Z to undo")
+
+
+func _on_range_committed(center_m: Vector2, kind: String, orientation_deg: int) -> void:
+	if _audio != null:
+		_audio.call("play_place_thud", 0.92)
+	print(
+		"Keepwright: %s range committed — centre %s, orientation %d°"
+		% [kind, str(center_m), orientation_deg]
+	)
+	if _bridge == null or not _bridge.has_method("add_range"):
+		_hud.call("set_tool_status", "%s range committed at %s" % [kind, str(center_m)])
+		return
+	var result: Variant = _bridge.call("add_range", center_m, kind, orientation_deg)
+	if not (result is Dictionary):
+		_hud.call("show_error", "KeepBridge.add_range() did not return a Dictionary.")
+		return
+	var data: Dictionary = result
+	if not bool(data.get("ok", false)):
+		_hud.call("show_error", "Range rejected: %s" % str(data.get("error", "unknown error")))
+		return
+	_apply_scene(data, false, false)
+	_hud.call("set_tool_status", "%s range added — Ctrl+Z to undo" % kind)
 
 
 func _on_undo_requested() -> void:

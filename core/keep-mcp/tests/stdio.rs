@@ -231,6 +231,74 @@ fn m1_flag_starts_the_edwardian_showcase_on_the_coastal_headland() {
 }
 
 #[test]
+fn m2_flag_starts_the_baltic_showcase_on_the_lake_island() {
+    let mut child = spawn(&["--offline", "--m2"]);
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "get_castle", "arguments": {} }
+        }),
+    );
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "get_site", "arguments": {} }
+        }),
+    );
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "get_assessment",
+                "arguments": { "style_id": "baltic_brick" }
+            }
+        }),
+    );
+    drop(child.stdin.take());
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let responses: Vec<Value> = BufReader::new(stdout)
+        .lines()
+        .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+        .collect();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(responses.len(), 3, "responses: {responses:#?}");
+
+    let castle = &responses[0]["result"]["structuredContent"];
+    assert_eq!(castle["element_count"], 14);
+    let kinds: Vec<&str> = castle["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|element| element["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"keep"));
+    assert!(kinds.contains(&"range"));
+    assert!(kinds.contains(&"gatehouse"));
+    assert!(kinds.contains(&"ditch"));
+
+    let site = &responses[1]["result"]["structuredContent"];
+    assert_eq!(site["site"]["id"], "lake_island");
+
+    let assessment = &responses[2]["result"]["structuredContent"];
+    assert_eq!(assessment["style_id"], "baltic_brick");
+    assert_eq!(assessment["passed"], true);
+    assert!(
+        assessment["historian"]["overall_score"].as_u64().unwrap() >= 80,
+        "historian: {}",
+        assessment["historian"]
+    );
+}
+
+#[test]
 fn site_flag_starts_empty_on_a_curated_site() {
     let mut child = spawn(&["--offline", "--site", "lake_island"]);
     write_line(

@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 /// The Edwardian Welsh stone style used by the M1 vertical slice.
 pub const EDWARDIAN_WELSH_JSON: &str = include_str!("../../../styles/edwardian_welsh.json");
 
+/// The Baltic brick style introduced by M2.
+pub const BALTIC_BRICK_JSON: &str = include_str!("../../../styles/baltic_brick.json");
+
 /// One curated style pack.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StylePack {
@@ -34,8 +37,15 @@ pub struct StylePack {
     pub flanking_spacing_min_m: f64,
     /// Maximum flanking distance that still gives bowshot coverage, in metres.
     pub flanking_spacing_max_m: f64,
+    /// Dominant material palette (for example `limestone` or `red_brick`).
+    #[serde(default = "default_material_palette")]
+    pub material_palette: String,
     /// Plain-language citations shown with validation findings.
     pub source_notes: Vec<String>,
+}
+
+fn default_material_palette() -> String {
+    "limestone".to_string()
 }
 
 impl StylePack {
@@ -43,6 +53,11 @@ impl StylePack {
     pub fn edwardian_welsh() -> Self {
         Self::from_json(EDWARDIAN_WELSH_JSON)
             .expect("styles/edwardian_welsh.json must parse cleanly")
+    }
+
+    /// Load the curated Baltic brick pack from the repository data file.
+    pub fn baltic_brick() -> Self {
+        Self::from_json(BALTIC_BRICK_JSON).expect("styles/baltic_brick.json must parse cleanly")
     }
 
     /// Parse a style pack from JSON. Returns the underlying `serde_json` error
@@ -53,7 +68,7 @@ impl StylePack {
 
     /// Every style pack compiled into this build, in stable id order.
     pub fn list() -> Vec<StylePack> {
-        let mut packs = vec![Self::edwardian_welsh()];
+        let mut packs = vec![Self::baltic_brick(), Self::edwardian_welsh()];
         packs.sort_by(|a, b| a.id.cmp(&b.id));
         packs
     }
@@ -110,6 +125,7 @@ mod tests {
         assert_eq!(pack.default_plinth_height_mm, 900);
         assert!((pack.flanking_spacing_min_m - 25.0).abs() < f64::EPSILON);
         assert!((pack.flanking_spacing_max_m - 42.0).abs() < f64::EPSILON);
+        assert_eq!(pack.material_palette, "limestone");
         assert!(pack
             .source_notes
             .iter()
@@ -126,14 +142,47 @@ mod tests {
     }
 
     #[test]
+    fn baltic_brick_pack_loads_and_has_the_expected_rules() {
+        let pack = StylePack::baltic_brick();
+        assert_eq!(pack.id, "baltic_brick");
+        assert_eq!(pack.name, "Baltic Brick (1350–1450)");
+        assert_eq!(pack.period, "1350–1450");
+        assert_eq!(pack.region, "Baltic / North Germany / Southern Scandinavia");
+        assert_eq!(pack.course_height_mm, 280);
+        assert_eq!(pack.min_wall_thickness_mm, 1_500);
+        assert_eq!(pack.default_wall_thickness_mm, 2_100);
+        assert!((pack.max_slenderness_ratio - 5.0).abs() < f64::EPSILON);
+        assert_eq!(pack.default_batter_mm, 450);
+        assert_eq!(pack.default_plinth_height_mm, 700);
+        assert!((pack.flanking_spacing_min_m - 22.0).abs() < f64::EPSILON);
+        assert!((pack.flanking_spacing_max_m - 38.0).abs() < f64::EPSILON);
+        assert_eq!(pack.material_palette, "red_brick");
+        assert!(pack
+            .source_notes
+            .iter()
+            .any(|note| note.contains("Malbork")));
+        assert!(pack.source_notes.iter().any(|note| note.contains("Gniew")));
+        assert!(pack
+            .source_notes
+            .iter()
+            .any(|note| note.contains("Kwidzyn")));
+        assert!(pack
+            .source_notes
+            .iter()
+            .any(|note| note.contains("Lidzbark")));
+    }
+
+    #[test]
     fn list_and_find_are_stable() {
         let packs = StylePack::list();
-        assert_eq!(packs.len(), 1);
-        assert_eq!(packs[0].id, "edwardian_welsh");
+        assert_eq!(packs.len(), 2);
+        assert_eq!(packs[0].id, "baltic_brick");
+        assert_eq!(packs[1].id, "edwardian_welsh");
         assert_eq!(
             StylePack::find("edwardian_welsh").unwrap().name,
-            packs[0].name
+            packs[1].name
         );
+        assert_eq!(StylePack::find("baltic_brick").unwrap().name, packs[0].name);
         assert!(StylePack::find("not_a_style").is_none());
     }
 

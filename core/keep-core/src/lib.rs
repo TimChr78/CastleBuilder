@@ -11,6 +11,7 @@
 pub mod command;
 pub mod document;
 pub mod fixtures;
+pub mod historian;
 pub mod junction;
 pub mod masonry;
 pub mod mesh;

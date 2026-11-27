@@ -9,7 +9,7 @@ use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
 use keep_core::document::CastleDocument;
-use keep_core::fixtures::m1_edwardian_document;
+use keep_core::fixtures::{m1_edwardian_document, m2_baltic_document};
 use keep_core::proposal::AgentPermission;
 use keep_core::session::DEFAULT_SITE_ID;
 use keep_mcp::McpServer;
@@ -17,6 +17,7 @@ use keep_mcp::McpServer;
 fn main() -> ExitCode {
     let mut empty = false;
     let mut m1 = false;
+    let mut m2 = false;
     let mut site: Option<String> = None;
     let mut live: Option<String> = None;
     let mut token: Option<String> = None;
@@ -28,6 +29,7 @@ fn main() -> ExitCode {
             "--offline" => {}
             "--empty" => empty = true,
             "--m1" => m1 = true,
+            "--m2" => m2 = true,
             "--site" => match arguments.next() {
                 Some(id) => site = Some(id),
                 None => {
@@ -77,12 +79,13 @@ fn main() -> ExitCode {
                     "keep-mcp {version}\n\n\
                      MCP sidecar for Keepwright. Speaks line-delimited JSON-RPC 2.0\n\
                      over stdin/stdout.\n\n\
-                     Usage: keep-mcp [--offline] [--empty] [--m1] [--site <id>]\n\
+                     Usage: keep-mcp [--offline] [--empty] [--m1|--m2] [--site <id>]\n\
                             keep-mcp --live <url> --token <token> [--permission <level>]\n\n\
                      Options:\n  \
                        --offline              Use the offline keep-core backend (default)\n  \
                        --empty                Start with an empty document instead of the showcase\n  \
                        --m1                   Start with the M1 Edwardian document on the coastal headland\n  \
+                       --m2                   Start with the M2 Baltic brick document on the lake island\n  \
                        --site <id>            Start empty on a curated site: m0a_promontory,\n                              \
                                               coastal_headland or lake_island\n  \
                        --live <url>           Forward tool calls to a running game at a loopback URL\n                              \
@@ -122,12 +125,16 @@ fn main() -> ExitCode {
         }
     } else {
         let permission = permission.unwrap_or(AgentPermission::DirectEdit);
-        let site_id = site.as_deref().unwrap_or(if m1 {
+        let site_id = site.as_deref().unwrap_or(if m2 {
+            "lake_island"
+        } else if m1 {
             "coastal_headland"
         } else {
             DEFAULT_SITE_ID
         });
-        let document = if m1 {
+        let document = if m2 {
+            m2_baltic_document()
+        } else if m1 {
             m1_edwardian_document()
         } else if empty || site.is_some() {
             CastleDocument::new()

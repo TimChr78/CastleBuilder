@@ -25,19 +25,25 @@ pub use keep_core::command::{
     CommandError as ProtoError, CommandOp as Operation, MAX_BATCH_OPS, MAX_BATTER_MM, MAX_COORD_MM,
     MAX_DITCH_DEPTH_MM, MAX_DITCH_LENGTH_MM, MAX_DITCH_WIDTH_MM, MAX_DOCUMENT_ELEMENTS,
     MAX_GATEHOUSE_DEPTH_MM, MAX_GATEHOUSE_HEIGHT_MM, MAX_GATEHOUSE_TOWER_RADIUS_MM,
-    MAX_INNER_SPLAY_WIDTH_MM, MAX_LOOP_HEIGHT_MM, MAX_LOOP_SILL_HEIGHT_MM, MAX_LOOP_T_PERMILLE,
+    MAX_INNER_SPLAY_WIDTH_MM, MAX_KEEP_DIMENSION_MM, MAX_KEEP_HEIGHT_MM,
+    MAX_KEEP_WALL_THICKNESS_MM, MAX_LOOP_HEIGHT_MM, MAX_LOOP_SILL_HEIGHT_MM, MAX_LOOP_T_PERMILLE,
     MAX_NAME_CHARS, MAX_ORIENTATION_DEG, MAX_OUTER_SLIT_MM, MAX_PASSAGE_HEIGHT_MM,
-    MAX_PASSAGE_WIDTH_MM, MAX_REF_ID_CHARS, MAX_TOWER_HEIGHT_MM, MAX_TOWER_RADIUS_MM,
+    MAX_PASSAGE_WIDTH_MM, MAX_RANGE_LENGTH_MM, MAX_RANGE_WALL_HEIGHT_MM, MAX_RANGE_WIDTH_MM,
+    MAX_REF_ID_CHARS, MAX_ROOF_PITCH_DEG, MAX_TOWER_HEIGHT_MM, MAX_TOWER_RADIUS_MM,
     MAX_WALL_HEIGHT_MM, MAX_WALL_LENGTH_MM, MAX_WALL_THICKNESS_MM, MIN_COORD_MM,
     MIN_DITCH_DEPTH_MM, MIN_DITCH_LENGTH_MM, MIN_DITCH_WIDTH_MM, MIN_GATEHOUSE_DEPTH_MM,
     MIN_GATEHOUSE_HEIGHT_MM, MIN_GATEHOUSE_TOWER_RADIUS_MM, MIN_INNER_SPLAY_WIDTH_MM,
-    MIN_LOOP_HEIGHT_MM, MIN_LOOP_T_PERMILLE, MIN_ORIENTATION_DEG, MIN_OUTER_SLIT_MM,
-    MIN_PASSAGE_HEIGHT_MM, MIN_PASSAGE_WIDTH_MM, MIN_TOWER_HEIGHT_MM, MIN_TOWER_RADIUS_MM,
-    MIN_WALL_HEIGHT_MM, MIN_WALL_LENGTH_MM, MIN_WALL_THICKNESS_MM,
+    MIN_KEEP_DIMENSION_MM, MIN_KEEP_HEIGHT_MM, MIN_KEEP_WALL_THICKNESS_MM, MIN_LOOP_HEIGHT_MM,
+    MIN_LOOP_T_PERMILLE, MIN_ORIENTATION_DEG, MIN_OUTER_SLIT_MM, MIN_PASSAGE_HEIGHT_MM,
+    MIN_PASSAGE_WIDTH_MM, MIN_RANGE_LENGTH_MM, MIN_RANGE_WALL_HEIGHT_MM, MIN_RANGE_WIDTH_MM,
+    MIN_ROOF_PITCH_DEG, MIN_TOWER_HEIGHT_MM, MIN_TOWER_RADIUS_MM, MIN_WALL_HEIGHT_MM,
+    MIN_WALL_LENGTH_MM, MIN_WALL_THICKNESS_MM,
 };
 // The structural assessment, style packs and curated sites are the same types
 // the core and the game host use, so the wire protocol never carries a drifting
 // copy of the validation vocabulary (architecture sections 6.1 and 7.6).
+pub use keep_core::document::RangeKind;
+pub use keep_core::historian::{HistorianFinding, HistorianReport};
 pub use keep_core::proposal::{
     AgentParticipant, AgentPermission, AgentState, Proposal, ProposalStatus,
 };
@@ -101,7 +107,8 @@ pub struct GetHistoryResponse {
     pub entries: Vec<HistoryEntry>,
 }
 
-/// Structural assessment of the current castle against one style pack.
+/// Structural assessment of the current castle against one style pack, plus
+/// the historian's reading of the same document.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssessmentResponse {
     /// 0..=100; errors cost more than warnings.
@@ -111,17 +118,24 @@ pub struct AssessmentResponse {
     /// Id of the style pack the document was judged against.
     pub style_id: String,
     pub findings: Vec<AssessmentFinding>,
+    /// Deterministic historical critique for the same style pack.
+    pub historian: HistorianReport,
 }
 
 impl AssessmentResponse {
-    /// Wrap a core [`AssessmentReport`] together with the style id that
-    /// produced it.
-    pub fn new(style_id: impl Into<String>, report: AssessmentReport) -> Self {
+    /// Wrap a core [`AssessmentReport`] and [`HistorianReport`] together with
+    /// the style id that produced them.
+    pub fn new(
+        style_id: impl Into<String>,
+        report: AssessmentReport,
+        historian: HistorianReport,
+    ) -> Self {
         Self {
             score: report.score,
             passed: report.passed,
             style_id: style_id.into(),
             findings: report.findings,
+            historian,
         }
     }
 }
@@ -204,7 +218,7 @@ pub struct RenderViewResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElementSummary {
     pub id: u64,
-    /// `"wall"`, `"tower"`, `"gatehouse"` or `"ditch"`.
+    /// `"wall"`, `"tower"`, `"gatehouse"`, `"ditch"`, `"keep"` or `"range"`.
     pub kind: String,
     pub name: String,
     pub height_mm: i64,
@@ -361,6 +375,40 @@ pub fn element_summaries(document: &CastleDocument) -> Vec<ElementSummary> {
                 passage_height_mm: None,
                 depth_mm: Some(ditch.depth_mm),
             },
+            Element::Keep(keep) => ElementSummary {
+                id: keep.id,
+                kind: "keep".to_string(),
+                name: keep.name.clone(),
+                height_mm: keep.height_mm,
+                thickness_mm: keep.wall_thickness_mm,
+                start_mm: None,
+                end_mm: None,
+                centre_mm: Some(keep.centre_mm),
+                radius_mm: None,
+                length_mm: Some(keep.width_mm),
+                plan: None,
+                orientation_deg: Some(keep.orientation_deg),
+                passage_width_mm: None,
+                passage_height_mm: None,
+                depth_mm: Some(keep.depth_mm),
+            },
+            Element::Range(range) => ElementSummary {
+                id: range.id,
+                kind: "range".to_string(),
+                name: range.name.clone(),
+                height_mm: range.wall_height_mm,
+                thickness_mm: 0,
+                start_mm: None,
+                end_mm: None,
+                centre_mm: Some(range.centre_mm),
+                radius_mm: None,
+                length_mm: Some(range.length_mm),
+                plan: None,
+                orientation_deg: Some(range.orientation_deg),
+                passage_width_mm: None,
+                passage_height_mm: None,
+                depth_mm: Some(range.width_mm),
+            },
         })
         .collect()
 }
@@ -454,7 +502,7 @@ fn element_summary_schema() -> serde_json::Value {
         "type": "object",
         "properties": {
             "id": { "type": "integer", "minimum": 0 },
-            "kind": { "type": "string", "enum": ["wall", "tower", "gatehouse", "ditch"] },
+            "kind": { "type": "string", "enum": ["wall", "tower", "gatehouse", "ditch", "keep", "range"] },
             "name": { "type": "string" },
             "height_mm": { "type": "integer" },
             "thickness_mm": { "type": "integer" },
@@ -690,6 +738,41 @@ fn assessment_finding_schema() -> serde_json::Value {
     })
 }
 
+fn historian_finding_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "category": { "type": "string", "enum": ["authenticity", "defensive", "domestic"] },
+            "code": { "type": "string" },
+            "message": { "type": "string" },
+            "source_note": { "type": "string" },
+            "score_impact": { "type": "integer" }
+        },
+        "required": ["category", "code", "message", "source_note", "score_impact"]
+    })
+}
+
+fn historian_report_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "style_id": { "type": "string" },
+            "authenticity_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "defensive_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "domestic_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "overall_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "findings": {
+                "type": "array",
+                "items": historian_finding_schema()
+            }
+        },
+        "required": [
+            "style_id", "authenticity_score", "defensive_score",
+            "domestic_score", "overall_score", "findings"
+        ]
+    })
+}
+
 fn assessment_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -700,9 +783,10 @@ fn assessment_schema() -> serde_json::Value {
             "findings": {
                 "type": "array",
                 "items": assessment_finding_schema()
-            }
+            },
+            "historian": historian_report_schema()
         },
-        "required": ["score", "passed", "style_id", "findings"]
+        "required": ["score", "passed", "style_id", "findings", "historian"]
     })
 }
 
@@ -922,6 +1006,41 @@ fn operation_schema() -> serde_json::Value {
             {
                 "type": "object",
                 "properties": {
+                    "op": { "const": "create_keep" },
+                    "ref_id": ref_id,
+                    "name": { "type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS },
+                    "centre_mm": int_pair_schema(),
+                    "width_mm": { "type": "integer", "minimum": MIN_KEEP_DIMENSION_MM, "maximum": MAX_KEEP_DIMENSION_MM, "default": 14_000 },
+                    "depth_mm": { "type": "integer", "minimum": MIN_KEEP_DIMENSION_MM, "maximum": MAX_KEEP_DIMENSION_MM, "default": 12_000 },
+                    "height_mm": { "type": "integer", "minimum": MIN_KEEP_HEIGHT_MM, "maximum": MAX_KEEP_HEIGHT_MM, "default": 20_000 },
+                    "wall_thickness_mm": { "type": "integer", "minimum": MIN_KEEP_WALL_THICKNESS_MM, "maximum": MAX_KEEP_WALL_THICKNESS_MM, "default": 2_600 },
+                    "orientation_deg": { "type": "integer", "minimum": MIN_ORIENTATION_DEG, "maximum": MAX_ORIENTATION_DEG, "default": 0 },
+                    "batter_mm": { "type": "integer", "minimum": 0, "maximum": MAX_BATTER_MM, "default": 450 },
+                    "plinth_height_mm": { "type": "integer", "minimum": 0, "maximum": MAX_WALL_HEIGHT_MM, "default": 700 }
+                },
+                "required": ["op", "name", "centre_mm"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "op": { "const": "create_range" },
+                    "ref_id": ref_id,
+                    "name": { "type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS },
+                    "kind": { "type": "string", "enum": ["hall", "chapel", "kitchen"], "default": "hall" },
+                    "centre_mm": int_pair_schema(),
+                    "length_mm": { "type": "integer", "minimum": MIN_RANGE_LENGTH_MM, "maximum": MAX_RANGE_LENGTH_MM, "default": 18_000 },
+                    "width_mm": { "type": "integer", "minimum": MIN_RANGE_WIDTH_MM, "maximum": MAX_RANGE_WIDTH_MM, "default": 8_500 },
+                    "wall_height_mm": { "type": "integer", "minimum": MIN_RANGE_WALL_HEIGHT_MM, "maximum": MAX_RANGE_WALL_HEIGHT_MM, "default": 7_500 },
+                    "roof_pitch_deg": { "type": "integer", "minimum": MIN_ROOF_PITCH_DEG, "maximum": MAX_ROOF_PITCH_DEG, "default": 42 },
+                    "orientation_deg": { "type": "integer", "minimum": MIN_ORIENTATION_DEG, "maximum": MAX_ORIENTATION_DEG, "default": 0 }
+                },
+                "required": ["op", "name", "kind", "centre_mm"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
                     "op": { "const": "modify_element" },
                     "id": { "type": "integer", "minimum": 0 },
                     "height_mm": { "type": "integer", "minimum": MIN_WALL_HEIGHT_MM, "maximum": MAX_WALL_HEIGHT_MM },
@@ -1055,10 +1174,16 @@ pub fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "get_assessment",
-            "description": "Assess the castle against the Edwardian Welsh style: slenderness, footings and openings, with plain-language findings and one-click suggested fixes. Read-only.",
+            "description": "Assess the castle against a style pack (default Edwardian Welsh): structural slenderness, footings and openings with one-click suggested fixes, plus the historian's authenticity, defensive and domestic reading. Read-only.",
             "inputSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "style_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Style pack id to judge against. Defaults to edwardian_welsh."
+                    }
+                },
                 "additionalProperties": false
             },
             "outputSchema": assessment_schema(),
@@ -1743,6 +1868,76 @@ mod tests {
         );
         assert_eq!(ditch["properties"]["start_mm"]["minItems"], 2);
 
+        // M2 keeps and domestic ranges are described with the exact bounds the
+        // command engine enforces.
+        let keep = op_schema("create_keep");
+        assert_eq!(
+            keep["properties"]["width_mm"]["minimum"],
+            MIN_KEEP_DIMENSION_MM
+        );
+        assert_eq!(
+            keep["properties"]["width_mm"]["maximum"],
+            MAX_KEEP_DIMENSION_MM
+        );
+        assert_eq!(
+            keep["properties"]["height_mm"]["maximum"],
+            MAX_KEEP_HEIGHT_MM
+        );
+        assert_eq!(
+            keep["properties"]["wall_thickness_mm"]["minimum"],
+            MIN_KEEP_WALL_THICKNESS_MM
+        );
+        assert_eq!(keep["required"], json!(["op", "name", "centre_mm"]));
+
+        let range = op_schema("create_range");
+        assert_eq!(
+            range["properties"]["kind"]["enum"],
+            json!(["hall", "chapel", "kitchen"])
+        );
+        assert_eq!(
+            range["properties"]["length_mm"]["minimum"],
+            MIN_RANGE_LENGTH_MM
+        );
+        assert_eq!(
+            range["properties"]["length_mm"]["maximum"],
+            MAX_RANGE_LENGTH_MM
+        );
+        assert_eq!(
+            range["properties"]["width_mm"]["maximum"],
+            MAX_RANGE_WIDTH_MM
+        );
+        assert_eq!(
+            range["properties"]["wall_height_mm"]["minimum"],
+            MIN_RANGE_WALL_HEIGHT_MM
+        );
+        assert_eq!(
+            range["properties"]["roof_pitch_deg"]["minimum"],
+            MIN_ROOF_PITCH_DEG
+        );
+        assert_eq!(
+            range["properties"]["roof_pitch_deg"]["maximum"],
+            MAX_ROOF_PITCH_DEG
+        );
+
+        // The element enum now covers every M2 element kind.
+        assert_eq!(
+            tools[0]["outputSchema"]["properties"]["elements"]["items"]["properties"]["kind"]
+                ["enum"],
+            json!(["wall", "tower", "gatehouse", "ditch", "keep", "range"])
+        );
+
+        // The assessment carries both the structural report and the historian.
+        let assessment = &tools[6]["outputSchema"];
+        assert!(assessment["properties"]["historian"].is_object());
+        assert!(assessment["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("historian")));
+        assert_eq!(
+            tools[6]["inputSchema"]["properties"]["style_id"]["type"],
+            "string"
+        );
+
         let modify = op_schema("modify_element");
         assert_eq!(
             modify["properties"]["height_mm"]["minimum"],
@@ -1897,11 +2092,33 @@ mod tests {
             score: 75,
             passed: false,
         };
-        let assessment = AssessmentResponse::new(style.id.clone(), report);
+        let assessment = AssessmentResponse::new(
+            style.id.clone(),
+            report,
+            HistorianReport {
+                style_id: style.id.clone(),
+                authenticity_score: 90,
+                defensive_score: 85,
+                domestic_score: 80,
+                overall_score: 85,
+                findings: vec![HistorianFinding {
+                    category: keep_core::historian::HistorianCategory::Authenticity,
+                    code: "no_gatehouse".into(),
+                    message: "No gatehouse".into(),
+                    source_note: style.primary_source_note().into(),
+                    score_impact: -20,
+                }],
+            },
+        );
         let value = serde_json::to_value(&assessment).unwrap();
         assert_eq!(value["style_id"], "edwardian_welsh");
         assert_eq!(value["score"], 75);
         assert_eq!(value["findings"][0]["severity"], "error");
+        assert_eq!(value["historian"]["overall_score"], 85);
+        assert_eq!(
+            value["historian"]["findings"][0]["category"],
+            "authenticity"
+        );
         assert_eq!(
             value["findings"][0]["suggested_fix"]["op"],
             "modify_element"
@@ -1916,7 +2133,9 @@ mod tests {
             styles: StylePack::list(),
         };
         let value = serde_json::to_value(&styles).unwrap();
-        assert_eq!(value["styles"][0]["id"], "edwardian_welsh");
+        assert_eq!(value["styles"][0]["id"], "baltic_brick");
+        assert_eq!(value["styles"][0]["material_palette"], "red_brick");
+        assert_eq!(value["styles"][1]["id"], "edwardian_welsh");
         assert_eq!(
             serde_json::from_value::<ListStylesResponse>(value).unwrap(),
             styles

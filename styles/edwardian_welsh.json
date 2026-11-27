@@ -11,6 +11,7 @@
   "default_plinth_height_mm": 900,
   "flanking_spacing_min_m": 25.0,
   "flanking_spacing_max_m": 42.0,
+  "material_palette": "limestone",
   "source_notes": [
     "Caernarfon Castle (begun 1283): great polygonal towers, banded stonework and a strongly battered plinth; the curtain walls are roughly 2.4 m thick and 9–12 m high.",
     "Conwy Castle (1283–1287): eight projecting round towers on a narrow rock ridge; walls and towers share a pronounced batter and a deep foundation plinth.",

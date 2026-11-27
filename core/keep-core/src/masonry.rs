@@ -13,8 +13,8 @@
 //! stones share an exact plane and no daylight shows between them.
 
 use crate::document::{
-    BatteredWall, CastleDocument, Element, ElementKind, Gatehouse, Opening, RoundTower, TowerPlan,
-    CASTLE_SEED,
+    BatteredWall, CastleDocument, Element, ElementKind, Gatehouse, Keep, Opening, Range, RangeKind,
+    RoundTower, TowerPlan, CASTLE_SEED,
 };
 use crate::hash01;
 use crate::junction;
@@ -47,6 +47,8 @@ pub enum BlockRole {
     Lintel,
     /// End stone dressed where a wall was trimmed at a junction seam.
     SeamQuoin,
+    /// A coursed roof tile, slate or lead strip on a pitched range roof.
+    Roof,
 }
 
 /// One quantised stone. Corner winding:
@@ -123,6 +125,8 @@ pub fn generate_blocks(document: &CastleDocument, terrain: &SiteTerrain) -> Vec<
             Element::BatteredWall(wall) => layout_wall(wall, document, terrain, &mut blocks),
             Element::RoundTower(tower) => layout_tower(tower, terrain, &mut blocks),
             Element::Gatehouse(gatehouse) => layout_gatehouse(gatehouse, terrain, &mut blocks),
+            Element::Keep(keep) => layout_keep(keep, terrain, &mut blocks),
+            Element::Range(range) => layout_range(range, document, terrain, &mut blocks),
             Element::Ditch(_) => {}
         }
     }
@@ -1657,6 +1661,771 @@ fn layout_shaped_tower(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Keeps and roofed ranges (M2.1)
+// ---------------------------------------------------------------------------
+
+/// Wall thickness used by a domestic range, derived from its height.
+fn range_wall_thickness_mm(range: &Range) -> i64 {
+    (range.wall_height_mm / 8).clamp(600, 1_200)
+}
+
+/// Ground height range sampled over an oriented rectangle footprint.
+fn ground_range_rect(
+    centre_mm: [i64; 2],
+    width_mm: i64,
+    depth_mm: i64,
+    orientation_deg: i32,
+    terrain: &SiteTerrain,
+) -> (i64, i64) {
+    let half_u = width_mm.max(1) as f64 * 0.5;
+    let half_v = depth_mm.max(1) as f64 * 0.5;
+    let mut min_h = i64::MAX;
+    let mut max_h = i64::MIN;
+    for iu in -2..=2 {
+        for iv in -2..=2 {
+            let u = half_u * iu as f64 / 2.0;
+            let v = half_v * iv as f64 / 2.0;
+            let (x, z) = local_to_world(centre_mm, orientation_deg, u, v);
+            let h = terrain.height_mm(round(x) as i64, round(z) as i64);
+            min_h = min_h.min(h);
+            max_h = max_h.max(h);
+        }
+    }
+    (min_h, max_h)
+}
+
+fn local_to_world(centre_mm: [i64; 2], orientation_deg: i32, u: f64, v: f64) -> (f64, f64) {
+    let o = orientation_deg as f64 * std::f64::consts::PI / 180.0;
+    let (oc, os) = (cos(o), sin(o));
+    (
+        centre_mm[0] as f64 + u * oc - v * os,
+        centre_mm[1] as f64 + u * os + v * oc,
+    )
+}
+
+/// Eight corners of an oriented box. Corner order follows the shared
+/// [`Block`] contract: `0->1` runs along `u`, `0->3` along `v`, and `4..7`
+/// repeat the bottom ring one thickness higher.
+#[allow(clippy::too_many_arguments)]
+fn oriented_box_corners(
+    centre_mm: [i64; 2],
+    orientation_deg: i32,
+    u0: i64,
+    u1: i64,
+    v0: i64,
+    v1: i64,
+    y0: i64,
+    y1: i64,
+) -> [[i64; 3]; 8] {
+    let p = |u: i64, v: i64, y: i64| -> [i64; 3] {
+        let (x, z) = local_to_world(centre_mm, orientation_deg, u as f64, v as f64);
+        [round(x) as i64, y, round(z) as i64]
+    };
+    [
+        p(u0, v0, y0),
+        p(u1, v0, y0),
+        p(u1, v1, y0),
+        p(u0, v1, y0),
+        p(u0, v0, y1),
+        p(u1, v0, y1),
+        p(u1, v1, y1),
+        p(u0, v1, y1),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_custom_block(
+    out: &mut Vec<Block>,
+    element_id: u64,
+    kind: ElementKind,
+    course_index: i32,
+    run_pos_mm: i64,
+    corners: [[i64; 3]; 8],
+    width_mm: i64,
+    height_mm: i64,
+    seed: u64,
+    tint: f32,
+    age: f32,
+    role: BlockRole,
+    expose: [bool; 6],
+) {
+    out.push(Block {
+        element_id,
+        kind,
+        course_index,
+        run_pos_mm,
+        build_index: 0,
+        corners_mm: corners,
+        block_width_mm: width_mm.max(1),
+        block_height_mm: height_mm.max(1),
+        tint,
+        age,
+        jitter_seed: hash01(seed, course_index as i64, run_pos_mm, 200 + role as i64),
+        expose,
+        role,
+    });
+}
+
+/// Lay out a great rectangular keep: four battered walls that alternate which
+/// pair owns the corners, so every course meets in crisp 90-degree quoins, and
+/// a crenellated parapet of merlons along the top.
+fn layout_keep(keep: &Keep, terrain: &SiteTerrain, out: &mut Vec<Block>) {
+    let half_w = (keep.width_mm.max(4_000) / 2).max(2_000);
+    let half_d = (keep.depth_mm.max(4_000) / 2).max(2_000);
+    let thickness = keep
+        .wall_thickness_mm
+        .clamp(400, half_w.min(half_d).saturating_sub(200));
+    let (ground_min, ground_max) = ground_range_rect(
+        keep.centre_mm,
+        keep.width_mm,
+        keep.depth_mm,
+        keep.orientation_deg,
+        terrain,
+    );
+    let foundation_y = ground_min - 1_200;
+    let plinth_top_y = ground_max + keep.plinth_height_mm.max(0);
+    let top_y = ground_max + keep.height_mm.max(1);
+    let total_height = (top_y - foundation_y).max(1);
+    let element_seed = keep.seed ^ CASTLE_SEED.rotate_left(17);
+
+    let course_nominal = 430i64;
+    let mut course_index = 0i32;
+    let mut y0 = foundation_y;
+
+    while y0 < top_y {
+        let jitter = (hash01(element_seed, i64::from(course_index), 2, 0) - 0.5) * 30.0;
+        let mut y1 = y0 + course_nominal + jitter as i64;
+        if y1 > top_y || top_y - y1 < course_nominal / 2 {
+            y1 = top_y;
+        }
+        if y1 <= y0 {
+            break;
+        }
+
+        let mid_y = (y0 + y1) / 2;
+        let t = ((mid_y - foundation_y) as f64 / total_height as f64).clamp(0.0, 1.0);
+        let is_plinth = y0 < plinth_top_y;
+        let plinth = if is_plinth { 450 } else { 0 };
+        let inset = round(keep.batter_mm.max(0) as f64 * t) as i64 / 2;
+
+        let w_out_bot = half_w - inset + plinth;
+        let w_in_bot = (half_w - thickness - inset - plinth).max(100);
+        let d_out_bot = half_d - inset + plinth;
+        let d_in_bot = (half_d - thickness - inset - plinth).max(100);
+
+        let u_faces_own = course_index % 2 == 0;
+        let bond = if course_index % 2 == 0 { 0 } else { 475 };
+
+        for face in [
+            SquareFace::PosU,
+            SquareFace::NegU,
+            SquareFace::PosV,
+            SquareFace::NegV,
+        ] {
+            let owns_corner = match face {
+                SquareFace::PosU | SquareFace::NegU => u_faces_own,
+                SquareFace::PosV | SquareFace::NegV => !u_faces_own,
+            };
+            let (a0, a1, d0, d1) = match face {
+                SquareFace::PosU => (
+                    -if owns_corner { d_out_bot } else { d_in_bot },
+                    if owns_corner { d_out_bot } else { d_in_bot },
+                    -w_out_bot,
+                    -w_in_bot,
+                ),
+                SquareFace::NegU => (
+                    -if owns_corner { d_out_bot } else { d_in_bot },
+                    if owns_corner { d_out_bot } else { d_in_bot },
+                    w_in_bot,
+                    w_out_bot,
+                ),
+                SquareFace::PosV => (
+                    -if owns_corner { w_out_bot } else { w_in_bot },
+                    if owns_corner { w_out_bot } else { w_in_bot },
+                    d_in_bot,
+                    d_out_bot,
+                ),
+                SquareFace::NegV => (
+                    -if owns_corner { w_out_bot } else { w_in_bot },
+                    if owns_corner { w_out_bot } else { w_in_bot },
+                    -d_out_bot,
+                    -d_in_bot,
+                ),
+            };
+            let joints = joint_positions(
+                a0,
+                a1,
+                950,
+                bond,
+                element_seed,
+                course_index,
+                face.index() * 1_000,
+            );
+            let count = joints.len().saturating_sub(1);
+            for (segment, pair) in joints.windows(2).enumerate() {
+                let (a0b, a1b) = (pair[0], pair[1]);
+                if a1b <= a0b {
+                    continue;
+                }
+                let corners = square_face_corners(
+                    keep.centre_mm,
+                    keep.orientation_deg,
+                    face,
+                    a0b,
+                    a1b,
+                    a0b,
+                    a1b,
+                    d0,
+                    d1,
+                    d0,
+                    d1,
+                    y0,
+                    y1,
+                );
+                if is_buried(&corners, terrain) {
+                    continue;
+                }
+                let column = face.index() * 100_000 + segment as i32;
+                push_custom_block(
+                    out,
+                    keep.id,
+                    ElementKind::Keep,
+                    course_index,
+                    column as i64,
+                    corners,
+                    a1b - a0b,
+                    y1 - y0,
+                    element_seed,
+                    stone_tint(hash01(element_seed, course_index as i64, column as i64, 21)),
+                    (0.55 + 0.45 * t as f32).min(1.0),
+                    BlockRole::Masonry,
+                    [
+                        false,
+                        true,
+                        true,
+                        true,
+                        owns_corner && segment == 0,
+                        owns_corner && segment + 1 == count,
+                    ],
+                );
+            }
+        }
+
+        course_index += 1;
+        y0 = y1;
+    }
+
+    // Crenellated parapet: a ring of merlons sitting on the wall head.
+    let inset_top = round(keep.batter_mm.max(0) as f64) as i64 / 2;
+    let w_out_top = half_w - inset_top;
+    let d_out_top = half_d - inset_top;
+    let merlon_height = (keep.height_mm / 18).clamp(700, 1_400);
+    let merlon_width = 1_150i64;
+    let merlon_depth = thickness.clamp(300, 700);
+    let gap = 800i64;
+    let mut merlon_index = 0i32;
+    let mut merlon = |u0: i64, u1: i64, v0: i64, v1: i64| {
+        let corners = oriented_box_corners(
+            keep.centre_mm,
+            keep.orientation_deg,
+            u0,
+            u1,
+            v0,
+            v1,
+            top_y,
+            top_y + merlon_height,
+        );
+        push_custom_block(
+            out,
+            keep.id,
+            ElementKind::Keep,
+            course_index,
+            merlon_index as i64,
+            corners,
+            u1 - u0,
+            merlon_height,
+            element_seed,
+            stone_tint(hash01(element_seed, 7, merlon_index as i64, 22)),
+            0.85,
+            BlockRole::Masonry,
+            [false, true, true, true, true, true],
+        );
+        merlon_index += 1;
+    };
+    let step = merlon_width + gap;
+    for (span, north) in [(w_out_top, true), (w_out_top, false)] {
+        let start = -span + merlon_width / 2 + 200;
+        let end = span - merlon_width / 2 - 200;
+        let mut centre = start;
+        while centre <= end {
+            let (v0, v1) = if north {
+                (d_out_top - merlon_depth, d_out_top)
+            } else {
+                (-d_out_top, -d_out_top + merlon_depth)
+            };
+            merlon(centre - merlon_width / 2, centre + merlon_width / 2, v0, v1);
+            centre += step;
+        }
+    }
+    for (span, east) in [(d_out_top, true), (d_out_top, false)] {
+        let start = -span + merlon_width / 2 + 200;
+        let end = span - merlon_width / 2 - 200;
+        let mut centre = start;
+        while centre <= end {
+            let (u0, u1) = if east {
+                (w_out_top - merlon_depth, w_out_top)
+            } else {
+                (-w_out_top, -w_out_top + merlon_depth)
+            };
+            merlon(u0, u1, centre - merlon_width / 2, centre + merlon_width / 2);
+            centre += step;
+        }
+    }
+}
+
+/// Lay out a roofed domestic range: four coursed walls, stepped triangular
+/// gable ends above the eaves, and two coursed roof planes clipped against
+/// higher-priority masonry so the roof never pokes through a parapet.
+fn layout_range(
+    range: &Range,
+    document: &CastleDocument,
+    terrain: &SiteTerrain,
+    out: &mut Vec<Block>,
+) {
+    let half_l = (range.length_mm.max(4_000) / 2).max(2_000);
+    let half_w = (range.width_mm.max(3_000) / 2).max(1_500);
+    let thickness = range_wall_thickness_mm(range).clamp(400, half_w.saturating_sub(200));
+    let (ground_min, ground_max) = ground_range_rect(
+        range.centre_mm,
+        range.length_mm,
+        range.width_mm,
+        range.orientation_deg,
+        terrain,
+    );
+    let foundation_y = ground_min - 1_200;
+    let eave_y = ground_max + range.wall_height_mm.max(1);
+    let ridge_y = eave_y + range.ridge_rise_mm().max(0);
+    let total_height = (ridge_y - foundation_y).max(1);
+    let element_seed = range.seed ^ CASTLE_SEED.rotate_left(31);
+    let pitch_tan = libm::tan((range.roof_pitch_deg.max(1) as f64).to_radians()).max(0.05);
+
+    let l_out = half_l;
+    let l_in = (half_l - thickness).max(100);
+    let w_out = half_w;
+    let w_in = (half_w - thickness).max(100);
+
+    let course_nominal = 430i64;
+    let mut course_index = 0i32;
+
+    // Body walls, foundation to the eaves.
+    let mut y0 = foundation_y;
+    while y0 < eave_y {
+        let jitter = (hash01(element_seed, i64::from(course_index), 3, 0) - 0.5) * 30.0;
+        let mut y1 = y0 + course_nominal + jitter as i64;
+        if y1 > eave_y || eave_y - y1 < course_nominal / 2 {
+            y1 = eave_y;
+        }
+        if y1 <= y0 {
+            break;
+        }
+        let mid_y = (y0 + y1) / 2;
+        let t = ((mid_y - foundation_y) as f64 / total_height as f64).clamp(0.0, 1.0);
+        let u_faces_own = course_index % 2 == 0;
+        let bond = if course_index % 2 == 0 { 0 } else { 475 };
+        for face in [
+            SquareFace::PosU,
+            SquareFace::NegU,
+            SquareFace::PosV,
+            SquareFace::NegV,
+        ] {
+            let owns_corner = match face {
+                SquareFace::PosU | SquareFace::NegU => u_faces_own,
+                SquareFace::PosV | SquareFace::NegV => !u_faces_own,
+            };
+            let (a0, a1, d0, d1) = match face {
+                SquareFace::PosU => (
+                    -if owns_corner { w_out } else { w_in },
+                    if owns_corner { w_out } else { w_in },
+                    -l_out,
+                    -l_in,
+                ),
+                SquareFace::NegU => (
+                    -if owns_corner { w_out } else { w_in },
+                    if owns_corner { w_out } else { w_in },
+                    l_in,
+                    l_out,
+                ),
+                SquareFace::PosV => (
+                    -if owns_corner { l_out } else { l_in },
+                    if owns_corner { l_out } else { l_in },
+                    w_in,
+                    w_out,
+                ),
+                SquareFace::NegV => (
+                    -if owns_corner { l_out } else { l_in },
+                    if owns_corner { l_out } else { l_in },
+                    -w_out,
+                    -w_in,
+                ),
+            };
+            let joints = joint_positions(
+                a0,
+                a1,
+                950,
+                bond,
+                element_seed,
+                course_index,
+                face.index() * 1_000,
+            );
+            let count = joints.len().saturating_sub(1);
+            for (segment, pair) in joints.windows(2).enumerate() {
+                let (a0b, a1b) = (pair[0], pair[1]);
+                if a1b <= a0b {
+                    continue;
+                }
+                let corners = square_face_corners(
+                    range.centre_mm,
+                    range.orientation_deg,
+                    face,
+                    a0b,
+                    a1b,
+                    a0b,
+                    a1b,
+                    d0,
+                    d1,
+                    d0,
+                    d1,
+                    y0,
+                    y1,
+                );
+                if is_buried(&corners, terrain) {
+                    continue;
+                }
+                let column = face.index() * 100_000 + segment as i32;
+                push_custom_block(
+                    out,
+                    range.id,
+                    ElementKind::Range,
+                    course_index,
+                    column as i64,
+                    corners,
+                    a1b - a0b,
+                    y1 - y0,
+                    element_seed,
+                    stone_tint(hash01(element_seed, course_index as i64, column as i64, 23)),
+                    (0.55 + 0.45 * t as f32).min(1.0),
+                    BlockRole::Masonry,
+                    [
+                        false,
+                        true,
+                        true,
+                        true,
+                        owns_corner && segment == 0,
+                        owns_corner && segment + 1 == count,
+                    ],
+                );
+            }
+        }
+        course_index += 1;
+        y0 = y1;
+    }
+
+    // Gable ends: stepped courses that narrow as they rise to the ridge.
+    let mut y0 = eave_y;
+    while y0 < ridge_y {
+        let jitter = (hash01(element_seed, i64::from(course_index), 4, 0) - 0.5) * 24.0;
+        let mut y1 = y0 + course_nominal + jitter as i64;
+        if y1 > ridge_y || ridge_y - y1 < course_nominal / 2 {
+            y1 = ridge_y;
+        }
+        if y1 <= y0 {
+            break;
+        }
+        let run_half = (((ridge_y - y1) as f64 / pitch_tan) as i64).clamp(0, half_w);
+        if run_half < 300 {
+            break;
+        }
+        let bond = if course_index % 2 == 0 { 0 } else { 475 };
+        for face in [SquareFace::PosU, SquareFace::NegU] {
+            let (d0, d1) = if matches!(face, SquareFace::PosU) {
+                (-l_out, -l_in)
+            } else {
+                (l_in, l_out)
+            };
+            let joints = joint_positions(
+                -run_half,
+                run_half,
+                950,
+                bond,
+                element_seed,
+                course_index,
+                face.index() * 1_000,
+            );
+            let count = joints.len().saturating_sub(1);
+            for (segment, pair) in joints.windows(2).enumerate() {
+                let (a0b, a1b) = (pair[0], pair[1]);
+                if a1b <= a0b {
+                    continue;
+                }
+                let corners = square_face_corners(
+                    range.centre_mm,
+                    range.orientation_deg,
+                    face,
+                    a0b,
+                    a1b,
+                    a0b,
+                    a1b,
+                    d0,
+                    d1,
+                    d0,
+                    d1,
+                    y0,
+                    y1,
+                );
+                if is_buried(&corners, terrain) {
+                    continue;
+                }
+                let column = face.index() * 100_000 + segment as i32;
+                push_custom_block(
+                    out,
+                    range.id,
+                    ElementKind::Range,
+                    course_index,
+                    column as i64,
+                    corners,
+                    a1b - a0b,
+                    y1 - y0,
+                    element_seed,
+                    stone_tint(hash01(element_seed, course_index as i64, column as i64, 23)),
+                    0.8,
+                    BlockRole::Masonry,
+                    [
+                        false,
+                        true,
+                        true,
+                        true,
+                        segment == 0 && count > 0,
+                        segment + 1 == count,
+                    ],
+                );
+            }
+        }
+        course_index += 1;
+        y0 = y1;
+    }
+
+    // Two pitched roof planes in coursed strips. Each u strip is divided along
+    // the slope from ridge to eave into coursed slate segments; only the
+    // segments that actually overlap a higher-priority wall, tower or keep
+    // (in plan *and* elevation) are dropped. A curtain abutting the eave trims
+    // the outer courses and leaves the rest of the roof intact instead of
+    // deleting the whole slope.
+    let roof_thickness = 180i64;
+    let strip = 850i64;
+    const SLOPE_SEGMENTS: i64 = 7;
+    let roof_tint = match range.kind {
+        RangeKind::Chapel => 0.62,
+        RangeKind::Hall => 0.5,
+        RangeKind::Kitchen => 0.46,
+    };
+    let roof_seed = element_seed ^ 0x5A5A_1234_5678_9ABC;
+    for sign in [-1i64, 1] {
+        let (v0, v1, y0_roof, y1_roof) = if sign > 0 {
+            (0, half_w, ridge_y, eave_y)
+        } else {
+            (-half_w, 0, eave_y, ridge_y)
+        };
+        let mut u0 = -half_l;
+        let mut roof_index = 0i32;
+        while u0 < half_l {
+            let u1 = (u0 + strip).min(half_l);
+            let u_mid = (u0 + u1) / 2;
+            for segment in 0..SLOPE_SEGMENTS {
+                let s0 = segment as f64 / SLOPE_SEGMENTS as f64;
+                let s1 = (segment + 1) as f64 / SLOPE_SEGMENTS as f64;
+                let s_mid = (s0 + s1) * 0.5;
+                let v_at = |s: f64| -> i64 { v0 + round((v1 - v0) as f64 * s) as i64 };
+                let y_at =
+                    |s: f64| -> i64 { y0_roof + round((y1_roof - y0_roof) as f64 * s) as i64 };
+
+                let blocked = [s0, s_mid, s1].iter().any(|&s| {
+                    let (x, z) = local_to_world(
+                        range.centre_mm,
+                        range.orientation_deg,
+                        u_mid as f64,
+                        v_at(s) as f64,
+                    );
+                    range_roof_blocked(document, range.id, terrain, x, z, y_at(s))
+                });
+                if blocked {
+                    continue;
+                }
+
+                let corners = roof_slab_corners(
+                    range.centre_mm,
+                    range.orientation_deg,
+                    u0,
+                    u1,
+                    v_at(s0),
+                    v_at(s1),
+                    y_at(s0),
+                    y_at(s1),
+                    roof_thickness,
+                );
+                push_custom_block(
+                    out,
+                    range.id,
+                    ElementKind::Range,
+                    course_index,
+                    sign * 1_000_000 + i64::from(roof_index),
+                    corners,
+                    u1 - u0,
+                    roof_thickness,
+                    roof_seed,
+                    roof_tint,
+                    0.7,
+                    BlockRole::Roof,
+                    [false, true, true, true, u0 <= -half_l, u1 >= half_l],
+                );
+                roof_index += 1;
+            }
+            u0 = u1;
+        }
+    }
+}
+
+/// Sloped roof strip: `y0` at `v0`, `y1` at `v1`, with a vertical thickness.
+#[allow(clippy::too_many_arguments)]
+fn roof_slab_corners(
+    centre_mm: [i64; 2],
+    orientation_deg: i32,
+    u0: i64,
+    u1: i64,
+    v0: i64,
+    v1: i64,
+    y0: i64,
+    y1: i64,
+    thickness: i64,
+) -> [[i64; 3]; 8] {
+    let p = |u: i64, v: i64, y: i64| -> [i64; 3] {
+        let (x, z) = local_to_world(centre_mm, orientation_deg, u as f64, v as f64);
+        [round(x) as i64, y, round(z) as i64]
+    };
+    [
+        p(u0, v0, y0),
+        p(u1, v0, y0),
+        p(u1, v1, y1),
+        p(u0, v1, y1),
+        p(u0, v0, y0 + thickness),
+        p(u1, v0, y0 + thickness),
+        p(u1, v1, y1 + thickness),
+        p(u0, v1, y1 + thickness),
+    ]
+}
+
+/// True when a roof point lies inside a higher-priority wall, tower or keep
+/// footprint at that elevation. The plan test is expanded a little so a roof
+/// edge stops cleanly short of the masonry, and the elevation test lets a roof
+/// pass above a lower wall instead of being clipped by it.
+fn range_roof_blocked(
+    document: &CastleDocument,
+    self_id: u64,
+    terrain: &SiteTerrain,
+    x: f64,
+    z: f64,
+    y: i64,
+) -> bool {
+    const MARGIN_MM: f64 = 250.0;
+    for element in document.elements() {
+        if element.id() == self_id {
+            continue;
+        }
+        match element {
+            Element::BatteredWall(wall) => {
+                let start = terrain.height_mm(wall.start_mm[0], wall.start_mm[1]);
+                let end = terrain.height_mm(wall.end_mm[0], wall.end_mm[1]);
+                let mid = terrain.height_mm(
+                    (wall.start_mm[0] + wall.end_mm[0]) / 2,
+                    (wall.start_mm[1] + wall.end_mm[1]) / 2,
+                );
+                if y > start.max(end).max(mid) + wall.height_mm {
+                    continue;
+                }
+                let ax = wall.start_mm[0] as f64;
+                let az = wall.start_mm[1] as f64;
+                let bx = wall.end_mm[0] as f64;
+                let bz = wall.end_mm[1] as f64;
+                let reach = wall.thickness_mm as f64 * 0.5 + MARGIN_MM;
+                if point_segment_distance(x, z, ax, az, bx, bz) <= reach {
+                    return true;
+                }
+            }
+            Element::RoundTower(tower) => {
+                if y > terrain.height_mm(tower.centre_mm[0], tower.centre_mm[1]) + tower.height_mm {
+                    continue;
+                }
+                let dx = x - tower.centre_mm[0] as f64;
+                let dz = z - tower.centre_mm[1] as f64;
+                let reach = tower.radius_mm as f64 + tower.plinth_projection_mm as f64 + MARGIN_MM;
+                if dx * dx + dz * dz <= reach * reach {
+                    return true;
+                }
+            }
+            Element::Gatehouse(gatehouse) => {
+                for tower in gatehouse.flank_towers() {
+                    if y > terrain.height_mm(tower.centre_mm[0], tower.centre_mm[1])
+                        + tower.height_mm
+                    {
+                        continue;
+                    }
+                    let dx = x - tower.centre_mm[0] as f64;
+                    let dz = z - tower.centre_mm[1] as f64;
+                    let reach = tower.radius_mm as f64 + MARGIN_MM;
+                    if dx * dx + dz * dz <= reach * reach {
+                        return true;
+                    }
+                }
+            }
+            Element::Keep(keep) => {
+                if y > terrain.height_mm(keep.centre_mm[0], keep.centre_mm[1]) + keep.height_mm {
+                    continue;
+                }
+                let (u, v) = world_to_local(keep.centre_mm, keep.orientation_deg, x, z);
+                let half_w = keep.width_mm as f64 * 0.5 + MARGIN_MM;
+                let half_d = keep.depth_mm as f64 * 0.5 + MARGIN_MM;
+                if u.abs() <= half_w && v.abs() <= half_d {
+                    return true;
+                }
+            }
+            Element::Range(_) | Element::Ditch(_) => {}
+        }
+    }
+    false
+}
+
+fn world_to_local(centre_mm: [i64; 2], orientation_deg: i32, x: f64, z: f64) -> (f64, f64) {
+    let o = orientation_deg as f64 * std::f64::consts::PI / 180.0;
+    let (oc, os) = (cos(o), sin(o));
+    let dx = x - centre_mm[0] as f64;
+    let dz = z - centre_mm[1] as f64;
+    (dx * oc + dz * os, -dx * os + dz * oc)
+}
+
+fn point_segment_distance(px: f64, pz: f64, ax: f64, az: f64, bx: f64, bz: f64) -> f64 {
+    let abx = bx - ax;
+    let abz = bz - az;
+    let denom = abx * abx + abz * abz;
+    let t = if denom <= f64::EPSILON {
+        0.0
+    } else {
+        (((px - ax) * abx + (pz - az) * abz) / denom).clamp(0.0, 1.0)
+    };
+    let dx = ax + abx * t - px;
+    let dz = az + abz * t - pz;
+    sqrt(dx * dx + dz * dz)
+}
+
 /// Which straight face of a square tower a block belongs to. The `d` axis is
 /// always the right-hand axis of the run so the shared [`Block`] winding stays
 /// outward on every face.
@@ -2423,7 +3192,10 @@ mod tests {
                         tower_pairs += 1;
                     }
                 }
-                Element::Gatehouse(_) | Element::Ditch(_) => {}
+                Element::Gatehouse(_)
+                | Element::Ditch(_)
+                | Element::Keep(_)
+                | Element::Range(_) => {}
             }
         }
 
@@ -2527,76 +3299,96 @@ mod tests {
 
     #[test]
     fn every_exposed_face_points_outward_for_all_element_kinds() {
-        let terrain =
-            SiteTerrain::for_site("coastal_headland").expect("coastal_headland is a curated site");
-        let doc = m1_edwardian_document();
-        let blocks = generate_blocks(&doc, &terrain);
-        assert!(!blocks.is_empty());
+        let cases = [
+            (
+                SiteTerrain::for_site("coastal_headland")
+                    .expect("coastal_headland is a curated site"),
+                m1_edwardian_document(),
+                vec![
+                    ElementKind::BatteredWall,
+                    ElementKind::RoundTower,
+                    ElementKind::Gatehouse,
+                ],
+            ),
+            (
+                SiteTerrain::for_site("lake_island").expect("lake_island is a curated site"),
+                crate::fixtures::m2_baltic_document(),
+                vec![
+                    ElementKind::BatteredWall,
+                    ElementKind::RoundTower,
+                    ElementKind::Gatehouse,
+                    ElementKind::Keep,
+                    ElementKind::Range,
+                ],
+            ),
+        ];
+        for (terrain, doc, required) in cases {
+            let blocks = generate_blocks(&doc, &terrain);
+            assert!(!blocks.is_empty());
 
-        let mut kinds = std::collections::BTreeSet::new();
-        for block in &blocks {
-            kinds.insert(block.kind);
-            let centre = block.centre_mm();
-            for face in [
-                BlockFace::Bottom,
-                BlockFace::Top,
-                BlockFace::Front,
-                BlockFace::Back,
-                BlockFace::End0,
-                BlockFace::End1,
-            ] {
-                if !block.face_enabled(face) {
-                    continue;
+            let mut kinds = std::collections::BTreeSet::new();
+            for block in &blocks {
+                kinds.insert(block.kind);
+                let centre = block.centre_mm();
+                for face in [
+                    BlockFace::Bottom,
+                    BlockFace::Top,
+                    BlockFace::Front,
+                    BlockFace::Back,
+                    BlockFace::End0,
+                    BlockFace::End1,
+                ] {
+                    if !block.face_enabled(face) {
+                        continue;
+                    }
+                    let ids = Block::face_corners(face);
+                    let p: Vec<[f64; 3]> = ids
+                        .iter()
+                        .map(|i| {
+                            [
+                                block.corners_mm[*i][0] as f64,
+                                block.corners_mm[*i][1] as f64,
+                                block.corners_mm[*i][2] as f64,
+                            ]
+                        })
+                        .collect();
+                    let e1 = [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]];
+                    let e2 = [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]];
+                    let normal = [
+                        e1[1] * e2[2] - e1[2] * e2[1],
+                        e1[2] * e2[0] - e1[0] * e2[2],
+                        e1[0] * e2[1] - e1[1] * e2[0],
+                    ];
+                    // The innermost splay jamb step tapers to a line, so its cap is
+                    // a triangle stored in a quad slot. One triangle is degenerate
+                    // and has no direction; the other still caps the stone.
+                    if normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2] <= 1.0
+                    {
+                        continue;
+                    }
+                    let face_centre = [
+                        (p[0][0] + p[1][0] + p[2][0] + p[3][0]) * 0.25,
+                        (p[0][1] + p[1][1] + p[2][1] + p[3][1]) * 0.25,
+                        (p[0][2] + p[1][2] + p[2][2] + p[3][2]) * 0.25,
+                    ];
+                    let outward = [
+                        face_centre[0] - centre[0],
+                        face_centre[1] - centre[1],
+                        face_centre[2] - centre[2],
+                    ];
+                    let dot =
+                        normal[0] * outward[0] + normal[1] * outward[1] + normal[2] * outward[2];
+                    assert!(
+                        dot > 1.0,
+                        "{:?} block {} face {face:?} points inward (dot {dot})",
+                        block.kind,
+                        block.element_id
+                    );
                 }
-                let ids = Block::face_corners(face);
-                let p: Vec<[f64; 3]> = ids
-                    .iter()
-                    .map(|i| {
-                        [
-                            block.corners_mm[*i][0] as f64,
-                            block.corners_mm[*i][1] as f64,
-                            block.corners_mm[*i][2] as f64,
-                        ]
-                    })
-                    .collect();
-                let e1 = [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]];
-                let e2 = [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]];
-                let normal = [
-                    e1[1] * e2[2] - e1[2] * e2[1],
-                    e1[2] * e2[0] - e1[0] * e2[2],
-                    e1[0] * e2[1] - e1[1] * e2[0],
-                ];
-                // The innermost splay jamb step tapers to a line, so its cap is
-                // a triangle stored in a quad slot. One triangle is degenerate
-                // and has no direction; the other still caps the stone.
-                if normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2] <= 1.0 {
-                    continue;
-                }
-                let face_centre = [
-                    (p[0][0] + p[1][0] + p[2][0] + p[3][0]) * 0.25,
-                    (p[0][1] + p[1][1] + p[2][1] + p[3][1]) * 0.25,
-                    (p[0][2] + p[1][2] + p[2][2] + p[3][2]) * 0.25,
-                ];
-                let outward = [
-                    face_centre[0] - centre[0],
-                    face_centre[1] - centre[1],
-                    face_centre[2] - centre[2],
-                ];
-                let dot = normal[0] * outward[0] + normal[1] * outward[1] + normal[2] * outward[2];
-                assert!(
-                    dot > 1.0,
-                    "{:?} block {} face {face:?} points inward (dot {dot})",
-                    block.kind,
-                    block.element_id
-                );
             }
-        }
-        for kind in [
-            ElementKind::BatteredWall,
-            ElementKind::RoundTower,
-            ElementKind::Gatehouse,
-        ] {
-            assert!(kinds.contains(&kind), "no {kind:?} blocks were checked");
+            for kind in required {
+                assert!(kinds.contains(&kind), "no {kind:?} blocks were checked");
+            }
         }
     }
 
@@ -3453,6 +4245,172 @@ mod tests {
                 v0 == inner.min(outer) && v1 == inner.max(outer)
             }));
         }
+    }
+
+    #[test]
+    fn a_curtain_near_the_eave_trims_only_the_outer_roof_courses() {
+        let terrain = SiteTerrain::for_site("lake_island").expect("curated site");
+        let mut doc = CastleDocument::new();
+        let mut range = Range::new(30, "Hall", RangeKind::Hall, [0, 0], 0);
+        range.length_mm = 18_000;
+        range.width_mm = 8_500;
+        range.wall_height_mm = 7_500;
+        range.roof_pitch_deg = 42;
+        doc.add_range(range);
+
+        // The curtain runs parallel to the ridge, its centreline half a metre
+        // beyond the eave, so the roof overlaps the wall face by 0.7 m.
+        let half_w = 4_250i64;
+        let wall_v = half_w + 500;
+        let mut wall = BatteredWall::new(
+            1,
+            "Curtain",
+            [-12_000, wall_v],
+            [12_000, wall_v],
+            10_000,
+            2_400,
+        );
+        wall.batter_mm = 600;
+        wall.plinth_height_mm = 700;
+        wall.plinth_projection_mm = 250;
+        doc.add_wall(wall);
+
+        let blocks = generate_blocks(&doc, &terrain);
+        let positive_roof: Vec<_> = blocks
+            .iter()
+            .filter(|block| {
+                block.element_id == 30
+                    && block.role == BlockRole::Roof
+                    && block.corners_mm.iter().all(|corner| corner[2] >= 0)
+            })
+            .collect();
+        assert!(
+            !positive_roof.is_empty(),
+            "the south roof slope produced no tiles"
+        );
+
+        let min_v = positive_roof
+            .iter()
+            .flat_map(|block| block.corners_mm.iter().map(|corner| corner[2]))
+            .min()
+            .unwrap();
+        let max_v = positive_roof
+            .iter()
+            .flat_map(|block| block.corners_mm.iter().map(|corner| corner[2]))
+            .max()
+            .unwrap();
+        assert!(min_v <= 200, "ridge courses are missing: min v {min_v}");
+        assert!(
+            max_v < half_w - 200,
+            "the eave courses next to the curtain were not trimmed: max v {max_v}"
+        );
+        assert!(
+            max_v as f64 >= half_w as f64 * 0.5,
+            "more than half the slope was lost: max v {max_v} of {half_w}"
+        );
+
+        // No surviving tile may sit inside the wall footprint below its head.
+        let ground = terrain
+            .height_mm(-12_000, wall_v)
+            .max(terrain.height_mm(12_000, wall_v))
+            .max(terrain.height_mm(0, wall_v));
+        let wall_top = ground + 10_000;
+        for corner in positive_roof
+            .iter()
+            .flat_map(|block| block.corners_mm.iter())
+        {
+            if (corner[2] - wall_v).abs() <= 1_200 && corner[1] < wall_top {
+                panic!("roof tile pokes through the curtain at {corner:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn keep_and_range_blocks_are_positive_volume_and_have_a_roof() {
+        let terrain = SiteTerrain::for_site("lake_island").expect("curated site");
+        let doc = crate::fixtures::m2_baltic_document();
+        let blocks = generate_blocks(&doc, &terrain);
+
+        let keep_blocks: Vec<_> = blocks
+            .iter()
+            .filter(|block| block.element_id == 20)
+            .collect();
+        let range_blocks: Vec<_> = blocks
+            .iter()
+            .filter(|block| block.element_id == 30)
+            .collect();
+        assert!(
+            keep_blocks.len() > 500,
+            "keep blocks: {}",
+            keep_blocks.len()
+        );
+        assert!(
+            range_blocks.len() > 200,
+            "range blocks: {}",
+            range_blocks.len()
+        );
+        assert!(range_blocks
+            .iter()
+            .any(|block| block.role == BlockRole::Roof));
+
+        let mut checked = 0;
+        for block in keep_blocks.iter().chain(&range_blocks) {
+            for corner in block.corners_mm {
+                assert!(corner[0].abs() < 500_000);
+                assert!(corner[1].abs() < 200_000);
+                assert!(corner[2].abs() < 500_000);
+            }
+            let volume = signed_volume(&block.corners_mm);
+            assert!(
+                volume > 1_000.0,
+                "{:?} block {} course {} has volume {volume}",
+                block.kind,
+                block.element_id,
+                block.course_index
+            );
+            checked += 1;
+        }
+        assert!(checked > 700, "checked only {checked} blocks");
+    }
+
+    fn signed_volume(corners: &[[i64; 3]; 8]) -> f64 {
+        let point = |index: usize| -> [f64; 3] {
+            [
+                corners[index][0] as f64,
+                corners[index][1] as f64,
+                corners[index][2] as f64,
+            ]
+        };
+        let mut volume = 0.0;
+        for face in [
+            BlockFace::Bottom,
+            BlockFace::Top,
+            BlockFace::Front,
+            BlockFace::Back,
+            BlockFace::End0,
+            BlockFace::End1,
+        ] {
+            let ids = Block::face_corners(face);
+            let p0 = point(ids[0]);
+            let p1 = point(ids[1]);
+            let p2 = point(ids[2]);
+            let p3 = point(ids[3]);
+            volume += dot(p0, cross(p1, p2));
+            volume += dot(p0, cross(p2, p3));
+        }
+        volume / 6.0
+    }
+
+    fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+
+    fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
     }
 
     #[test]

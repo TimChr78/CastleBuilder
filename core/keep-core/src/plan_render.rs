@@ -63,6 +63,10 @@ const STYLE: &str = "<style>\n\
 .wall{fill:#d9c8a6;stroke:#3a3226;stroke-width:0.35;stroke-linejoin:round;}\n\
 .tower{fill:#d4c09c;stroke:#3a3226;stroke-width:0.35;}\n\
 .gatehouse{fill:#d4c09c;stroke:#3a3226;stroke-width:0.35;stroke-linejoin:round;}\n\
+.keep{fill:#c9b38c;stroke:#3a3226;stroke-width:0.35;stroke-linejoin:round;}\n\
+.keep-court{fill:#f6f1e6;stroke:#3a3226;stroke-width:0.22;}\n\
+.range{fill:#d9c8a6;stroke:#3a3226;stroke-width:0.35;stroke-linejoin:round;}\n\
+.roof-ridge{stroke:#5a3b2a;stroke-width:0.28;stroke-linecap:round;stroke-dasharray:0.9 0.45;}\n\
 .ditch{fill:none;stroke:#6b5b3e;stroke-width:0.42;stroke-linecap:round;stroke-dasharray:1.1 0.7;}\n\
 .ditch-hachure{stroke:#8c7b5a;stroke-width:0.16;stroke-linecap:round;}\n\
 .opening{fill:#f3e3ad;stroke:#8a4f1c;stroke-width:0.28;}\n\
@@ -139,6 +143,18 @@ impl Bounds {
                         + gatehouse.tower_radius_mm * 2
                         + 100) as f64
                         / 1000.0;
+                    include(cx - reach, cz - reach, cx + reach, cz + reach);
+                }
+                Element::Keep(keep) => {
+                    let cx = keep.centre_mm[0] as f64 / 1000.0;
+                    let cz = keep.centre_mm[1] as f64 / 1000.0;
+                    let reach = (keep.width_mm.max(keep.depth_mm) as f64 * 0.5 + 600.0) / 1000.0;
+                    include(cx - reach, cz - reach, cx + reach, cz + reach);
+                }
+                Element::Range(range) => {
+                    let cx = range.centre_mm[0] as f64 / 1000.0;
+                    let cz = range.centre_mm[1] as f64 / 1000.0;
+                    let reach = (range.length_mm.max(range.width_mm) as f64 * 0.5 + 600.0) / 1000.0;
                     include(cx - reach, cz - reach, cx + reach, cz + reach);
                 }
                 Element::Ditch(ditch) => {
@@ -290,6 +306,23 @@ fn square_plan_points(centre: [f64; 2], radius: f64, orientation_deg: i32) -> Ve
         (radius, -radius),
         (radius, radius),
         (-radius, radius),
+    ]
+    .into_iter()
+    .map(|(u, v)| rotate_plan(centre, u, v, orientation_deg))
+    .collect()
+}
+
+fn rect_plan_points(
+    centre: [f64; 2],
+    half_u: f64,
+    half_v: f64,
+    orientation_deg: i32,
+) -> Vec<(f64, f64)> {
+    [
+        (-half_u, -half_v),
+        (half_u, -half_v),
+        (half_u, half_v),
+        (-half_u, half_v),
     ]
     .into_iter()
     .map(|(u, v)| rotate_plan(centre, u, v, orientation_deg))
@@ -501,6 +534,60 @@ fn render_top_plan(document: &CastleDocument, terrain: &SiteTerrain) -> String {
                     &gatehouse.name,
                 ));
             }
+            Element::Keep(keep) => {
+                let c = [
+                    keep.centre_mm[0] as f64 / 1000.0,
+                    keep.centre_mm[1] as f64 / 1000.0,
+                ];
+                let half_w = keep.width_mm as f64 * 0.5 / 1000.0;
+                let half_d = keep.depth_mm as f64 * 0.5 / 1000.0;
+                let thickness = keep.wall_thickness_mm as f64 / 1000.0;
+                let outer = rect_plan_points(c, half_w, half_d, keep.orientation_deg);
+                svg.push_str(&format!(
+                    "<polygon class=\"keep\" points=\"{}\"/>\n",
+                    polygon_attr(&outer, &to_svg)
+                ));
+                let inner = rect_plan_points(
+                    c,
+                    (half_w - thickness).max(0.1),
+                    (half_d - thickness).max(0.1),
+                    keep.orientation_deg,
+                );
+                svg.push_str(&format!(
+                    "<polygon class=\"keep-court\" points=\"{}\"/>\n",
+                    polygon_attr(&inner, &to_svg)
+                ));
+                let label = to_svg(c[0], c[1] - half_d - 1.0);
+                svg.push_str(&element_label(label.0, label.1, keep.id, &keep.name));
+            }
+            Element::Range(range) => {
+                let c = [
+                    range.centre_mm[0] as f64 / 1000.0,
+                    range.centre_mm[1] as f64 / 1000.0,
+                ];
+                let half_l = range.length_mm as f64 * 0.5 / 1000.0;
+                let half_w = range.width_mm as f64 * 0.5 / 1000.0;
+                let outer = rect_plan_points(c, half_l, half_w, range.orientation_deg);
+                svg.push_str(&format!(
+                    "<polygon class=\"range\" points=\"{}\"/>\n",
+                    polygon_attr(&outer, &to_svg)
+                ));
+                // Ridge line along the length, plus a dashed eave line on each
+                // side so the plan reads as a pitched roof, not a flat slab.
+                let ridge_a = rotate_plan(c, -half_l, 0.0, range.orientation_deg);
+                let ridge_b = rotate_plan(c, half_l, 0.0, range.orientation_deg);
+                let a = to_svg(ridge_a.0, ridge_a.1);
+                let b = to_svg(ridge_b.0, ridge_b.1);
+                svg.push_str(&format!(
+                    "<line class=\"roof-ridge\" x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\"/>\n",
+                    n(a.0),
+                    n(a.1),
+                    n(b.0),
+                    n(b.1)
+                ));
+                let label = to_svg(c[0], c[1] - half_w - 1.0);
+                svg.push_str(&element_label(label.0, label.1, range.id, &range.name));
+            }
             Element::Ditch(ditch) => {
                 let a = to_svg(
                     ditch.start_mm[0] as f64 / 1000.0,
@@ -664,6 +751,23 @@ fn render_elevation(document: &CastleDocument, terrain: &SiteTerrain) -> String 
                 );
                 max_y = max_y.max(ground + gatehouse.height_mm as f64 / 1000.0);
             }
+            Element::Keep(keep) => {
+                let ground = height_at(
+                    terrain,
+                    keep.centre_mm[0] as f64 / 1000.0,
+                    keep.centre_mm[1] as f64 / 1000.0,
+                );
+                max_y = max_y.max(ground + keep.height_mm as f64 / 1000.0);
+            }
+            Element::Range(range) => {
+                let ground = height_at(
+                    terrain,
+                    range.centre_mm[0] as f64 / 1000.0,
+                    range.centre_mm[1] as f64 / 1000.0,
+                );
+                max_y = max_y
+                    .max(ground + (range.wall_height_mm + range.ridge_rise_mm()) as f64 / 1000.0);
+            }
             Element::Ditch(_) => {}
         }
     }
@@ -803,6 +907,55 @@ fn render_elevation(document: &CastleDocument, terrain: &SiteTerrain) -> String 
                     gatehouse.id,
                     &gatehouse.name,
                 ));
+            }
+            Element::Keep(keep) => {
+                let cx = keep.centre_mm[0] as f64 / 1000.0;
+                let cz = keep.centre_mm[1] as f64 / 1000.0;
+                let ground = height_at(terrain, cx, cz);
+                let top = ground + keep.height_mm as f64 / 1000.0;
+                let half = keep.width_mm as f64 * 0.5 / 1000.0;
+                let p0 = to_svg(cx - half, ground);
+                let p1 = to_svg(cx + half, top);
+                svg.push_str(&format!(
+                    "<rect class=\"keep\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/>\n",
+                    n(p0.0),
+                    n(p0.1.min(p1.1)),
+                    n((p1.0 - p0.0).max(0.05)),
+                    n((p1.1 - p0.1).abs().max(0.05))
+                ));
+                let label = to_svg(cx, top + 0.8);
+                svg.push_str(&element_label(label.0, label.1, keep.id, &keep.name));
+            }
+            Element::Range(range) => {
+                let cx = range.centre_mm[0] as f64 / 1000.0;
+                let cz = range.centre_mm[1] as f64 / 1000.0;
+                let ground = height_at(terrain, cx, cz);
+                let eave = ground + range.wall_height_mm as f64 / 1000.0;
+                let ridge = eave + range.ridge_rise_mm() as f64 / 1000.0;
+                let half = range.length_mm as f64 * 0.5 / 1000.0;
+                let body = to_svg(cx - half, ground);
+                let body_top = to_svg(cx + half, eave);
+                svg.push_str(&format!(
+                    "<rect class=\"range\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/>\n",
+                    n(body.0),
+                    n(body.1.min(body_top.1)),
+                    n((body_top.0 - body.0).max(0.05)),
+                    n((body_top.1 - body.1).abs().max(0.05))
+                ));
+                let peak = to_svg(cx, ridge);
+                let left = to_svg(cx - half, eave);
+                let right = to_svg(cx + half, eave);
+                svg.push_str(&format!(
+                    "<polygon class=\"range\" points=\"{},{} {},{} {},{}\"/>\n",
+                    n(left.0),
+                    n(left.1),
+                    n(peak.0),
+                    n(peak.1),
+                    n(right.0),
+                    n(right.1)
+                ));
+                let label = to_svg(cx, ridge + 0.8);
+                svg.push_str(&element_label(label.0, label.1, range.id, &range.name));
             }
             Element::Ditch(_) => {}
         }

@@ -62,6 +62,14 @@ func _initialize() -> void:
 		return
 
 	if bridge != null:
+		_check_m2(bridge, failures)
+
+	if not failures.is_empty():
+		_for_each_failure(failures)
+		quit(1)
+		return
+
+	if bridge != null:
 		_check_control_and_proposals(bridge, failures)
 
 	if not failures.is_empty():
@@ -667,6 +675,97 @@ func _check_m1(bridge: Object, failures: Array[String]) -> void:
 		print(
 			"M1.2 bridge OK: blocks=%d chunks=%d sites=3 fix=ok"
 			% [int(m1.get("block_count", 0)), int(m1.get("chunk_count", 0))]
+		)
+
+
+## M2.1 Wave 2b: Baltic brick showcase, historian scores, style switching and
+## the Keep/Hall placement commands.
+func _check_m2(bridge: Object, failures: Array[String]) -> void:
+	for method in ["build_m2_baltic", "set_style", "add_keep", "add_range"]:
+		if not bridge.has_method(method):
+			failures.append("KeepBridge has no %s() method." % method)
+	if not failures.is_empty():
+		return
+
+	var started := Time.get_ticks_msec()
+	var result: Variant = bridge.call("build_m2_baltic")
+	var elapsed := Time.get_ticks_msec() - started
+	_check_result(result, elapsed, failures, "M2 Baltic showcase")
+	if not (result is Dictionary):
+		return
+	var m2: Dictionary = result
+
+	if str(m2.get("site_id", "")) != "lake_island":
+		failures.append(
+			"build_m2_baltic() reported site_id %s, expected lake_island."
+			% str(m2.get("site_id", ""))
+		)
+	if str(m2.get("style_id", "")) != "baltic_brick":
+		failures.append(
+			"build_m2_baltic() reported style_id %s, expected baltic_brick."
+			% str(m2.get("style_id", ""))
+		)
+	if str(m2.get("material_palette", "")) != "red_brick":
+		failures.append(
+			"build_m2_baltic() reported material_palette %s, expected red_brick."
+			% str(m2.get("material_palette", ""))
+		)
+	if int(m2.get("block_count", 0)) <= 0:
+		failures.append("build_m2_baltic() produced no masonry blocks.")
+
+	var historian: Variant = m2.get("historian", null)
+	if not (historian is Dictionary):
+		failures.append("build_m2_baltic() is missing a historian Dictionary.")
+	else:
+		var report: Dictionary = historian
+		if int(report.get("overall_score", 0)) < 80:
+			failures.append(
+				"build_m2_baltic() historian overall_score is %d, expected >= 80."
+				% int(report.get("overall_score", 0))
+			)
+		for key in [
+			"authenticity_score",
+			"defensive_score",
+			"domestic_score",
+			"findings",
+		]:
+			if not report.has(key):
+				failures.append("build_m2_baltic() historian is missing \"%s\"." % key)
+
+	var style_result := _require_ok(
+		bridge.call("set_style", "edwardian_welsh"), "set_style(edwardian_welsh)", failures
+	)
+	if not style_result.is_empty():
+		if str(style_result.get("style_id", "")) != "edwardian_welsh":
+			failures.append("set_style() did not report the Edwardian style.")
+		if str(style_result.get("material_palette", "")) != "limestone":
+			failures.append("set_style() did not report the limestone palette.")
+		if not (style_result.get("assessment", null) is Dictionary):
+			failures.append("set_style() returned no assessment Dictionary.")
+		if not (style_result.get("historian", null) is Dictionary):
+			failures.append("set_style() returned no historian Dictionary.")
+
+	var keep_result := _require_ok(
+		bridge.call("add_keep", Vector2(30.0, 0.0), 0), "add_keep()", failures
+	)
+	var keep_hash := str(keep_result.get("document_hash", ""))
+	if keep_hash.is_empty() or keep_hash == str(m2.get("document_hash", "")):
+		failures.append("add_keep() did not change the document_hash.")
+
+	var range_result := _require_ok(
+		bridge.call("add_range", Vector2(30.0, 16.0), "hall", 0), "add_range(hall)", failures
+	)
+	var range_hash := str(range_result.get("document_hash", ""))
+	if range_hash.is_empty() or range_hash == keep_hash:
+		failures.append("add_range() did not change the document_hash.")
+
+	if failures.is_empty():
+		print(
+			"M2.1 bridge OK: blocks=%d historian=%d palette=red_brick keep+hall=ok"
+			% [
+				int(m2.get("block_count", 0)),
+				int((historian as Dictionary).get("overall_score", 0)),
+			]
 		)
 
 

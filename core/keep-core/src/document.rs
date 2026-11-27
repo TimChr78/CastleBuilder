@@ -30,6 +30,8 @@ pub enum ElementKind {
     RoundTower,
     Gatehouse,
     Ditch,
+    Keep,
+    Range,
 }
 
 /// Plan shape of a tower footprint. Defaults to [`TowerPlan::Round`] so saves
@@ -157,6 +159,134 @@ impl RoundTower {
         self.plan = plan;
         self.orientation_deg = orientation_deg;
         self
+    }
+}
+
+/// A great rectangular keep: four battered thick walls around a courtyard,
+/// topped by a crenellated parapet. The plan dimensions are outer dimensions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Keep {
+    pub id: ElementId,
+    pub name: String,
+    /// Plan centre, `[x, z]` millimetres.
+    pub centre_mm: [i64; 2],
+    /// Outer width along the local `u` axis, in millimetres.
+    pub width_mm: i64,
+    /// Outer depth along the local `v` axis, in millimetres.
+    pub depth_mm: i64,
+    pub height_mm: i64,
+    pub wall_thickness_mm: i64,
+    /// Plan rotation, in degrees clockwise from +X.
+    #[serde(default)]
+    pub orientation_deg: i32,
+    #[serde(default = "default_keep_batter_mm")]
+    pub batter_mm: i64,
+    #[serde(default = "default_keep_plinth_mm")]
+    pub plinth_height_mm: i64,
+    pub seed: u64,
+}
+
+const fn default_keep_batter_mm() -> i64 {
+    450
+}
+const fn default_keep_plinth_mm() -> i64 {
+    700
+}
+
+impl Keep {
+    pub fn new(
+        id: ElementId,
+        name: impl Into<String>,
+        centre_mm: [i64; 2],
+        orientation_deg: i32,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            centre_mm,
+            width_mm: 14_000,
+            depth_mm: 12_000,
+            height_mm: 20_000,
+            wall_thickness_mm: 2_600,
+            orientation_deg,
+            batter_mm: default_keep_batter_mm(),
+            plinth_height_mm: default_keep_plinth_mm(),
+            seed: CASTLE_SEED ^ id.rotate_left(53),
+        }
+    }
+
+    /// Axis-aligned half extents `[half_width, half_depth]`, in millimetres.
+    pub fn half_extents_mm(&self) -> [i64; 2] {
+        [self.width_mm.max(1) / 2, self.depth_mm.max(1) / 2]
+    }
+}
+
+/// Which domestic range a [`Range`] represents.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RangeKind {
+    #[default]
+    Hall,
+    Chapel,
+    Kitchen,
+}
+
+/// A roofed domestic range: four coursed walls with a pitched roof and stepped
+/// gable ends. The length runs along the local `u` axis and the ridge likewise.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Range {
+    pub id: ElementId,
+    pub name: String,
+    pub kind: RangeKind,
+    /// Plan centre, `[x, z]` millimetres.
+    pub centre_mm: [i64; 2],
+    /// Outer length along the ridge, in millimetres.
+    pub length_mm: i64,
+    /// Outer width across the ridge, in millimetres.
+    pub width_mm: i64,
+    pub wall_height_mm: i64,
+    /// Roof pitch above horizontal, in degrees.
+    #[serde(default = "default_roof_pitch_deg")]
+    pub roof_pitch_deg: i32,
+    /// Plan rotation of the ridge, in degrees clockwise from +X.
+    #[serde(default)]
+    pub orientation_deg: i32,
+    pub seed: u64,
+}
+
+const fn default_roof_pitch_deg() -> i32 {
+    42
+}
+
+impl Range {
+    pub fn new(
+        id: ElementId,
+        name: impl Into<String>,
+        kind: RangeKind,
+        centre_mm: [i64; 2],
+        orientation_deg: i32,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            kind,
+            centre_mm,
+            length_mm: 18_000,
+            width_mm: 8_500,
+            wall_height_mm: 7_500,
+            roof_pitch_deg: default_roof_pitch_deg(),
+            orientation_deg,
+            seed: CASTLE_SEED ^ id.rotate_left(59),
+        }
+    }
+
+    /// Ridge height above the eave, in millimetres.
+    pub fn ridge_rise_mm(&self) -> i64 {
+        let half_width = self.width_mm.max(1) as f64 * 0.5;
+        let angle = (self.roof_pitch_deg as f64).to_radians();
+        libm::round(half_width * libm::tan(angle)) as i64
     }
 }
 
@@ -425,6 +555,8 @@ pub enum Element {
     RoundTower(RoundTower),
     Gatehouse(Gatehouse),
     Ditch(Ditch),
+    Keep(Keep),
+    Range(Range),
 }
 
 impl Element {
@@ -434,6 +566,8 @@ impl Element {
             Self::RoundTower(t) => t.id,
             Self::Gatehouse(g) => g.id,
             Self::Ditch(d) => d.id,
+            Self::Keep(k) => k.id,
+            Self::Range(r) => r.id,
         }
     }
 
@@ -443,6 +577,8 @@ impl Element {
             Self::RoundTower(t) => &t.name,
             Self::Gatehouse(g) => &g.name,
             Self::Ditch(d) => &d.name,
+            Self::Keep(k) => &k.name,
+            Self::Range(r) => &r.name,
         }
     }
 
@@ -452,6 +588,8 @@ impl Element {
             Self::RoundTower(_) => ElementKind::RoundTower,
             Self::Gatehouse(_) => ElementKind::Gatehouse,
             Self::Ditch(_) => ElementKind::Ditch,
+            Self::Keep(_) => ElementKind::Keep,
+            Self::Range(_) => ElementKind::Range,
         }
     }
 }
@@ -497,6 +635,34 @@ impl CastleDocument {
         let id = ditch.id;
         self.insert(Element::Ditch(ditch));
         id
+    }
+
+    pub fn add_keep(&mut self, keep: Keep) -> ElementId {
+        let id = keep.id;
+        self.insert(Element::Keep(keep));
+        id
+    }
+
+    pub fn add_range(&mut self, range: Range) -> ElementId {
+        let id = range.id;
+        self.insert(Element::Range(range));
+        id
+    }
+
+    /// Every keep in stable id order.
+    pub fn keeps(&self) -> impl Iterator<Item = &Keep> {
+        self.elements.values().filter_map(|element| match element {
+            Element::Keep(keep) => Some(keep),
+            _ => None,
+        })
+    }
+
+    /// Every domestic range in stable id order.
+    pub fn ranges(&self) -> impl Iterator<Item = &Range> {
+        self.elements.values().filter_map(|element| match element {
+            Element::Range(range) => Some(range),
+            _ => None,
+        })
     }
 
     /// Every ditch in stable id order.
@@ -704,6 +870,33 @@ impl CastleDocument {
                     bytes.extend_from_slice(&d.width_mm.to_le_bytes());
                     bytes.extend_from_slice(&d.depth_mm.to_le_bytes());
                 }
+                Element::Keep(k) => {
+                    bytes.push(5);
+                    bytes.extend_from_slice(&k.id.to_le_bytes());
+                    bytes.extend_from_slice(&k.centre_mm[0].to_le_bytes());
+                    bytes.extend_from_slice(&k.centre_mm[1].to_le_bytes());
+                    bytes.extend_from_slice(&k.width_mm.to_le_bytes());
+                    bytes.extend_from_slice(&k.depth_mm.to_le_bytes());
+                    bytes.extend_from_slice(&k.height_mm.to_le_bytes());
+                    bytes.extend_from_slice(&k.wall_thickness_mm.to_le_bytes());
+                    bytes.extend_from_slice(&k.orientation_deg.to_le_bytes());
+                    bytes.extend_from_slice(&k.batter_mm.to_le_bytes());
+                    bytes.extend_from_slice(&k.plinth_height_mm.to_le_bytes());
+                    bytes.extend_from_slice(&k.seed.to_le_bytes());
+                }
+                Element::Range(r) => {
+                    bytes.push(6);
+                    bytes.extend_from_slice(&r.id.to_le_bytes());
+                    bytes.push(r.kind as u8);
+                    bytes.extend_from_slice(&r.centre_mm[0].to_le_bytes());
+                    bytes.extend_from_slice(&r.centre_mm[1].to_le_bytes());
+                    bytes.extend_from_slice(&r.length_mm.to_le_bytes());
+                    bytes.extend_from_slice(&r.width_mm.to_le_bytes());
+                    bytes.extend_from_slice(&r.wall_height_mm.to_le_bytes());
+                    bytes.extend_from_slice(&r.roof_pitch_deg.to_le_bytes());
+                    bytes.extend_from_slice(&r.orientation_deg.to_le_bytes());
+                    bytes.extend_from_slice(&r.seed.to_le_bytes());
+                }
             }
         }
         bytes.extend_from_slice(&(self.openings.len() as u64).to_le_bytes());
@@ -840,6 +1033,37 @@ pub(crate) fn validate_element(element: &Element) -> Result<(), CommandError> {
                 end_mm: ditch.end_mm,
                 width_mm: ditch.width_mm,
                 depth_mm: ditch.depth_mm,
+            }
+            .validated()?;
+        }
+        Element::Keep(keep) => {
+            sanitize_name(&keep.name)?;
+            CommandOp::CreateKeep {
+                ref_id: None,
+                name: keep.name.clone(),
+                centre_mm: keep.centre_mm,
+                width_mm: Some(keep.width_mm),
+                depth_mm: Some(keep.depth_mm),
+                height_mm: Some(keep.height_mm),
+                wall_thickness_mm: Some(keep.wall_thickness_mm),
+                orientation_deg: Some(keep.orientation_deg),
+                batter_mm: Some(keep.batter_mm),
+                plinth_height_mm: Some(keep.plinth_height_mm),
+            }
+            .validated()?;
+        }
+        Element::Range(range) => {
+            sanitize_name(&range.name)?;
+            CommandOp::CreateRange {
+                ref_id: None,
+                name: range.name.clone(),
+                kind: range.kind,
+                centre_mm: range.centre_mm,
+                length_mm: Some(range.length_mm),
+                width_mm: Some(range.width_mm),
+                wall_height_mm: Some(range.wall_height_mm),
+                roof_pitch_deg: Some(range.roof_pitch_deg),
+                orientation_deg: Some(range.orientation_deg),
             }
             .validated()?;
         }

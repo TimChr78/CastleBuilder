@@ -1,0 +1,21 @@
+{
+  "id": "baltic_brick",
+  "name": "Baltic Brick (1350–1450)",
+  "period": "1350–1450",
+  "region": "Baltic / North Germany / Southern Scandinavia",
+  "course_height_mm": 280,
+  "min_wall_thickness_mm": 1500,
+  "default_wall_thickness_mm": 2100,
+  "max_slenderness_ratio": 5.0,
+  "default_batter_mm": 450,
+  "default_plinth_height_mm": 700,
+  "flanking_spacing_min_m": 22.0,
+  "flanking_spacing_max_m": 38.0,
+  "material_palette": "red_brick",
+  "source_notes": [
+    "Malbork Castle (Marienburg, refounded 1274 and greatly expanded after 1309): the High Castle, Middle Castle and Palace of the Grand Masters are built of coursed red brick over stone footings, with tall crow-stepped gables and pitched tile roofs rather than the low battered curtains of the Welsh castles.",
+    "Gniew Castle (begun c. 1290, rebuilt through the 14th and 15th centuries) and Lidzbark Warmiński (1350–1401): brick fortresses with corner towers, a strongly defended gatehouse and flanking drums roughly 22–38 m apart, close enough for bowshot to cover the whole curtain.",
+    "Kwidzyn Castle (1345–1390) and the Malbork Palace of the Grand Masters (c. 1390s): brick castles combine a great hall, chapel and kitchen ranges around a courtyard, with steep pitched roofs of clay tile or slate and tall gabled ends closing the domestic buildings.",
+    "Baltic brick walls of 1350–1450 are laid in tall, relatively thin courses over a pronounced plinth and a modest batter; hall and chapel roofs are carried on timber trusses, which in practice limits an unsupported range to roughly 16 m across before an aisle or vault is needed."
+  ]
+}

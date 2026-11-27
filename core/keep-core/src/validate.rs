@@ -202,6 +202,64 @@ pub fn validate_structure(
                     });
                 }
             }
+            Element::Keep(keep) => {
+                let height = keep.height_mm.max(1);
+                let thickness = keep.wall_thickness_mm.max(1);
+                let slender = height as f64 / thickness as f64;
+                // Keeps carry the parapet and the lord's residence, so their
+                // walls are checked against the same style minimum as a
+                // curtain but with a tighter 8.5:1 slenderness limit.
+                if thickness < style.min_wall_thickness_mm || slender > 8.5 {
+                    let recommended = ((height as f64 / 8.5).ceil() as i64)
+                        .max(style.min_wall_thickness_mm)
+                        .max(style.default_wall_thickness_mm);
+                    let suggested_fix = (recommended <= MAX_WALL_THICKNESS_MM).then_some(
+                        CommandOp::ModifyElement {
+                            id: keep.id,
+                            height_mm: None,
+                            thickness_mm: Some(recommended),
+                            batter_mm: None,
+                            plinth_height_mm: None,
+                            plan: None,
+                            orientation_deg: None,
+                        },
+                    );
+                    findings.push(Finding {
+                        element_id: keep.id,
+                        severity: Severity::Error,
+                        code: "keep_too_slender".to_string(),
+                        message: format!(
+                            "This {:.1} m keep has {:.1} m thick walls. {} expects a keep wall of at least {} m and a height-to-thickness ratio no greater than 8.5; a keep this tall needs walls around {:.1} m thick.",
+                            height as f64 / 1000.0,
+                            thickness as f64 / 1000.0,
+                            style.name,
+                            style.min_wall_thickness_mm as f64 / 1000.0,
+                            recommended as f64 / 1000.0
+                        ),
+                        source_note: source.clone(),
+                        suggested_fix,
+                    });
+                }
+            }
+            Element::Range(range) => {
+                // A medieval timber roof truss is credible to roughly 16 m of
+                // unsupported span (architecture section 6.1). Wider ranges
+                // need an aisle, a stone vault or a crown-post alternative.
+                if range.width_mm > 16_000 {
+                    findings.push(Finding {
+                        element_id: range.id,
+                        severity: Severity::Warning,
+                        code: "range_roof_span_too_wide".to_string(),
+                        message: format!(
+                            "This range is {:.1} m across, beyond the roughly 16 m an unsupported timber roof truss could span in {}; it would need an aisle, a stone vault or an internal arcade.",
+                            range.width_mm as f64 / 1000.0,
+                            style.name
+                        ),
+                        source_note: source.clone(),
+                        suggested_fix: None,
+                    });
+                }
+            }
             Element::RoundTower(_) | Element::Ditch(_) => {}
         }
     }
@@ -265,6 +323,52 @@ mod tests {
 
     fn style() -> StylePack {
         StylePack::edwardian_welsh()
+    }
+
+    #[test]
+    fn a_wide_range_warns_about_its_timber_roof_span() {
+        use crate::document::{Range, RangeKind};
+
+        let terrain = SiteTerrain::m0a_promontory();
+        let mut document = CastleDocument::new();
+        let mut range = Range::new(20, "Wide hall", RangeKind::Hall, [0, 0], 0);
+        range.width_mm = 20_000;
+        document.add_range(range);
+
+        let report = validate_structure(&document, &terrain, &style());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == "range_roof_span_too_wide")
+            .expect("roof span finding");
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(report.passed, "a span warning must not fail the castle");
+    }
+
+    #[test]
+    fn a_slender_keep_is_an_error_with_a_thicker_wall_fix() {
+        use crate::document::Keep;
+
+        let terrain = SiteTerrain::m0a_promontory();
+        let mut document = CastleDocument::new();
+        let mut keep = Keep::new(21, "Needle keep", [0, 0], 0);
+        keep.height_mm = 30_000;
+        keep.wall_thickness_mm = 2_000;
+        document.add_keep(keep);
+
+        let report = validate_structure(&document, &terrain, &style());
+        assert!(!report.passed);
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == "keep_too_slender")
+            .expect("keep slenderness finding");
+        assert_eq!(finding.severity, Severity::Error);
+        let Some(CommandOp::ModifyElement { thickness_mm, .. }) = finding.suggested_fix.as_ref()
+        else {
+            panic!("expected a ModifyElement suggested fix");
+        };
+        assert!(thickness_mm.unwrap() >= 3_529);
     }
 
     #[test]

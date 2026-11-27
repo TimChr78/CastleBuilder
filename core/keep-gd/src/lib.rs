@@ -28,7 +28,8 @@ use keep_core::command::{
     MAX_WALL_THICKNESS_MM, MIN_TOWER_HEIGHT_MM, MIN_TOWER_RADIUS_MM, MIN_WALL_HEIGHT_MM,
     MIN_WALL_THICKNESS_MM,
 };
-use keep_core::document::{CastleDocument, Element, TowerPlan};
+use keep_core::document::{CastleDocument, Element, RangeKind, TowerPlan};
+use keep_core::historian::{assess_historian, HistorianCategory, HistorianReport};
 use keep_core::mesh::{ChunkMeshData, SceneData};
 use keep_core::picking::SnapKind;
 use keep_core::plan_render::{render_plan_svg, PlanView};
@@ -73,6 +74,8 @@ pub struct KeepBridge {
     pending_render_view: Option<(i64, Sender<RpcReply>)>,
     /// Monotonic id for `render_view` capture requests.
     next_render_view_id: i64,
+    /// Active architectural style pack id (`edwardian_welsh` by default).
+    style_id: String,
 }
 
 #[godot_api]
@@ -90,6 +93,7 @@ impl INode for KeepBridge {
             control_server: None,
             pending_render_view: None,
             next_render_view_id: 1,
+            style_id: "edwardian_welsh".to_string(),
         };
         bridge.ensure_control_agents();
         bridge
@@ -101,12 +105,49 @@ impl KeepBridge {
     /// Build the M1 Edwardian showcase on the coastal headland.
     #[func]
     fn build_m1_edwardian(&mut self) -> VarDictionary {
+        self.style_id = "edwardian_welsh".to_string();
         self.replace_session(Session::from_document(
             M1_SITE_ID,
             SiteTerrain::for_site(M1_SITE_ID).expect("coastal_headland is a curated site"),
             keep_core::fixtures::m1_edwardian_document(),
         ));
         self.session_scene()
+    }
+
+    /// Build the M2 Baltic red-brick showcase on the lake island.
+    #[func]
+    fn build_m2_baltic(&mut self) -> VarDictionary {
+        self.style_id = "baltic_brick".to_string();
+        self.replace_session(Session::from_document(
+            "lake_island",
+            SiteTerrain::for_site("lake_island").expect("lake_island is a curated site"),
+            keep_core::fixtures::m2_baltic_document(),
+        ));
+        self.session_scene()
+    }
+
+    /// Switch the active architectural style and re-assess the live document.
+    #[func]
+    fn set_style(&mut self, style_id: GString) -> VarDictionary {
+        let id = style_id.to_string();
+        let Some(pack) = StylePack::find(&id) else {
+            let mut result = VarDictionary::new();
+            result.set("ok", false);
+            result.set("error", &GString::from(&format!("unknown style id '{id}'")));
+            return result;
+        };
+        self.style_id = pack.id.clone();
+        let historian = assess_historian(self.session.document(), self.session.terrain(), &pack);
+        let mut result = VarDictionary::new();
+        result.set("ok", true);
+        result.set("style_id", &GString::from(&pack.id));
+        result.set("material_palette", &GString::from(&pack.material_palette));
+        result.set(
+            "assessment",
+            &assessment_dictionary(self.session.document(), self.session.terrain(), &pack),
+        );
+        result.set("historian", &historian_dictionary(&historian));
+        result
     }
 
     /// Switch to an empty castle on one of the curated sites.
@@ -336,6 +377,71 @@ impl KeepBridge {
         }
     }
 
+    /// Add a great rectangular keep and return the rebuilt scene.
+    #[func]
+    fn add_keep(&mut self, center_xz: Vector2, orientation_deg: i32) -> VarDictionary {
+        let op = CommandOp::CreateKeep {
+            ref_id: None,
+            name: format!("Keep {}", self.session.next_element_id()),
+            centre_mm: quantise_xz(center_xz),
+            width_mm: None,
+            depth_mm: None,
+            height_mm: None,
+            wall_thickness_mm: None,
+            orientation_deg: Some(orientation_deg),
+            batter_mm: None,
+            plinth_height_mm: None,
+        };
+        match self
+            .session
+            .apply_batch(self.player_author.clone(), vec![op])
+        {
+            Ok(_) => {
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Add a roofed domestic range (`hall`, `chapel` or `kitchen`).
+    #[func]
+    fn add_range(
+        &mut self,
+        center_xz: Vector2,
+        kind: GString,
+        orientation_deg: i32,
+    ) -> VarDictionary {
+        let range_kind = range_kind_from_key(&kind.to_string());
+        let op = CommandOp::CreateRange {
+            ref_id: None,
+            name: format!(
+                "{} {}",
+                range_kind_name(range_kind),
+                self.session.next_element_id()
+            ),
+            kind: range_kind,
+            centre_mm: quantise_xz(center_xz),
+            length_mm: None,
+            width_mm: None,
+            wall_height_mm: None,
+            roof_pitch_deg: None,
+            orientation_deg: Some(orientation_deg),
+        };
+        match self
+            .session
+            .apply_batch(self.player_author.clone(), vec![op])
+        {
+            Ok(_) => {
+                let mut result = self.session_scene();
+                result.set("ok", true);
+                result
+            }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
     /// Add a twin-towered gatehouse and return the rebuilt scene.
     #[func]
     fn add_gatehouse(&mut self, center_xz: Vector2, orientation_deg: i32) -> VarDictionary {
@@ -391,10 +497,11 @@ impl KeepBridge {
         }
     }
 
-    /// Assess the current castle against the Edwardian Welsh style pack.
+    /// Assess the current castle against the active style pack.
     #[func]
     fn get_assessment(&self) -> VarDictionary {
-        assessment_dictionary(self.session.document(), self.session.terrain())
+        let style = self.active_style();
+        assessment_dictionary(self.session.document(), self.session.terrain(), &style)
     }
 
     /// Apply a suggested fix (serialised `CommandOp` JSON) as a normal batch.
@@ -755,12 +862,14 @@ impl KeepBridge {
             .build_proposal_ghost_scene(&proposal_id.to_string())
         {
             Some(scene) => {
+                let style = self.active_style();
                 let mut result = scene_to_dictionary(
                     scene,
                     self.session.document(),
                     self.session.terrain(),
                     self.session.document().document_hash(),
                     self.session.site_id(),
+                    &style,
                 );
                 result.set("ok", true);
                 result
@@ -889,7 +998,21 @@ impl KeepBridge {
                 .map_err(response_error)?,
             "list_elements" => serde_json::to_value(build_element_list_response(&self.session))
                 .map_err(response_error)?,
-            "get_assessment" => assessment_json(self.session.document(), self.session.terrain()),
+            "get_assessment" => {
+                // Match the offline `keep-mcp` contract: an explicit style_id
+                // is honoured (and rejected when unknown); only an omitted
+                // style falls back to the live session's active pack.
+                let style = match params.get("style_id") {
+                    None | Some(Value::Null) => self.active_style(),
+                    Some(Value::String(id)) => StylePack::find(id).ok_or_else(|| {
+                        RpcError::new(-32_602, format!("unknown style id '{id}'"))
+                    })?,
+                    Some(_) => {
+                        return Err(RpcError::new(-32_602, "'style_id' must be a string"));
+                    }
+                };
+                assessment_json(self.session.document(), self.session.terrain(), &style)
+            }
             "list_styles" => json!({ "styles": StylePack::list() }),
             "get_style" => {
                 let id = required_string(params, "id")?;
@@ -1052,14 +1175,20 @@ impl KeepBridge {
 
 /// Rebuild the current session document into a scene dictionary.
 impl KeepBridge {
+    fn active_style(&self) -> StylePack {
+        StylePack::find(&self.style_id).unwrap_or_default()
+    }
+
     fn session_scene(&self) -> VarDictionary {
         let scene = self.session.build_scene();
+        let style = self.active_style();
         let mut result = scene_to_dictionary(
             scene,
             self.session.document(),
             self.session.terrain(),
             self.session.document().document_hash(),
             self.session.site_id(),
+            &style,
         );
         result.set("history_len", self.session.history().len() as i64);
         result
@@ -1171,14 +1300,15 @@ fn status_key(status: ProposalStatus) -> &'static str {
     }
 }
 
-fn assessment_json(document: &CastleDocument, terrain: &SiteTerrain) -> Value {
-    let style = StylePack::edwardian_welsh();
-    let report = validate_structure(document, terrain, &style);
+fn assessment_json(document: &CastleDocument, terrain: &SiteTerrain, style: &StylePack) -> Value {
+    let report = validate_structure(document, terrain, style);
+    let historian = assess_historian(document, terrain, style);
     json!({
         "score": report.score,
         "passed": report.passed,
-        "style_id": style.id,
+        "style_id": style.id.clone(),
         "findings": report.findings,
+        "historian": historian,
     })
 }
 
@@ -1222,6 +1352,7 @@ fn scene_to_dictionary(
     terrain: &SiteTerrain,
     document_hash: u64,
     site_id: &str,
+    style: &StylePack,
 ) -> VarDictionary {
     let mut result = VarDictionary::new();
 
@@ -1245,10 +1376,17 @@ fn scene_to_dictionary(
         entry.set("block_count", chunk.block_count as i64);
         chunks.push(&entry);
     }
+    let historian = assess_historian(document, terrain, style);
     result.set("chunks", &chunks);
     result.set("elements", &elements_array(document, terrain));
     result.set("site_id", &GString::from(site_id));
-    result.set("assessment", &assessment_dictionary(document, terrain));
+    result.set("style_id", &GString::from(&style.id));
+    result.set("material_palette", &GString::from(&style.material_palette));
+    result.set("historian", &historian_dictionary(&historian));
+    result.set(
+        "assessment",
+        &assessment_dictionary(document, terrain, style),
+    );
     result.set("block_count", scene.block_count as i64);
     result.set("chunk_count", scene.chunks.len() as i64);
     result.set("triangle_count", scene.triangle_count as i64);
@@ -1315,15 +1453,107 @@ fn elements_array(document: &CastleDocument, terrain: &SiteTerrain) -> Array<Var
                     elements.push(&entry);
                 }
             }
+            Element::Keep(keep) => {
+                // Export the four keep walls as ordinary curtain segments so the
+                // construction scaffolding wraps the great tower cleanly.
+                let half_w = keep.width_mm as f64 * 0.5;
+                let half_d = keep.depth_mm as f64 * 0.5;
+                let corners =
+                    oriented_rect_corners(keep.centre_mm, keep.orientation_deg, half_w, half_d);
+                push_rect_walls(
+                    &mut elements,
+                    terrain,
+                    &corners,
+                    keep.wall_thickness_mm as f32 / 1000.0,
+                    keep.height_mm as f32 / 1000.0,
+                );
+            }
+            Element::Range(range) => {
+                // A roofed range is a rectangle of four walls; export them as
+                // curtain segments at eaves height.
+                let half_l = range.length_mm as f64 * 0.5;
+                let half_w = range.width_mm as f64 * 0.5;
+                let corners =
+                    oriented_rect_corners(range.centre_mm, range.orientation_deg, half_l, half_w);
+                push_rect_walls(
+                    &mut elements,
+                    terrain,
+                    &corners,
+                    0.6,
+                    range.wall_height_mm as f32 / 1000.0,
+                );
+            }
             Element::Ditch(_) => {}
         }
     }
     elements
 }
 
-/// Structural assessment in the shape the HUD expects.
-fn assessment_dictionary(document: &CastleDocument, terrain: &SiteTerrain) -> VarDictionary {
-    let report = validate_structure(document, terrain, &StylePack::edwardian_welsh());
+/// Four world-space corners of an oriented rectangle (metres).
+fn oriented_rect_corners(
+    centre_mm: [i64; 2],
+    orientation_deg: i32,
+    half_u: f64,
+    half_v: f64,
+) -> [(f32, f32); 4] {
+    let cx = centre_mm[0] as f64 / 1000.0;
+    let cz = centre_mm[1] as f64 / 1000.0;
+    let angle = (orientation_deg as f64).to_radians();
+    let (sin_a, cos_a) = (angle.sin(), angle.cos());
+    let mut corners = [(0.0f32, 0.0f32); 4];
+    for (index, (u, v)) in [
+        (-half_u, -half_v),
+        (half_u, -half_v),
+        (half_u, half_v),
+        (-half_u, half_v),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let x = cx + u * cos_a - v * sin_a;
+        let z = cz + u * sin_a + v * cos_a;
+        corners[index] = (x as f32, z as f32);
+    }
+    corners
+}
+
+/// Emit one wall footprint per rectangle edge so scaffolding and dust follow
+/// the element outline.
+fn push_rect_walls(
+    elements: &mut Array<VarDictionary>,
+    terrain: &SiteTerrain,
+    corners: &[(f32, f32); 4],
+    thickness: f32,
+    height: f32,
+) {
+    for index in 0..4 {
+        let (start_x, start_z) = corners[index];
+        let (end_x, end_z) = corners[(index + 1) % 4];
+        let mid_x = (start_x + end_x) * 0.5;
+        let mid_z = (start_z + end_z) * 0.5;
+        let mut entry = VarDictionary::new();
+        let kind = GString::from("wall");
+        entry.set("kind", &kind);
+        entry.set("start", Vector2::new(start_x, start_z));
+        entry.set("end", Vector2::new(end_x, end_z));
+        entry.set("thickness", thickness);
+        entry.set("base_y", terrain.height_m(mid_x, mid_z));
+        entry.set("start_y", terrain.height_m(start_x, start_z));
+        entry.set("end_y", terrain.height_m(end_x, end_z));
+        entry.set("height", height);
+        elements.push(&entry);
+    }
+}
+
+/// Structural assessment in the shape the HUD expects, including the
+/// historian's deterministic reading of the same document.
+fn assessment_dictionary(
+    document: &CastleDocument,
+    terrain: &SiteTerrain,
+    style: &StylePack,
+) -> VarDictionary {
+    let report = validate_structure(document, terrain, style);
+    let historian = assess_historian(document, terrain, style);
     let mut findings: Array<VarDictionary> = Array::new();
     for finding in &report.findings {
         let mut entry = VarDictionary::new();
@@ -1344,8 +1574,58 @@ fn assessment_dictionary(document: &CastleDocument, terrain: &SiteTerrain) -> Va
     let mut result = VarDictionary::new();
     result.set("score", i64::from(report.score));
     result.set("passed", report.passed);
+    result.set("style_id", &GString::from(&style.id));
+    result.set("findings", &findings);
+    result.set("historian", &historian_dictionary(&historian));
+    result
+}
+
+fn historian_dictionary(report: &HistorianReport) -> VarDictionary {
+    let mut result = VarDictionary::new();
+    result.set("style_id", &GString::from(&report.style_id));
+    result.set("overall_score", i64::from(report.overall_score));
+    result.set("authenticity_score", i64::from(report.authenticity_score));
+    result.set("defensive_score", i64::from(report.defensive_score));
+    result.set("domestic_score", i64::from(report.domestic_score));
+    let mut findings: Array<VarDictionary> = Array::new();
+    for finding in &report.findings {
+        let mut entry = VarDictionary::new();
+        entry.set(
+            "category",
+            &GString::from(historian_category_key(finding.category)),
+        );
+        entry.set("code", &GString::from(&finding.code));
+        entry.set("message", &GString::from(&finding.message));
+        entry.set("source_note", &GString::from(&finding.source_note));
+        entry.set("score_impact", i64::from(finding.score_impact));
+        findings.push(&entry);
+    }
     result.set("findings", &findings);
     result
+}
+
+fn historian_category_key(category: HistorianCategory) -> &'static str {
+    match category {
+        HistorianCategory::Authenticity => "authenticity",
+        HistorianCategory::Defensive => "defensive",
+        HistorianCategory::Domestic => "domestic",
+    }
+}
+
+fn range_kind_from_key(key: &str) -> RangeKind {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "chapel" => RangeKind::Chapel,
+        "kitchen" => RangeKind::Kitchen,
+        _ => RangeKind::Hall,
+    }
+}
+
+fn range_kind_name(kind: RangeKind) -> &'static str {
+    match kind {
+        RangeKind::Hall => "Hall",
+        RangeKind::Chapel => "Chapel",
+        RangeKind::Kitchen => "Kitchen",
+    }
 }
 
 fn severity_key(severity: Severity) -> GString {

@@ -12,6 +12,7 @@
 
 use keep_core::command::AuthorId;
 use keep_core::document::CastleDocument;
+use keep_core::historian::assess_historian;
 use keep_core::plan_render::{render_plan_svg, PlanView};
 use keep_core::proposal::AgentPermission;
 use keep_core::session::Session;
@@ -278,7 +279,9 @@ impl McpServer {
                 .map(|value| tool_result(&value)),
             "undo" => self.tool_undo().map(|value| tool_result(&value)),
             "get_history" => self.tool_get_history().map(|value| tool_result(&value)),
-            "get_assessment" => self.tool_get_assessment().map(|value| tool_result(&value)),
+            "get_assessment" => self
+                .tool_get_assessment(arguments)
+                .map(|value| tool_result(&value)),
             "list_styles" => self.tool_list_styles().map(|value| tool_result(&value)),
             "get_style" => self
                 .tool_get_style(arguments)
@@ -499,11 +502,30 @@ impl McpServer {
         })
     }
 
-    /// Assess the castle against the Edwardian Welsh rules and cite the style.
-    fn tool_get_assessment(&self) -> Result<AssessmentResponse, String> {
-        let style = StylePack::edwardian_welsh();
-        let report = validate_structure(self.session.document(), self.session.terrain(), &style);
-        Ok(AssessmentResponse::new(style.id.clone(), report))
+    /// Assess the castle against the requested style pack (Edwardian Welsh by
+    /// default) and cite both the structural and historical readings.
+    fn tool_get_assessment(&self, arguments: Value) -> Result<AssessmentResponse, String> {
+        let style_id = match arguments.get("style_id") {
+            None | Some(Value::Null) => "edwardian_welsh",
+            Some(Value::String(id)) => id.as_str(),
+            Some(_) => {
+                return Err("invalid arguments: 'style_id' must be a string".to_string());
+            }
+        };
+        if style_id.is_empty() {
+            return Err("invalid arguments: 'style_id' must not be empty".to_string());
+        }
+        let style = StylePack::find(style_id).ok_or_else(|| {
+            format!(
+                "unknown style id '{}'",
+                truncate_message_field(style_id, 64)
+            )
+        })?;
+        let document = self.session.document();
+        let terrain = self.session.terrain();
+        let report = validate_structure(document, terrain, &style);
+        let historian = assess_historian(document, terrain, &style);
+        Ok(AssessmentResponse::new(style.id.clone(), report, historian))
     }
 
     /// Every curated style pack, in stable id order.
@@ -608,7 +630,7 @@ impl McpServer {
             "keep://castle/plan/elevation" => Ok(self.resource_svg(uri, PlanView::ElevationNorth)),
             "keep://castle/assessment" => {
                 let assessment = self
-                    .tool_get_assessment()
+                    .tool_get_assessment(json!({}))
                     .map_err(|message| (code::INTERNAL_ERROR, message))?;
                 let text = serde_json::to_string_pretty(&assessment)
                     .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?;
@@ -616,6 +638,12 @@ impl McpServer {
             }
             "keep://styles/edwardian_welsh" => {
                 let style = StylePack::edwardian_welsh();
+                let text = serde_json::to_string_pretty(&style)
+                    .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?;
+                Ok(resource_contents(uri, "application/json", text))
+            }
+            "keep://styles/baltic_brick" => {
+                let style = StylePack::baltic_brick();
                 let text = serde_json::to_string_pretty(&style)
                     .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?;
                 Ok(resource_contents(uri, "application/json", text))
@@ -647,6 +675,11 @@ impl McpServer {
             "keep://styles/edwardian_welsh" => (
                 "get_style",
                 json!({ "id": "edwardian_welsh" }),
+                "application/json",
+            ),
+            "keep://styles/baltic_brick" => (
+                "get_style",
+                json!({ "id": "baltic_brick" }),
                 "application/json",
             ),
             "keep://castle/save" => {
@@ -698,7 +731,7 @@ fn initialize_result() -> Value {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Keepwright castle sidecar. Use get_castle, list_elements, render_plan, apply_operations, undo and get_history, plus get_assessment, list_styles, get_style and get_site for structural and style reads. Use begin_proposal, stage_proposal_ops and submit_proposal to propose edits for the human to accept in-game (list_proposals shows their status). render_view needs live mode; render_plan works offline."
+        "instructions": "Keepwright castle sidecar. Use get_castle, list_elements, render_plan, apply_operations, undo and get_history, plus get_assessment (optional style_id), list_styles, get_style and get_site for structural, historical and style reads. Use begin_proposal, stage_proposal_ops and submit_proposal to propose edits for the human to accept in-game (list_proposals shows their status). render_view needs live mode; render_plan works offline."
     })
 }
 
@@ -732,13 +765,19 @@ fn resources_list() -> Value {
             {
                 "uri": "keep://castle/assessment",
                 "name": "Structural assessment",
-                "description": "Edwardian Welsh structural findings with severity, source notes and suggested fixes.",
+                "description": "Structural and historian findings for a style pack (default Edwardian Welsh), with severity, source notes and suggested fixes.",
                 "mimeType": "application/json"
             },
             {
                 "uri": "keep://styles/edwardian_welsh",
                 "name": "Edwardian Welsh style pack",
                 "description": "Curated dimension, slenderness, batter, plinth and flanking rules with source notes.",
+                "mimeType": "application/json"
+            },
+            {
+                "uri": "keep://styles/baltic_brick",
+                "name": "Baltic brick style pack",
+                "description": "Curated brick dimension, slenderness, batter, plinth and flanking rules with source notes.",
                 "mimeType": "application/json"
             }
         ]
@@ -840,6 +879,11 @@ mod tests {
             keep_core::fixtures::m1_edwardian_document(),
         )
         .expect("coastal_headland is a curated site")
+    }
+
+    fn m2_server() -> McpServer {
+        McpServer::with_start("lake_island", keep_core::fixtures::m2_baltic_document())
+            .expect("lake_island is a curated site")
     }
 
     fn call(server: &mut McpServer, id: u64, method: &str, params: Value) -> Value {
@@ -1673,13 +1717,14 @@ mod tests {
         let mut server = server();
         let response = call(&mut server, 5, "resources/list", json!({}));
         let resources = response["result"]["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 6);
+        assert_eq!(resources.len(), 7);
         assert_eq!(resources[0]["uri"], "keep://castle/document");
         assert_eq!(resources[1]["uri"], "keep://castle/save");
         assert_eq!(resources[1]["mimeType"], "application/json");
         assert_eq!(resources[2]["mimeType"], "image/svg+xml");
         assert_eq!(resources[4]["uri"], "keep://castle/assessment");
         assert_eq!(resources[5]["uri"], "keep://styles/edwardian_welsh");
+        assert_eq!(resources[6]["uri"], "keep://styles/baltic_brick");
         assert_eq!(resources[4]["mimeType"], "application/json");
 
         let document = call(
@@ -1722,6 +1767,19 @@ mod tests {
         assert_eq!(contents["mimeType"], "application/json");
         let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["id"], "edwardian_welsh");
+
+        let style = call(
+            &mut server,
+            11,
+            "resources/read",
+            json!({ "uri": "keep://styles/baltic_brick" }),
+        );
+        let contents = &style["result"]["contents"][0];
+        assert_eq!(contents["mimeType"], "application/json");
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["id"], "baltic_brick");
+        assert_eq!(parsed["course_height_mm"], 280);
+        assert_eq!(parsed["material_palette"], "red_brick");
     }
 
     #[test]
@@ -1894,10 +1952,13 @@ mod tests {
         let mut server = server();
         let styles = structured(&mut server, "list_styles", json!({}));
         let styles = styles["styles"].as_array().unwrap();
-        assert_eq!(styles.len(), 1);
-        assert_eq!(styles[0]["id"], "edwardian_welsh");
-        assert_eq!(styles[0]["course_height_mm"], 450);
-        assert!(styles[0]["source_notes"].as_array().unwrap().len() >= 4);
+        assert_eq!(styles.len(), 2);
+        assert_eq!(styles[0]["id"], "baltic_brick");
+        assert_eq!(styles[0]["course_height_mm"], 280);
+        assert_eq!(styles[0]["material_palette"], "red_brick");
+        assert_eq!(styles[1]["id"], "edwardian_welsh");
+        assert_eq!(styles[1]["course_height_mm"], 450);
+        assert!(styles[1]["source_notes"].as_array().unwrap().len() >= 4);
 
         let style = structured(&mut server, "get_style", json!({ "id": "edwardian_welsh" }));
         assert_eq!(style["style"]["id"], "edwardian_welsh");
@@ -2018,6 +2079,158 @@ mod tests {
             .unwrap();
         assert_eq!(wall["height_mm"], 7_000);
         assert_eq!(wall["thickness_mm"], 2_000);
+    }
+
+    #[test]
+    fn m2_element_summaries_cover_keeps_and_ranges() {
+        let mut server = m2_server();
+        let castle = structured(&mut server, "get_castle", json!({}));
+        let elements = castle["elements"].as_array().unwrap();
+        let kinds: Vec<&str> = elements
+            .iter()
+            .map(|element| element["kind"].as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"keep"), "kinds: {kinds:?}");
+        assert!(kinds.contains(&"range"), "kinds: {kinds:?}");
+
+        let keep = elements
+            .iter()
+            .find(|element| element["kind"] == "keep")
+            .unwrap();
+        assert_eq!(keep["name"], "High keep");
+        assert_eq!(keep["height_mm"], 22_000);
+        assert_eq!(keep["length_mm"], 14_000);
+        assert_eq!(keep["depth_mm"], 12_000);
+        assert_eq!(keep["thickness_mm"], 2_600);
+
+        let ranges: Vec<_> = elements
+            .iter()
+            .filter(|element| element["kind"] == "range")
+            .collect();
+        assert_eq!(ranges.len(), 3);
+        let hall = ranges
+            .iter()
+            .find(|range| range["name"] == "Great hall")
+            .unwrap();
+        assert_eq!(hall["height_mm"], 7_500);
+        assert_eq!(hall["length_mm"], 18_000);
+        assert_eq!(hall["depth_mm"], 8_500);
+        assert_eq!(hall["orientation_deg"], 0);
+    }
+
+    #[test]
+    fn create_keep_and_range_round_trip() {
+        let mut server = McpServer::new(true);
+        let applied = structured(
+            &mut server,
+            "apply_operations",
+            json!({
+                "operations": [
+                    {
+                        "op": "create_keep",
+                        "ref_id": "keep",
+                        "name": "Test keep",
+                        "centre_mm": [0, 0],
+                        "width_mm": 12_000,
+                        "depth_mm": 10_000,
+                        "height_mm": 18_000,
+                        "wall_thickness_mm": 2_200
+                    },
+                    {
+                        "op": "create_range",
+                        "ref_id": "hall",
+                        "name": "Test hall",
+                        "kind": "hall",
+                        "centre_mm": [0, 12_000],
+                        "length_mm": 16_000,
+                        "width_mm": 8_000,
+                        "wall_height_mm": 7_000,
+                        "roof_pitch_deg": 40
+                    },
+                    {
+                        "op": "create_range",
+                        "ref_id": "chapel",
+                        "name": "Test chapel",
+                        "kind": "chapel",
+                        "centre_mm": [12_000, 0],
+                        "orientation_deg": 90
+                    }
+                ]
+            }),
+        );
+        assert_eq!(applied["applied_count"], 3);
+        assert_eq!(applied["created_ids"]["keep"], 1);
+        assert_eq!(applied["created_ids"]["hall"], 2);
+        assert_eq!(applied["created_ids"]["chapel"], 3);
+
+        let castle = structured(&mut server, "get_castle", json!({}));
+        let kinds: Vec<&str> = castle["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|element| element["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["keep", "range", "range"]);
+
+        let keep = &castle["elements"][0];
+        assert_eq!(keep["name"], "Test keep");
+        assert_eq!(keep["height_mm"], 18_000);
+        assert_eq!(keep["length_mm"], 12_000);
+        assert_eq!(keep["depth_mm"], 10_000);
+        assert_eq!(keep["thickness_mm"], 2_200);
+
+        // Omitted range fields fall back to the same defaults as `Range::new`.
+        let chapel = &castle["elements"][2];
+        assert_eq!(chapel["height_mm"], 7_500);
+        assert_eq!(chapel["length_mm"], 18_000);
+        assert_eq!(chapel["depth_mm"], 8_500);
+        assert_eq!(chapel["orientation_deg"], 90);
+
+        // Structural validation accepts the new elements and the historian
+        // sees the keep as a lordly residence.
+        let assessment = structured(
+            &mut server,
+            "get_assessment",
+            json!({ "style_id": "edwardian_welsh" }),
+        );
+        assert_eq!(assessment["passed"], true, "{}", assessment["findings"]);
+        assert!(assessment["historian"]["domestic_score"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn get_assessment_honours_style_id_and_runs_the_historian() {
+        let mut server = m2_server();
+        let assessment = structured(
+            &mut server,
+            "get_assessment",
+            json!({ "style_id": "baltic_brick" }),
+        );
+        assert_eq!(assessment["style_id"], "baltic_brick");
+        assert_eq!(assessment["passed"], true, "{}", assessment["findings"]);
+        let historian = &assessment["historian"];
+        assert_eq!(historian["style_id"], "baltic_brick");
+        for field in ["authenticity_score", "domestic_score", "overall_score"] {
+            let score = historian[field].as_u64().unwrap();
+            assert!(score >= 80, "{field} was {score}: {historian}");
+        }
+        let defensive = historian["defensive_score"].as_u64().unwrap();
+        assert!(
+            defensive >= 80,
+            "defensive_score was {defensive}: {historian}"
+        );
+        assert!(historian["findings"].is_array());
+
+        // No style_id keeps the M1 Edwardian default.
+        let default = structured(&mut server, "get_assessment", json!({}));
+        assert_eq!(default["style_id"], "edwardian_welsh");
+        assert_eq!(default["historian"]["style_id"], "edwardian_welsh");
+
+        let message = tool_error_message(
+            &mut server,
+            "get_assessment",
+            json!({ "style_id": "gothic" }),
+        );
+        assert!(message.contains("unknown style id"), "got {message}");
     }
 
     #[test]

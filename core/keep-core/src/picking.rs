@@ -7,7 +7,7 @@
 
 use crate::document::{CastleDocument, Element, ElementId};
 use crate::terrain::SiteTerrain;
-use libm::{round, sqrt};
+use libm::{cos, round, sin, sqrt};
 
 /// What a snapped point latched onto.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -210,6 +210,42 @@ pub fn snap_point(
                 consider(gatehouse.centre_mm, SnapKind::TowerCentre, gatehouse.id);
                 for tower in gatehouse.flank_towers() {
                     consider(tower.centre_mm, SnapKind::TowerCentre, gatehouse.id);
+                }
+            }
+            Element::Keep(keep) => {
+                consider(keep.centre_mm, SnapKind::TowerCentre, keep.id);
+                let angle = keep.orientation_deg as f64 * std::f64::consts::PI / 180.0;
+                let (c, s) = (cos(angle), sin(angle));
+                let half_w = keep.width_mm.max(1) as f64 * 0.5;
+                let half_d = keep.depth_mm.max(1) as f64 * 0.5;
+                for (u, v) in [
+                    (-half_w, -half_d),
+                    (half_w, -half_d),
+                    (half_w, half_d),
+                    (-half_w, half_d),
+                ] {
+                    let x = keep.centre_mm[0] as f64 + u * c - v * s;
+                    let z = keep.centre_mm[1] as f64 + u * s + v * c;
+                    consider(
+                        [round(x) as i64, round(z) as i64],
+                        SnapKind::WallEndpoint,
+                        keep.id,
+                    );
+                }
+            }
+            Element::Range(range) => {
+                consider(range.centre_mm, SnapKind::TowerCentre, range.id);
+                let angle = range.orientation_deg as f64 * std::f64::consts::PI / 180.0;
+                let (c, s) = (cos(angle), sin(angle));
+                let half = range.length_mm.max(1) as f64 * 0.5;
+                for sign in [-1.0f64, 1.0] {
+                    let x = range.centre_mm[0] as f64 + half * sign * c;
+                    let z = range.centre_mm[1] as f64 + half * sign * s;
+                    consider(
+                        [round(x) as i64, round(z) as i64],
+                        SnapKind::WallEndpoint,
+                        range.id,
+                    );
                 }
             }
             Element::Ditch(ditch) => {

@@ -15,13 +15,15 @@
 //! * `positions` / `normals` / `uvs`;
 //! * `colors`: `[ao, tint, age, jitter_seed]`;
 //! * `custom0`: `[build_index_norm, course_index, block_width_m, block_height_m]`.
+//!   Roof blocks store a *negative* height so the shader can identify slate
+//!   strips explicitly; the absolute value is always the real height.
 
 use std::collections::BTreeMap;
 
 use crate::document::{
     BatteredWall, CastleDocument, Element, ElementKind, Gatehouse, RoundTower, TowerPlan,
 };
-use crate::masonry::{generate_blocks, Block, BlockFace};
+use crate::masonry::{generate_blocks, Block, BlockFace, BlockRole};
 use crate::terrain::SiteTerrain;
 use crate::{fnv1a_64, fnv1a_64_update, GENERATOR_VERSION};
 use libm::{atan2, cos, round, sin, sqrt, trunc};
@@ -37,6 +39,7 @@ pub struct ChunkMeshData {
     /// `[baked_ao, tint, age, jitter_seed]`
     pub colors: Vec<[f32; 4]>,
     /// `[build_index_norm, course_index, block_width_m, block_height_m]`
+    /// where a negative height marks a [`BlockRole::Roof`] block.
     pub custom0: Vec<[f32; 4]>,
     pub indices: Vec<i32>,
 }
@@ -265,6 +268,15 @@ fn build_chunk(
                 terrain,
                 occupancy,
             ),
+            Element::Keep(_) | Element::Range(_) => {
+                let mut aabb = Aabb::empty();
+                for block in element_chunk_blocks {
+                    aabb.include(&Aabb::from_block(block));
+                }
+                if !aabb.is_empty() {
+                    emit_box(&mut lod1, &aabb, &params, terrain, occupancy);
+                }
+            }
             Element::Ditch(_) => {}
         }
     }
@@ -317,6 +329,14 @@ fn emit_block(
     terrain: &SiteTerrain,
     occupancy: &Occupancy,
 ) {
+    // Explicit roof tag: the sign of `custom0[3]` says "slate", never the
+    // block's size. A thin brick or gatehouse course must stay stone.
+    let block_height = block.block_height_mm as f32 / 1000.0;
+    let encoded_height = if block.role == BlockRole::Roof {
+        -block_height
+    } else {
+        block_height
+    };
     let params = EmitParams {
         tint: block.tint,
         age: block.age,
@@ -324,7 +344,7 @@ fn emit_block(
         build_norm,
         course: block.course_index as f32,
         width: block.block_width_mm as f32 / 1000.0,
-        height: block.block_height_mm as f32 / 1000.0,
+        height: encoded_height,
     };
 
     for face in [
@@ -1187,6 +1207,46 @@ mod tests {
     use super::*;
     use crate::document::Gatehouse;
     use crate::fixtures::m0a_showcase;
+
+    #[test]
+    fn only_roof_blocks_carry_a_negative_encoded_height() {
+        let terrain = SiteTerrain::for_site("lake_island").expect("lake_island is a curated site");
+        let document = crate::fixtures::m2_baltic_document();
+        let blocks = generate_blocks(&document, &terrain);
+        let occupancy = Occupancy::build(&blocks, &terrain);
+
+        let mut data = ChunkMeshData::default();
+        let mut roof_vertices = 0usize;
+        let mut stone_vertices = 0usize;
+        for block in &blocks {
+            let start = data.custom0.len();
+            emit_block(&mut data, block, 0.5, &terrain, &occupancy);
+            for custom in &data.custom0[start..] {
+                if block.role == BlockRole::Roof {
+                    assert!(
+                        custom[3] < 0.0,
+                        "roof block {} course {} emitted height {}",
+                        block.element_id,
+                        block.course_index,
+                        custom[3]
+                    );
+                    roof_vertices += 1;
+                } else {
+                    assert!(
+                        custom[3] > 0.0,
+                        "non-roof block {:?} {} course {} emitted height {}",
+                        block.role,
+                        block.element_id,
+                        block.course_index,
+                        custom[3]
+                    );
+                    stone_vertices += 1;
+                }
+            }
+        }
+        assert!(roof_vertices > 0, "the showcase has no roof vertices");
+        assert!(stone_vertices > 0, "the showcase has no stone vertices");
+    }
 
     #[test]
     fn gatehouse_lod1_leaves_the_passage_open() {

@@ -11,6 +11,7 @@ signal speed_requested(multiplier: float)
 signal timelapse_requested()
 signal mute_toggled(muted: bool)
 signal mode_requested(mode: String)
+signal style_requested(style_id: String)
 signal site_requested(site_id: String)
 signal tool_requested(tool: String)
 signal fix_requested(fix_json: String)
@@ -36,6 +37,7 @@ var _speed_buttons: Dictionary = {}
 var _timelapse_button: Button
 var _mute_button: Button
 var _m1_button: Button
+var _m2_button: Button
 var _showcase_button: Button
 var _m0b_button: Button
 var _stress_button: Button
@@ -45,7 +47,9 @@ var _load_button: Button
 var _tool_status: Label
 var _tool_buttons: Dictionary = {}
 var _assessment_label: Label
+var _historian_label: Label
 var _assessment_findings: VBoxContainer
+var _style_buttons: Dictionary = {}
 
 var _playing := false
 var _speed_multiplier := 1.0
@@ -134,6 +138,12 @@ func _build_ui() -> void:
 	_m1_button.pressed.connect(_on_m1_pressed)
 	mode_row.add_child(_m1_button)
 
+	_m2_button = Button.new()
+	_m2_button.text = "M2 Baltic"
+	_m2_button.focus_mode = Control.FOCUS_NONE
+	_m2_button.pressed.connect(_on_m2_pressed)
+	mode_row.add_child(_m2_button)
+
 	_m0b_button = Button.new()
 	_m0b_button.text = "M0b"
 	_m0b_button.focus_mode = Control.FOCUS_NONE
@@ -156,11 +166,37 @@ func _build_ui() -> void:
 	site_row.add_theme_constant_override("separation", 6)
 	column.add_child(site_row)
 
+	var style_label := Label.new()
+	style_label.text = "Style"
+	style_label.add_theme_font_size_override("font_size", 11)
+	style_label.add_theme_color_override("font_color", Color(0.62, 0.64, 0.58))
+	site_row.add_child(style_label)
+
+	var style_group := ButtonGroup.new()
+	style_group.allow_unpress = false
+	for style_entry in [
+		["edwardian_welsh", "Welsh Stone"],
+		["baltic_brick", "Baltic Brick"],
+	]:
+		var style_button := Button.new()
+		style_button.text = style_entry[1]
+		style_button.toggle_mode = true
+		style_button.button_group = style_group
+		style_button.focus_mode = Control.FOCUS_NONE
+		style_button.pressed.connect(_on_style_pressed.bind(style_entry[0]))
+		site_row.add_child(style_button)
+		_style_buttons[style_entry[0]] = style_button
+	_style_buttons["edwardian_welsh"].set_pressed_no_signal(true)
+
+	var site_row_2 := HBoxContainer.new()
+	site_row_2.add_theme_constant_override("separation", 6)
+	column.add_child(site_row_2)
+
 	var site_label := Label.new()
 	site_label.text = "Site"
 	site_label.add_theme_font_size_override("font_size", 11)
 	site_label.add_theme_color_override("font_color", Color(0.62, 0.64, 0.58))
-	site_row.add_child(site_label)
+	site_row_2.add_child(site_label)
 
 	for site_entry in [
 		["m0a_promontory", "Promontory"],
@@ -171,7 +207,7 @@ func _build_ui() -> void:
 		site_button.text = site_entry[1]
 		site_button.focus_mode = Control.FOCUS_NONE
 		site_button.pressed.connect(_on_site_pressed.bind(site_entry[0]))
-		site_row.add_child(site_button)
+		site_row_2.add_child(site_button)
 
 	var file_row := HBoxContainer.new()
 	file_row.add_theme_constant_override("separation", 6)
@@ -272,6 +308,8 @@ func _build_ui() -> void:
 		["tower_square", "Square Tower"],
 		["gatehouse", "Gatehouse"],
 		["ditch", "Ditch"],
+		["keep", "Keep"],
+		["hall", "Hall"],
 	]
 	for entry in tool_entries:
 		var tool_id: String = entry[0]
@@ -296,6 +334,12 @@ func _build_ui() -> void:
 	_assessment_label.add_theme_font_size_override("font_size", 13)
 	_assessment_label.add_theme_color_override("font_color", Color(0.86, 0.87, 0.80))
 	column.add_child(_assessment_label)
+
+	_historian_label = Label.new()
+	_historian_label.text = "Historian: —"
+	_historian_label.add_theme_font_size_override("font_size", 12)
+	_historian_label.add_theme_color_override("font_color", Color(0.74, 0.80, 0.88))
+	column.add_child(_historian_label)
 
 	_assessment_findings = VBoxContainer.new()
 	_assessment_findings.add_theme_constant_override("separation", 3)
@@ -442,6 +486,28 @@ func set_assessment(data: Dictionary) -> void:
 		_assessment_findings.add_child(row)
 
 
+## Compact historian readout shown directly under the structural score.
+func set_historian(data: Dictionary) -> void:
+	if _historian_label == null:
+		return
+	if data.is_empty():
+		_historian_label.text = "Historian: —"
+		return
+	_historian_label.text = "Historian: %d/100 · Auth %d · Def %d · Dom %d" % [
+		int(data.get("overall_score", 0)),
+		int(data.get("authenticity_score", 0)),
+		int(data.get("defensive_score", 0)),
+		int(data.get("domestic_score", 0)),
+	]
+
+
+## Keep the style toggle in sync with the bridge's active pack.
+func set_style_selection(style_id: String) -> void:
+	if _style_buttons.has(style_id):
+		var button: Button = _style_buttons[style_id]
+		button.set_pressed_no_signal(true)
+
+
 func set_build_front(value: float) -> void:
 	var clamped := clampf(value, 0.0, 1.0)
 	_slider.set_value_no_signal(clamped)
@@ -548,6 +614,14 @@ func _on_showcase_pressed() -> void:
 
 func _on_m1_pressed() -> void:
 	mode_requested.emit("m1")
+
+
+func _on_m2_pressed() -> void:
+	mode_requested.emit("m2")
+
+
+func _on_style_pressed(style_id: String) -> void:
+	style_requested.emit(style_id)
 
 
 func _on_site_pressed(site_id: String) -> void:

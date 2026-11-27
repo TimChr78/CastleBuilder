@@ -44,6 +44,12 @@ fn kind_priority(element: &Element) -> i32 {
         Element::Gatehouse(_) => 2,
         Element::BatteredWall(_) => 1,
         Element::Ditch(_) => 0,
+        // A keep is a whole building, not a run to be mitred, but it still
+        // outranks curtains so a wall abutting it would be trimmed.
+        Element::Keep(_) => 4,
+        // Ranges are domestic blocks; their roofs clip themselves against the
+        // defensive masonry instead of trimming curtain runs.
+        Element::Range(_) => 0,
     }
 }
 
@@ -300,7 +306,7 @@ pub fn wall_course_intervals(
                     }
                 }
             }
-            Element::Ditch(_) => {}
+            Element::Ditch(_) | Element::Keep(_) | Element::Range(_) => {}
         }
     }
     allowed
@@ -776,7 +782,8 @@ fn elements_form_junction(terrain: &SiteTerrain, a: &Element, b: &Element) -> bo
             .flank_towers()
             .iter()
             .any(|flank| towers_touch(flank, tower)),
-        (Element::Ditch(_), _) | (_, Element::Ditch(_)) => false,
+        (Element::Ditch(_) | Element::Keep(_) | Element::Range(_), _)
+        | (_, Element::Ditch(_) | Element::Keep(_) | Element::Range(_)) => false,
     }
 }
 

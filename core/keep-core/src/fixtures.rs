@@ -10,7 +10,8 @@
 //!   curtain walls and 24–28 m drum towers.
 
 use crate::document::{
-    BatteredWall, CastleDocument, Ditch, Gatehouse, Opening, RoundTower, TowerPlan,
+    BatteredWall, CastleDocument, Ditch, Gatehouse, Keep, Opening, Range, RangeKind, RoundTower,
+    TowerPlan,
 };
 use crate::mesh::{build_scene, SceneData};
 use crate::terrain::SiteTerrain;
@@ -263,9 +264,121 @@ pub fn m1_edwardian_showcase() -> SceneData {
     build_scene(&document, &terrain)
 }
 
+/// The document behind the M2 Baltic brick showcase on the lake island.
+///
+/// A compact brick castle: a tall central keep, hall, chapel and kitchen
+/// ranges around a courtyard, a twin-tower gatehouse on the landward curtain,
+/// four corner drums and an approach ditch.
+pub fn m2_baltic_document() -> CastleDocument {
+    let mut doc = CastleDocument::new();
+
+    // Curtain wall ring, 32 m square, with four corner drums.
+    let half = 16_000i64;
+    let walls = [
+        (1u64, "South curtain", [-half, -half], [half, -half]),
+        (2, "East curtain", [half, -half], [half, half]),
+        (3, "North curtain", [half, half], [-half, half]),
+        (4, "West curtain", [-half, half], [-half, -half]),
+    ];
+    for (id, name, start, end) in walls {
+        let mut wall = BatteredWall::new(id, name, start, end, 8_000, 1_800);
+        wall.batter_mm = 600;
+        wall.plinth_height_mm = 700;
+        wall.plinth_projection_mm = 250;
+        wall.course_height_mm = 280;
+        doc.add_wall(wall);
+    }
+
+    // Gatehouse on the south curtain, passage running north into the bailey.
+    let mut gatehouse = Gatehouse::new(5, "South gatehouse", [0, -half], 90);
+    gatehouse.passage_width_mm = 3_200;
+    gatehouse.passage_height_mm = 4_200;
+    gatehouse.depth_mm = 8_000;
+    gatehouse.height_mm = 12_000;
+    gatehouse.tower_radius_mm = 3_000;
+    doc.add_gatehouse(gatehouse);
+
+    for (index, (x, z)) in [(-half, -half), (half, -half), (half, half), (-half, half)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut tower = RoundTower::new(
+            10 + index as u64,
+            format!("Corner drum {}", index + 1),
+            [x, z],
+            3_000,
+            11_000,
+        );
+        tower.thickness_mm = 1_200;
+        tower.batter_mm = 450;
+        tower.plinth_height_mm = 700;
+        tower.plinth_projection_mm = 250;
+        tower.course_height_mm = 280;
+        doc.add_tower(tower);
+    }
+
+    // Central keep.
+    let mut keep = Keep::new(20, "High keep", [0, -1_000], 0);
+    keep.width_mm = 14_000;
+    keep.depth_mm = 12_000;
+    keep.height_mm = 22_000;
+    keep.wall_thickness_mm = 2_600;
+    keep.batter_mm = 450;
+    keep.plinth_height_mm = 700;
+    doc.add_keep(keep);
+
+    // Domestic ranges around the courtyard.
+    let mut hall = Range::new(30, "Great hall", RangeKind::Hall, [0, 10_000], 0);
+    hall.length_mm = 18_000;
+    hall.width_mm = 8_500;
+    hall.wall_height_mm = 7_500;
+    hall.roof_pitch_deg = 42;
+    doc.add_range(hall);
+
+    let mut chapel = Range::new(31, "Chapel range", RangeKind::Chapel, [10_500, -4_000], 90);
+    chapel.length_mm = 10_000;
+    chapel.width_mm = 5_500;
+    chapel.wall_height_mm = 6_500;
+    chapel.roof_pitch_deg = 46;
+    doc.add_range(chapel);
+
+    let mut kitchen = Range::new(
+        32,
+        "Kitchen range",
+        RangeKind::Kitchen,
+        [-10_500, -4_000],
+        90,
+    );
+    kitchen.length_mm = 9_000;
+    kitchen.width_mm = 5_000;
+    kitchen.wall_height_mm = 6_000;
+    kitchen.roof_pitch_deg = 40;
+    doc.add_range(kitchen);
+
+    // Approach ditch across the landward south side.
+    doc.add_ditch(Ditch::new(
+        40,
+        "Approach ditch",
+        [-22_000, -26_000],
+        [22_000, -26_000],
+        5_000,
+        2_000,
+    ));
+
+    doc
+}
+
+/// Build the M2 Baltic brick showcase scene on the lake island.
+pub fn m2_baltic_showcase() -> SceneData {
+    let terrain = SiteTerrain::for_site("lake_island").expect("lake_island is a curated site");
+    let document = m2_baltic_document();
+    build_scene(&document, &terrain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::historian::assess_historian;
     use crate::style::StylePack;
     use crate::validate::validate_structure;
 
@@ -391,5 +504,150 @@ mod tests {
         let other = m1_edwardian_showcase();
         assert_eq!(scene.layout_hash, other.layout_hash);
         assert_eq!(scene.block_count, other.block_count);
+    }
+
+    #[test]
+    fn keep_and_range_round_trip_through_session_undo_and_save() {
+        use crate::command::{AuthorId, CommandOp};
+        use crate::document::{Keep, Range, RangeKind};
+        use crate::session::Session;
+
+        let terrain = SiteTerrain::for_site("lake_island").unwrap();
+        let author = AuthorId::player("mason").unwrap();
+        let mut session = Session::from_document("lake_island", terrain, CastleDocument::new());
+
+        let keep = Keep::new(1, "Test keep", [0, 0], 0);
+        let range = Range::new(2, "Test hall", RangeKind::Hall, [0, 12_000], 0);
+        let outcome = session
+            .apply_batch(
+                author.clone(),
+                vec![
+                    CommandOp::CreateKeep {
+                        ref_id: None,
+                        name: keep.name.clone(),
+                        centre_mm: keep.centre_mm,
+                        width_mm: Some(keep.width_mm),
+                        depth_mm: Some(keep.depth_mm),
+                        height_mm: Some(keep.height_mm),
+                        wall_thickness_mm: Some(keep.wall_thickness_mm),
+                        orientation_deg: Some(keep.orientation_deg),
+                        batter_mm: Some(keep.batter_mm),
+                        plinth_height_mm: Some(keep.plinth_height_mm),
+                    },
+                    CommandOp::CreateRange {
+                        ref_id: None,
+                        name: range.name.clone(),
+                        kind: range.kind,
+                        centre_mm: range.centre_mm,
+                        length_mm: Some(range.length_mm),
+                        width_mm: Some(range.width_mm),
+                        wall_height_mm: Some(range.wall_height_mm),
+                        roof_pitch_deg: Some(range.roof_pitch_deg),
+                        orientation_deg: Some(range.orientation_deg),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(session.document().len(), 2);
+        assert_eq!(session.document().keeps().count(), 1);
+        assert_eq!(session.document().ranges().count(), 1);
+        assert!(session.build_scene().block_count > 0);
+
+        let saved = session.to_save_json().unwrap();
+        let loaded = Session::from_save_json(&saved).unwrap();
+        assert_eq!(
+            loaded.document().document_hash(),
+            session.document().document_hash()
+        );
+        assert_eq!(loaded.document().keeps().count(), 1);
+        assert_eq!(loaded.document().ranges().count(), 1);
+
+        let hash_after_apply = session.document().document_hash();
+        let undo = session.undo_last(&author).unwrap();
+        assert_eq!(undo.target_seq, outcome.seq);
+        assert!(session.document().is_empty());
+        assert_ne!(session.document().document_hash(), hash_after_apply);
+
+        // A single keep also survives its own apply/undo cycle.
+        session
+            .apply_batch(
+                author.clone(),
+                vec![CommandOp::CreateKeep {
+                    ref_id: None,
+                    name: "Solo keep".to_string(),
+                    centre_mm: [0, 0],
+                    width_mm: None,
+                    depth_mm: None,
+                    height_mm: None,
+                    wall_thickness_mm: None,
+                    orientation_deg: None,
+                    batter_mm: None,
+                    plinth_height_mm: None,
+                }],
+            )
+            .unwrap();
+        assert_eq!(session.document().keeps().count(), 1);
+        session.undo_last(&author).unwrap();
+        assert!(session.document().is_empty());
+    }
+
+    #[test]
+    fn m2_baltic_showcase_validates_and_builds() {
+        let document = m2_baltic_document();
+        let terrain = SiteTerrain::for_site("lake_island").unwrap();
+        let style = StylePack::baltic_brick();
+        let report = validate_structure(&document, &terrain, &style);
+        assert!(
+            report.passed,
+            "M2 showcase must pass structural checks: {:?}",
+            report.findings
+        );
+        assert_eq!(report.score, 100, "findings: {:?}", report.findings);
+
+        assert_eq!(document.keeps().count(), 1);
+        assert_eq!(document.ranges().count(), 3);
+        assert_eq!(document.gatehouses().count(), 1);
+        assert_eq!(document.ditches().count(), 1);
+
+        let historian = assess_historian(&document, &terrain, &style);
+        assert!(
+            historian.overall_score >= 80,
+            "historian overall {} with findings {:?}",
+            historian.overall_score,
+            historian.findings
+        );
+
+        let scene = m2_baltic_showcase();
+        assert!(
+            scene.block_count > 8_000,
+            "scene had {} blocks",
+            scene.block_count
+        );
+        assert!(!scene.chunks.is_empty());
+        assert!(!scene.terrain_mesh.positions.is_empty());
+        for chunk in &scene.chunks {
+            for lod in [&chunk.lod0, &chunk.lod1, &chunk.lod2] {
+                assert!(!lod.is_empty());
+                for position in &lod.positions {
+                    assert!(
+                        position.iter().all(|value| value.is_finite()),
+                        "non-finite vertex in chunk {:?}",
+                        chunk.key
+                    );
+                }
+                for normal in &lod.normals {
+                    assert!(
+                        normal.iter().all(|value| value.is_finite()),
+                        "non-finite normal in chunk {:?}",
+                        chunk.key
+                    );
+                }
+            }
+        }
+
+        let other = m2_baltic_showcase();
+        assert_eq!(scene.layout_hash, other.layout_hash);
+        assert_eq!(scene.block_count, other.block_count);
+        assert_eq!(scene.triangle_count, other.triangle_count);
     }
 }

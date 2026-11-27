@@ -16,10 +16,12 @@ extends Node3D
 ##   TOWER_SQUARE — LMB click places a square tower
 ##   GATEHOUSE    — LMB click places a twin-towered gatehouse
 ##   DITCH        — LMB drag carves a linear trench preview
+##   KEEP         — LMB click places a great rectangular keep
+##   HALL         — LMB click places a pitched-roof hall range
 ##
 ## RMB and MMB are deliberately untouched so the orbit camera keeps working.
 
-enum Mode { NONE, WALL, TOWER, TOWER_D, TOWER_SQUARE, GATEHOUSE, DITCH }
+enum Mode { NONE, WALL, TOWER, TOWER_D, TOWER_SQUARE, GATEHOUSE, DITCH, KEEP, HALL }
 
 signal wall_committed(start_m: Vector2, end_m: Vector2, height_m: float, thickness_m: float)
 signal tower_committed(center_m: Vector2, radius_m: float, height_m: float)
@@ -28,6 +30,8 @@ signal tower_shaped_committed(
 )
 signal gatehouse_committed(center_m: Vector2, orientation_deg: int)
 signal ditch_committed(start_m: Vector2, end_m: Vector2, width_m: float, depth_m: float)
+signal keep_committed(center_m: Vector2, orientation_deg: int)
+signal range_committed(center_m: Vector2, kind: String, orientation_deg: int)
 signal snap_feedback()
 
 const SNAP_STEP := 1.0
@@ -39,12 +43,21 @@ const GHOST_WALL_COLOR := Color(0.96, 0.84, 0.58, 0.28)
 const GHOST_TOWER_COLOR := Color(0.92, 0.82, 0.62, 0.24)
 const GHOST_GATEHOUSE_COLOR := Color(0.90, 0.78, 0.56, 0.26)
 const GHOST_DITCH_COLOR := Color(0.62, 0.52, 0.36, 0.34)
+const GHOST_KEEP_COLOR := Color(0.88, 0.80, 0.66, 0.26)
+const GHOST_RANGE_COLOR := Color(0.96, 0.74, 0.52, 0.24)
 const RING_COLOR := Color(1.0, 0.84, 0.38, 0.90)
 
 const GATEHOUSE_HEIGHT := 14.0
 const GATEHOUSE_DEPTH := 8.0
 const GATEHOUSE_TOWER_RADIUS := 3.4
 const GATEHOUSE_PASSAGE_WIDTH := 3.2
+
+const KEEP_WIDTH := 14.0
+const KEEP_DEPTH := 12.0
+const KEEP_HEIGHT := 22.0
+const RANGE_LENGTH := 18.0
+const RANGE_WIDTH := 8.5
+const RANGE_HEIGHT := 11.0
 
 var _mode: int = Mode.NONE
 var _ground_y := 0.0
@@ -71,6 +84,8 @@ var _tower_ghost: MeshInstance3D
 var _tower_box_ghost: MeshInstance3D
 var _gatehouse_ghost: MeshInstance3D
 var _ditch_ghost: MeshInstance3D
+var _keep_ghost: MeshInstance3D
+var _range_ghost: MeshInstance3D
 var _snap_ring: MeshInstance3D
 var _readout: Label3D
 
@@ -177,6 +192,10 @@ func _unhandled_input(event: InputEvent) -> void:
 			_drag_mode = _mode
 		elif _mode == Mode.GATEHOUSE:
 			_commit_gatehouse(snapped)
+		elif _mode == Mode.KEEP:
+			_commit_keep(snapped)
+		elif _mode == Mode.HALL:
+			_commit_range(snapped, "hall")
 		else:
 			_commit_tower(snapped)
 
@@ -240,6 +259,14 @@ func _commit_tower(center: Vector3) -> void:
 
 func _commit_gatehouse(center: Vector3) -> void:
 	gatehouse_committed.emit(Vector2(center.x, center.z), _plan_orientation())
+
+
+func _commit_keep(center: Vector3) -> void:
+	keep_committed.emit(Vector2(center.x, center.z), _plan_orientation())
+
+
+func _commit_range(center: Vector3, kind: String) -> void:
+	range_committed.emit(Vector2(center.x, center.z), kind, _plan_orientation())
 
 
 ## Gatehouse/tower plan rotation, aligned with the camera's view direction so a
@@ -375,6 +402,26 @@ func _build_visuals() -> void:
 	_ditch_ghost.visible = false
 	add_child(_ditch_ghost)
 
+	var keep_box := BoxMesh.new()
+	keep_box.size = Vector3.ONE
+	_keep_ghost = MeshInstance3D.new()
+	_keep_ghost.name = "KeepGhost"
+	_keep_ghost.mesh = keep_box
+	_keep_ghost.material_override = _ghost_material(GHOST_KEEP_COLOR)
+	_keep_ghost.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_keep_ghost.visible = false
+	add_child(_keep_ghost)
+
+	var range_box := BoxMesh.new()
+	range_box.size = Vector3.ONE
+	_range_ghost = MeshInstance3D.new()
+	_range_ghost.name = "RangeGhost"
+	_range_ghost.mesh = range_box
+	_range_ghost.material_override = _ghost_material(GHOST_RANGE_COLOR)
+	_range_ghost.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_range_ghost.visible = false
+	add_child(_range_ghost)
+
 	var torus := TorusMesh.new()
 	torus.inner_radius = 0.90
 	torus.outer_radius = 1.0
@@ -422,17 +469,23 @@ func _update_preview() -> void:
 		_mode == Mode.TOWER or _mode == Mode.TOWER_D or _mode == Mode.TOWER_SQUARE
 	)
 	var gatehouse_mode := _mode == Mode.GATEHOUSE
+	var keep_mode := _mode == Mode.KEEP
+	var range_mode := _mode == Mode.HALL
 
 	var wall_active := wall_mode and _has_hover and _dragging
 	var ditch_active := ditch_mode and _has_hover and _dragging
 	var tower_active := tower_mode and _has_hover
 	var gatehouse_active := gatehouse_mode and _has_hover
+	var keep_active := keep_mode and _has_hover
+	var range_active := range_mode and _has_hover
 
 	_wall_ghost.visible = false
 	_tower_ghost.visible = false
 	_tower_box_ghost.visible = false
 	_gatehouse_ghost.visible = false
 	_ditch_ghost.visible = false
+	_keep_ghost.visible = false
+	_range_ghost.visible = false
 	_snap_ring.visible = false
 	_readout.visible = false
 
@@ -513,6 +566,32 @@ func _update_preview() -> void:
 			total_width, GATEHOUSE_HEIGHT
 		]
 		_readout.position = _hover + Vector3(0.0, GATEHOUSE_HEIGHT + 1.4, 0.0)
+		_readout.visible = true
+	elif keep_active:
+		var yaw := -deg_to_rad(float(_plan_orientation()))
+		var center := _hover + Vector3(0.0, KEEP_HEIGHT * 0.5, 0.0)
+		var basis := Basis(Vector3.UP, yaw) * Basis.from_scale(
+			Vector3(KEEP_WIDTH, KEEP_HEIGHT, KEEP_DEPTH)
+		)
+		_keep_ghost.transform = Transform3D(basis, center)
+		_keep_ghost.visible = true
+
+		_readout.text = "Keep  %.1f × %.1f m   ·   H %.1f m" % [
+			KEEP_WIDTH, KEEP_DEPTH, KEEP_HEIGHT
+		]
+		_readout.position = _hover + Vector3(0.0, KEEP_HEIGHT + 1.4, 0.0)
+		_readout.visible = true
+	elif range_active:
+		var yaw := -deg_to_rad(float(_plan_orientation()))
+		var center := _hover + Vector3(0.0, RANGE_HEIGHT * 0.5, 0.0)
+		var basis := Basis(Vector3.UP, yaw) * Basis.from_scale(
+			Vector3(RANGE_LENGTH, RANGE_HEIGHT, RANGE_WIDTH)
+		)
+		_range_ghost.transform = Transform3D(basis, center)
+		_range_ghost.visible = true
+
+		_readout.text = "Hall  %.1f × %.1f m   ·   pitched roof" % [RANGE_LENGTH, RANGE_WIDTH]
+		_readout.position = _hover + Vector3(0.0, RANGE_HEIGHT + 1.4, 0.0)
 		_readout.visible = true
 
 	# Show the snap ring on hover as well as during a drag, so the user sees the

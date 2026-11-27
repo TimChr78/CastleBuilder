@@ -16,8 +16,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::document::{
-    validate_element, BatteredWall, CastleDocument, Ditch, Element, ElementId, Gatehouse, Opening,
-    OpeningKind, RoundTower, TowerPlan,
+    validate_element, BatteredWall, CastleDocument, Ditch, Element, ElementId, Gatehouse, Keep,
+    Opening, OpeningKind, Range, RangeKind, RoundTower, TowerPlan,
 };
 
 // ---------------------------------------------------------------------------
@@ -135,6 +135,36 @@ pub const MAX_DITCH_DEPTH_MM: i64 = 10_000;
 pub const MIN_DITCH_LENGTH_MM: i64 = 500;
 /// Longest accepted ditch centreline, in millimetres.
 pub const MAX_DITCH_LENGTH_MM: i64 = 500_000;
+
+/// Narrowest accepted keep plan dimension, in millimetres.
+pub const MIN_KEEP_DIMENSION_MM: i64 = 4_000;
+/// Widest accepted keep plan dimension, in millimetres.
+pub const MAX_KEEP_DIMENSION_MM: i64 = 40_000;
+/// Lowest accepted keep, in millimetres.
+pub const MIN_KEEP_HEIGHT_MM: i64 = 4_000;
+/// Highest accepted keep, in millimetres.
+pub const MAX_KEEP_HEIGHT_MM: i64 = 40_000;
+/// Thinnest accepted keep wall, in millimetres.
+pub const MIN_KEEP_WALL_THICKNESS_MM: i64 = 600;
+/// Thickest accepted keep wall, in millimetres.
+pub const MAX_KEEP_WALL_THICKNESS_MM: i64 = 4_000;
+
+/// Shortest accepted domestic range, in millimetres.
+pub const MIN_RANGE_LENGTH_MM: i64 = 4_000;
+/// Longest accepted domestic range, in millimetres.
+pub const MAX_RANGE_LENGTH_MM: i64 = 60_000;
+/// Narrowest accepted domestic range, in millimetres.
+pub const MIN_RANGE_WIDTH_MM: i64 = 3_000;
+/// Widest accepted domestic range, in millimetres.
+pub const MAX_RANGE_WIDTH_MM: i64 = 30_000;
+/// Lowest accepted range wall, in millimetres.
+pub const MIN_RANGE_WALL_HEIGHT_MM: i64 = 2_000;
+/// Highest accepted range wall, in millimetres.
+pub const MAX_RANGE_WALL_HEIGHT_MM: i64 = 30_000;
+/// Shallowest accepted pitched roof, in degrees.
+pub const MIN_ROOF_PITCH_DEG: i64 = 5;
+/// Steepest accepted pitched roof, in degrees.
+pub const MAX_ROOF_PITCH_DEG: i64 = 70;
 
 // ---------------------------------------------------------------------------
 // Authors
@@ -270,6 +300,45 @@ pub enum CommandOp {
         end_mm: [i64; 2],
         width_mm: i64,
         depth_mm: i64,
+    },
+    /// Create a great rectangular keep with a crenellated parapet.
+    CreateKeep {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        name: String,
+        centre_mm: [i64; 2],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        depth_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wall_thickness_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orientation_deg: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batter_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plinth_height_mm: Option<i64>,
+    },
+    /// Create a roofed domestic range (hall, chapel or kitchen).
+    CreateRange {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        name: String,
+        kind: RangeKind,
+        centre_mm: [i64; 2],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        length_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wall_height_mm: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        roof_pitch_deg: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orientation_deg: Option<i32>,
     },
     /// Modify one existing element. Only the fields that are `Some` change.
     ModifyElement {
@@ -455,6 +524,107 @@ impl CommandOp {
                         max_mm: i128::from(MAX_DITCH_LENGTH_MM),
                     });
                 }
+            }
+            Self::CreateKeep {
+                ref_id,
+                name,
+                centre_mm,
+                width_mm,
+                depth_mm,
+                height_mm,
+                wall_thickness_mm,
+                orientation_deg,
+                batter_mm,
+                plinth_height_mm,
+            } => {
+                *name = sanitize_name(name)?;
+                validate_optional_ref_id(ref_id)?;
+                for value in centre_mm.iter() {
+                    check_coordinate("centre_mm", *value)?;
+                }
+                let width = width_mm.unwrap_or(14_000);
+                check_dimension(
+                    "width_mm",
+                    width,
+                    MIN_KEEP_DIMENSION_MM,
+                    MAX_KEEP_DIMENSION_MM,
+                )?;
+                let depth = depth_mm.unwrap_or(12_000);
+                check_dimension(
+                    "depth_mm",
+                    depth,
+                    MIN_KEEP_DIMENSION_MM,
+                    MAX_KEEP_DIMENSION_MM,
+                )?;
+                let height = height_mm.unwrap_or(20_000);
+                check_dimension("height_mm", height, MIN_KEEP_HEIGHT_MM, MAX_KEEP_HEIGHT_MM)?;
+                let max_thickness = width.min(depth) / 2 - 500;
+                let thickness = wall_thickness_mm.unwrap_or(2_600);
+                check_dimension(
+                    "wall_thickness_mm",
+                    thickness,
+                    MIN_KEEP_WALL_THICKNESS_MM,
+                    MAX_KEEP_WALL_THICKNESS_MM.min(max_thickness),
+                )?;
+                let orientation = orientation_deg.unwrap_or(0);
+                check_dimension(
+                    "orientation_deg",
+                    i64::from(orientation),
+                    MIN_ORIENTATION_DEG,
+                    MAX_ORIENTATION_DEG,
+                )?;
+                if let Some(batter_mm) = batter_mm {
+                    check_dimension("batter_mm", *batter_mm, 0, MAX_BATTER_MM)?;
+                }
+                let plinth = plinth_height_mm.unwrap_or(700);
+                check_dimension("plinth_height_mm", plinth, 0, height.saturating_sub(1))?;
+            }
+            Self::CreateRange {
+                ref_id,
+                name,
+                centre_mm,
+                length_mm,
+                width_mm,
+                wall_height_mm,
+                roof_pitch_deg,
+                orientation_deg,
+                ..
+            } => {
+                *name = sanitize_name(name)?;
+                validate_optional_ref_id(ref_id)?;
+                for value in centre_mm.iter() {
+                    check_coordinate("centre_mm", *value)?;
+                }
+                check_dimension(
+                    "length_mm",
+                    length_mm.unwrap_or(18_000),
+                    MIN_RANGE_LENGTH_MM,
+                    MAX_RANGE_LENGTH_MM,
+                )?;
+                check_dimension(
+                    "width_mm",
+                    width_mm.unwrap_or(8_500),
+                    MIN_RANGE_WIDTH_MM,
+                    MAX_RANGE_WIDTH_MM,
+                )?;
+                check_dimension(
+                    "wall_height_mm",
+                    wall_height_mm.unwrap_or(7_500),
+                    MIN_RANGE_WALL_HEIGHT_MM,
+                    MAX_RANGE_WALL_HEIGHT_MM,
+                )?;
+                check_dimension(
+                    "roof_pitch_deg",
+                    i64::from(roof_pitch_deg.unwrap_or(42)),
+                    MIN_ROOF_PITCH_DEG,
+                    MAX_ROOF_PITCH_DEG,
+                )?;
+                check_dimension(
+                    "orientation_deg",
+                    i64::from(orientation_deg.unwrap_or(0)),
+                    MIN_ORIENTATION_DEG,
+                    MAX_ORIENTATION_DEG,
+                )?;
             }
             Self::ModifyElement {
                 height_mm,
@@ -1004,6 +1174,8 @@ pub(crate) fn execute_batch(
     let mut created_towers = 0usize;
     let mut created_gatehouses = 0usize;
     let mut created_ditches = 0usize;
+    let mut created_keeps = 0usize;
+    let mut created_ranges = 0usize;
     let mut created_openings = 0usize;
     let mut modified = 0usize;
     let mut deleted = 0usize;
@@ -1123,6 +1295,92 @@ pub(crate) fn execute_batch(
                     .ok_or(CommandError::IdOverflow)?;
                 created_ditches += 1;
             }
+            CommandOp::CreateKeep {
+                ref_id,
+                name,
+                centre_mm,
+                width_mm,
+                depth_mm,
+                height_mm,
+                wall_thickness_mm,
+                orientation_deg,
+                batter_mm,
+                plinth_height_mm,
+            } => {
+                let mut keep = Keep::new(
+                    next_element_id,
+                    name,
+                    centre_mm,
+                    orientation_deg.unwrap_or(0),
+                );
+                if let Some(width_mm) = width_mm {
+                    keep.width_mm = width_mm;
+                }
+                if let Some(depth_mm) = depth_mm {
+                    keep.depth_mm = depth_mm;
+                }
+                if let Some(height_mm) = height_mm {
+                    keep.height_mm = height_mm;
+                }
+                if let Some(wall_thickness_mm) = wall_thickness_mm {
+                    keep.wall_thickness_mm = wall_thickness_mm;
+                }
+                if let Some(batter_mm) = batter_mm {
+                    keep.batter_mm = batter_mm;
+                }
+                if let Some(plinth_height_mm) = plinth_height_mm {
+                    keep.plinth_height_mm = plinth_height_mm;
+                }
+                let id = keep.id;
+                inverse.created_elements.push(Element::Keep(keep.clone()));
+                document.add_keep(keep);
+                register_ref(&mut created_ids, ref_id, id)?;
+                touched.insert(id);
+                next_element_id = next_element_id
+                    .checked_add(1)
+                    .ok_or(CommandError::IdOverflow)?;
+                created_keeps += 1;
+            }
+            CommandOp::CreateRange {
+                ref_id,
+                name,
+                kind,
+                centre_mm,
+                length_mm,
+                width_mm,
+                wall_height_mm,
+                roof_pitch_deg,
+                orientation_deg,
+            } => {
+                let mut range = Range::new(
+                    next_element_id,
+                    name,
+                    kind,
+                    centre_mm,
+                    orientation_deg.unwrap_or(0),
+                );
+                if let Some(length_mm) = length_mm {
+                    range.length_mm = length_mm;
+                }
+                if let Some(width_mm) = width_mm {
+                    range.width_mm = width_mm;
+                }
+                if let Some(wall_height_mm) = wall_height_mm {
+                    range.wall_height_mm = wall_height_mm;
+                }
+                if let Some(roof_pitch_deg) = roof_pitch_deg {
+                    range.roof_pitch_deg = roof_pitch_deg;
+                }
+                let id = range.id;
+                inverse.created_elements.push(Element::Range(range.clone()));
+                document.add_range(range);
+                register_ref(&mut created_ids, ref_id, id)?;
+                touched.insert(id);
+                next_element_id = next_element_id
+                    .checked_add(1)
+                    .ok_or(CommandError::IdOverflow)?;
+                created_ranges += 1;
+            }
             CommandOp::ModifyElement {
                 id,
                 height_mm,
@@ -1143,6 +1401,8 @@ pub(crate) fn execute_batch(
                         Element::RoundTower(_) => "tower",
                         Element::Gatehouse(_) => "gatehouse",
                         Element::Ditch(_) => "ditch",
+                        Element::Keep(_) => "keep",
+                        Element::Range(_) => "range",
                     },
                 };
                 match &previous {
@@ -1187,6 +1447,25 @@ pub(crate) fn execute_batch(
                         }
                         if orientation_deg.is_some() {
                             return Err(invalid("orientation_deg"));
+                        }
+                    }
+                    Element::Keep(_) => {
+                        if plan.is_some() {
+                            return Err(invalid("plan"));
+                        }
+                    }
+                    Element::Range(_) => {
+                        if thickness_mm.is_some() {
+                            return Err(invalid("thickness_mm"));
+                        }
+                        if batter_mm.is_some() {
+                            return Err(invalid("batter_mm"));
+                        }
+                        if plinth_height_mm.is_some() {
+                            return Err(invalid("plinth_height_mm"));
+                        }
+                        if plan.is_some() {
+                            return Err(invalid("plan"));
                         }
                     }
                 }
@@ -1235,6 +1514,31 @@ pub(crate) fn execute_batch(
                         }
                     }
                     Element::Ditch(_) => {}
+                    Element::Keep(keep) => {
+                        if let Some(height_mm) = height_mm {
+                            keep.height_mm = height_mm;
+                        }
+                        if let Some(thickness_mm) = thickness_mm {
+                            keep.wall_thickness_mm = thickness_mm;
+                        }
+                        if let Some(batter_mm) = batter_mm {
+                            keep.batter_mm = batter_mm;
+                        }
+                        if let Some(plinth_height_mm) = plinth_height_mm {
+                            keep.plinth_height_mm = plinth_height_mm;
+                        }
+                        if let Some(orientation_deg) = orientation_deg {
+                            keep.orientation_deg = orientation_deg;
+                        }
+                    }
+                    Element::Range(range) => {
+                        if let Some(height_mm) = height_mm {
+                            range.wall_height_mm = height_mm;
+                        }
+                        if let Some(orientation_deg) = orientation_deg {
+                            range.orientation_deg = orientation_deg;
+                        }
+                    }
                 }
                 // Re-validate the resulting element against the same bounds a
                 // create command would enforce, including cross-field invariants
@@ -1320,6 +1624,8 @@ pub(crate) fn execute_batch(
         created_towers,
         created_gatehouses,
         created_ditches,
+        created_keeps,
+        created_ranges,
         created_openings,
         modified,
         deleted,
@@ -1407,11 +1713,14 @@ fn delete_id(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn batch_summary(
     walls: usize,
     towers: usize,
     gatehouses: usize,
     ditches: usize,
+    keeps: usize,
+    ranges: usize,
     openings: usize,
     modified: usize,
     deleted: usize,
@@ -1428,6 +1737,12 @@ fn batch_summary(
     }
     if ditches > 0 {
         parts.push(format!("+{ditches} ditch{}", plural(ditches)));
+    }
+    if keeps > 0 {
+        parts.push(format!("+{keeps} keep{}", plural(keeps)));
+    }
+    if ranges > 0 {
+        parts.push(format!("+{ranges} range{}", plural(ranges)));
     }
     if openings > 0 {
         parts.push(format!("+{openings} arrow loop{}", plural(openings)));
