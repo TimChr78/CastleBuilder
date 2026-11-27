@@ -206,7 +206,6 @@ fn layout_wall(
 
         let mid_y = (y0 + y1) / 2;
         let t = ((mid_y - foundation_y) as f64 / total_height as f64).clamp(0.0, 1.0);
-        let batter_inset = round(wall.batter_mm as f64 * t) as i64;
         let is_plinth = y0 < plinth_top_y;
         let plinth = if is_plinth {
             wall.plinth_projection_mm
@@ -215,11 +214,12 @@ fn layout_wall(
         };
         let expose_top = y1 >= top_y || (is_plinth && y1 >= plinth_top_y);
 
-        let d0 = -wall.thickness_mm / 2 + batter_inset / 2 - plinth;
-        let mut d1 = wall.thickness_mm / 2 - batter_inset / 2 + plinth;
-        if d1 <= d0 {
-            d1 = d0 + 100;
-        }
+        // True sloped batter: evaluate the face at the course bed and its top
+        // separately so stacked courses share an exact horizontal plane. The
+        // plinth projection stays constant across the course and steps cleanly
+        // at the capped plinth ledge.
+        let (d0_bot, d1_bot) = wall_face_offsets(wall, foundation_y, total_height, y0, plinth);
+        let (d0_top, d1_top) = wall_face_offsets(wall, foundation_y, total_height, y1, plinth);
 
         // Priority-ordered junction trimming: wall stones may only exist in
         // these run intervals once towers and higher-priority walls have taken
@@ -230,7 +230,7 @@ fn layout_wall(
         let run_lo = -extend_start;
         let run_hi = length_mm + extend_end;
         let intervals = junction::wall_course_intervals(
-            document, wall, d0, d1, run_lo, run_hi, y0, y1, terrain,
+            document, wall, d0_bot, d1_bot, d0_top, d1_top, run_lo, run_hi, y0, y1, terrain,
         );
         let mut solid = intervals.clone();
         let mut active_cuts: Vec<usize> = Vec::new();
@@ -271,8 +271,10 @@ fn layout_wall(
                 course_index,
                 expose_top,
                 length_mm,
-                d0,
-                d1,
+                d0_bot,
+                d1_bot,
+                d0_top,
+                d1_top,
                 y0,
                 y1,
                 t,
@@ -305,8 +307,10 @@ fn layout_wall(
                     terrain,
                     cut,
                     &intervals,
-                    d0,
-                    d1,
+                    d0_bot,
+                    d1_bot,
+                    d0_top,
+                    d1_top,
                 );
             }
 
@@ -326,8 +330,10 @@ fn layout_wall(
                     expose_top,
                     start,
                     end,
-                    d0,
-                    d1,
+                    d0_bot,
+                    d1_bot,
+                    d0_top,
+                    d1_top,
                     y0,
                     y1,
                     t,
@@ -340,14 +346,44 @@ fn layout_wall(
 
             // Dress the stone that terminates in a round tower so its end
             // face follows the tower's circular curve instead of a flat chord.
-            if let Some(seam) = junction::tower_seam(document, wall, d0, d1, y0, y1, terrain) {
-                dress_tower_seam(out, wall, dir, right, course_index, d0, d1, y0, y1, seam);
+            if let Some(seam) = junction::tower_seam(
+                document, wall, d0_bot, d1_bot, d0_top, d1_top, y0, y1, terrain,
+            ) {
+                dress_tower_seam(
+                    out,
+                    wall,
+                    dir,
+                    right,
+                    course_index,
+                    d0_bot,
+                    d1_bot,
+                    d0_top,
+                    d1_top,
+                    y0,
+                    y1,
+                    seam,
+                );
             }
             // ...and the stone that meets a higher-priority wall so its end
             // face lies along the incumbent's battered face instead of a flat
             // run cut that leaves a triangular daylight gap.
-            for seam in junction::wall_seams(document, wall, d0, d1, y0, y1, terrain) {
-                dress_wall_seam(out, wall, dir, right, course_index, d0, d1, y0, y1, seam);
+            for seam in junction::wall_seams(
+                document, wall, d0_bot, d1_bot, d0_top, d1_top, y0, y1, terrain,
+            ) {
+                dress_wall_seam(
+                    out,
+                    wall,
+                    dir,
+                    right,
+                    course_index,
+                    d0_bot,
+                    d1_bot,
+                    d0_top,
+                    d1_top,
+                    y0,
+                    y1,
+                    seam,
+                );
             }
         }
 
@@ -449,8 +485,9 @@ fn boundary_exposed(
         .any(|&(start, end)| start == edge || end == edge)
 }
 
-/// Original whole-course layout. Kept byte-for-byte compatible so documents
-/// without junctions or openings keep their M0a layout hashes.
+/// Whole-course layout for runs that need no junction trimming or openings.
+/// Joints are still solved once per joint so neighbouring stones share an
+/// exact plane.
 #[allow(clippy::too_many_arguments)]
 fn layout_full_course(
     out: &mut Vec<Block>,
@@ -461,8 +498,10 @@ fn layout_full_course(
     course_index: i32,
     expose_top: bool,
     length_mm: i64,
-    d0: i64,
-    d1: i64,
+    d0_bot: i64,
+    d1_bot: i64,
+    d0_top: i64,
+    d1_top: i64,
     y0: i64,
     y1: i64,
     height_fraction: f64,
@@ -532,8 +571,10 @@ fn layout_full_course(
                     expose_top,
                     a_clamped,
                     length_mm,
-                    d0,
-                    d1,
+                    d0_bot,
+                    d1_bot,
+                    d0_top,
+                    d1_top,
                     y0,
                     y1,
                     height_fraction,
@@ -553,8 +594,10 @@ fn layout_full_course(
             expose_top,
             a_clamped,
             b_clamped,
-            d0,
-            d1,
+            d0_bot,
+            d1_bot,
+            d0_top,
+            d1_top,
             y0,
             y1,
             height_fraction,
@@ -577,8 +620,10 @@ fn layout_course_run(
     expose_top: bool,
     run_start: i64,
     run_end: i64,
-    d0: i64,
-    d1: i64,
+    d0_bot: i64,
+    d1_bot: i64,
+    d0_top: i64,
+    d1_top: i64,
     y0: i64,
     y1: i64,
     height_fraction: f64,
@@ -656,8 +701,10 @@ fn layout_course_run(
                     expose_top,
                     a0,
                     run_end,
-                    d0,
-                    d1,
+                    d0_bot,
+                    d1_bot,
+                    d0_top,
+                    d1_top,
                     y0,
                     y1,
                     height_fraction,
@@ -688,8 +735,10 @@ fn layout_course_run(
             expose_top,
             a0,
             a1,
-            d0,
-            d1,
+            d0_bot,
+            d1_bot,
+            d0_top,
+            d1_top,
             y0,
             y1,
             height_fraction,
@@ -714,8 +763,10 @@ fn push_interval_block(
     expose_top: bool,
     a0: i64,
     a1: i64,
-    d0: i64,
-    d1: i64,
+    d0_bot: i64,
+    d1_bot: i64,
+    d0_top: i64,
+    d1_top: i64,
     y0: i64,
     y1: i64,
     height_fraction: f64,
@@ -725,9 +776,9 @@ fn push_interval_block(
     role: BlockRole,
 ) {
     let column = a0 / 950;
-    let j_d0 = stone_jitter(element_seed, course_index, column as i32, 3);
-    let j_d1 = stone_jitter(element_seed, course_index, column as i32, 4);
-    let corners = wall_corners(wall, dir, right, a0, a1, d0 + j_d0, d1 + j_d1, y0, y1);
+    let corners = wall_corners(
+        wall, dir, right, a0, a1, d0_bot, d1_bot, d0_top, d1_top, y0, y1,
+    );
     if is_buried(&corners, terrain) {
         return;
     }
@@ -748,7 +799,7 @@ fn push_interval_block(
     );
 }
 
-/// Original whole-course block emitter, byte-for-byte compatible with M0a.
+/// Whole-course block emitter for an untrimmed run.
 #[allow(clippy::too_many_arguments)]
 fn push_wall_block(
     out: &mut Vec<Block>,
@@ -760,18 +811,20 @@ fn push_wall_block(
     expose_top: bool,
     a0: i64,
     a1: i64,
-    d0: i64,
-    d1: i64,
+    d0_bot: i64,
+    d1_bot: i64,
+    d0_top: i64,
+    d1_top: i64,
     y0: i64,
     y1: i64,
     height_fraction: f64,
     terrain: &SiteTerrain,
 ) {
     let column = a0 / 950;
-    let j_d0 = stone_jitter(element_seed, course_index, column as i32, 3);
-    let j_d1 = stone_jitter(element_seed, course_index, column as i32, 4);
 
-    let corners = wall_corners(wall, dir, right, a0, a1, d0 + j_d0, d1 + j_d1, y0, y1);
+    let corners = wall_corners(
+        wall, dir, right, a0, a1, d0_bot, d1_bot, d0_top, d1_top, y0, y1,
+    );
 
     if is_buried(&corners, terrain) {
         return;
@@ -819,8 +872,10 @@ fn emit_opening_jambs(
     terrain: &SiteTerrain,
     cut: &OpeningCut,
     intervals: &[(i64, i64)],
-    d0: i64,
-    d1: i64,
+    d0_bot: i64,
+    d1_bot: i64,
+    d0_top: i64,
+    d1_top: i64,
 ) {
     const STEPS: i64 = 4;
     let band_lo = cut.a_centre - cut.inner_half;
@@ -831,17 +886,20 @@ fn emit_opening_jambs(
     {
         return;
     }
-    let thickness = d1 - d0;
-    if thickness <= 0 {
+    let thickness_bot = d1_bot - d0_bot;
+    let thickness_top = d1_top - d0_top;
+    if thickness_bot <= 0 || thickness_top <= 0 {
         return;
     }
 
     for step in 0..STEPS {
         let s0 = step as f64 / STEPS as f64;
         let s1 = (step + 1) as f64 / STEPS as f64;
-        let d_a = d0 + round(thickness as f64 * s0) as i64;
-        let d_b = d0 + round(thickness as f64 * s1) as i64;
-        if d_b <= d_a {
+        let d_a_bot = d0_bot + round(thickness_bot as f64 * s0) as i64;
+        let d_b_bot = d0_bot + round(thickness_bot as f64 * s1) as i64;
+        let d_a_top = d0_top + round(thickness_top as f64 * s0) as i64;
+        let d_b_top = d0_top + round(thickness_top as f64 * s1) as i64;
+        if d_b_bot <= d_a_bot || d_b_top <= d_a_top {
             continue;
         }
         let half_a = cut.half_at(s0);
@@ -858,11 +916,17 @@ fn emit_opening_jambs(
         let top = expose_top;
 
         // Left jamb: run increases from the inner edge toward the void.
-        let left = [
-            (band_lo, d_a),
-            (cut.a_centre - half_a, d_a),
-            (cut.a_centre - half_b, d_b),
-            (band_lo, d_b),
+        let left_bot = [
+            (band_lo, d_a_bot),
+            (cut.a_centre - half_a, d_a_bot),
+            (cut.a_centre - half_b, d_b_bot),
+            (band_lo, d_b_bot),
+        ];
+        let left_top = [
+            (band_lo, d_a_top),
+            (cut.a_centre - half_a, d_a_top),
+            (cut.a_centre - half_b, d_b_top),
+            (band_lo, d_b_top),
         ];
         push_jamb(
             out,
@@ -875,16 +939,23 @@ fn emit_opening_jambs(
             y1,
             height_fraction,
             terrain,
-            left,
+            left_bot,
+            left_top,
             [false, top, front, back, false, true],
         );
 
         // Right jamb: mirror across the opening centreline.
-        let right_plan = [
-            (cut.a_centre + half_a, d_a),
-            (band_hi, d_a),
-            (band_hi, d_b),
-            (cut.a_centre + half_b, d_b),
+        let right_bot = [
+            (cut.a_centre + half_a, d_a_bot),
+            (band_hi, d_a_bot),
+            (band_hi, d_b_bot),
+            (cut.a_centre + half_b, d_b_bot),
+        ];
+        let right_top = [
+            (cut.a_centre + half_a, d_a_top),
+            (band_hi, d_a_top),
+            (band_hi, d_b_top),
+            (cut.a_centre + half_b, d_b_top),
         ];
         push_jamb(
             out,
@@ -897,7 +968,8 @@ fn emit_opening_jambs(
             y1,
             height_fraction,
             terrain,
-            right_plan,
+            right_bot,
+            right_top,
             [false, top, front, back, true, false],
         );
     }
@@ -915,7 +987,8 @@ fn push_jamb(
     y1: i64,
     height_fraction: f64,
     terrain: &SiteTerrain,
-    plan: [(i64, i64); 4],
+    plan_bot: [(i64, i64); 4],
+    plan_top: [(i64, i64); 4],
     expose: [bool; 6],
 ) {
     let point = |a: i64, d: i64, y: i64| -> [i64; 3] {
@@ -924,22 +997,22 @@ fn push_jamb(
         [round(x) as i64, y, round(z) as i64]
     };
     let corners = [
-        point(plan[0].0, plan[0].1, y0),
-        point(plan[1].0, plan[1].1, y0),
-        point(plan[2].0, plan[2].1, y0),
-        point(plan[3].0, plan[3].1, y0),
-        point(plan[0].0, plan[0].1, y1),
-        point(plan[1].0, plan[1].1, y1),
-        point(plan[2].0, plan[2].1, y1),
-        point(plan[3].0, plan[3].1, y1),
+        point(plan_bot[0].0, plan_bot[0].1, y0),
+        point(plan_bot[1].0, plan_bot[1].1, y0),
+        point(plan_bot[2].0, plan_bot[2].1, y0),
+        point(plan_bot[3].0, plan_bot[3].1, y0),
+        point(plan_top[0].0, plan_top[0].1, y1),
+        point(plan_top[1].0, plan_top[1].1, y1),
+        point(plan_top[2].0, plan_top[2].1, y1),
+        point(plan_top[3].0, plan_top[3].1, y1),
     ];
     if is_buried(&corners, terrain) {
         return;
     }
-    let da = (plan[1].0 - plan[0].0) as f64;
-    let dd = (plan[1].1 - plan[0].1) as f64;
+    let da = (plan_bot[1].0 - plan_bot[0].0) as f64;
+    let dd = (plan_bot[1].1 - plan_bot[0].1) as f64;
     let width = round(sqrt(da * da + dd * dd)) as i64;
-    let run_pos = plan[0].0.min(plan[3].0);
+    let run_pos = plan_bot[0].0.min(plan_bot[3].0);
     push_block(
         out,
         wall.id,
@@ -1014,8 +1087,10 @@ fn dress_tower_seam(
     dir: [f64; 2],
     right: [f64; 2],
     course_index: i32,
-    d0: i64,
-    d1: i64,
+    d0_bot: i64,
+    d1_bot: i64,
+    d0_top: i64,
+    d1_top: i64,
     y0: i64,
     y1: i64,
     seam: junction::TowerSeam,
@@ -1026,10 +1101,10 @@ fn dress_tower_seam(
         [round(x) as i64, y, round(z) as i64]
     };
     let corners = [
-        point(seam.corners[0], d0, y0),
-        point(seam.corners[1], d1, y0),
-        point(seam.corners[2], d0, y1),
-        point(seam.corners[3], d1, y1),
+        point(seam.corners[0], d0_bot, y0),
+        point(seam.corners[1], d1_bot, y0),
+        point(seam.corners[2], d0_top, y1),
+        point(seam.corners[3], d1_top, y1),
     ];
     let target = out.iter_mut().rev().find(|block| {
         if block.element_id != wall.id || block.course_index != course_index {
@@ -1072,8 +1147,10 @@ fn dress_wall_seam(
     dir: [f64; 2],
     right: [f64; 2],
     course_index: i32,
-    d0: i64,
-    d1: i64,
+    d0_bot: i64,
+    d1_bot: i64,
+    d0_top: i64,
+    d1_top: i64,
     y0: i64,
     y1: i64,
     seam: junction::WallSeam,
@@ -1084,10 +1161,10 @@ fn dress_wall_seam(
         [round(x) as i64, y, round(z) as i64]
     };
     let corners = [
-        point(seam.corners[0], d0, y0),
-        point(seam.corners[1], d1, y0),
-        point(seam.corners[2], d0, y1),
-        point(seam.corners[3], d1, y1),
+        point(seam.corners[0], d0_bot, y0),
+        point(seam.corners[1], d1_bot, y0),
+        point(seam.corners[2], d0_top, y1),
+        point(seam.corners[3], d1_top, y1),
     ];
     let target = if seam.forward {
         out.iter()
@@ -1137,8 +1214,10 @@ fn wall_corners(
     right: [f64; 2],
     a0: i64,
     a1: i64,
-    d0: i64,
-    d1: i64,
+    d0_bot: i64,
+    d1_bot: i64,
+    d0_top: i64,
+    d1_top: i64,
     y0: i64,
     y1: i64,
 ) -> [[i64; 3]; 8] {
@@ -1150,14 +1229,14 @@ fn wall_corners(
         [round(x) as i64, y, round(z) as i64]
     };
     [
-        point(a0, d0, y0),
-        point(a1, d0, y0),
-        point(a1, d1, y0),
-        point(a0, d1, y0),
-        point(a0, d0, y1),
-        point(a1, d0, y1),
-        point(a1, d1, y1),
-        point(a0, d1, y1),
+        point(a0, d0_bot, y0),
+        point(a1, d0_bot, y0),
+        point(a1, d1_bot, y0),
+        point(a0, d1_bot, y0),
+        point(a0, d0_top, y1),
+        point(a1, d0_top, y1),
+        point(a1, d1_top, y1),
+        point(a0, d1_top, y1),
     ]
 }
 
@@ -1193,7 +1272,6 @@ fn layout_tower(tower: &RoundTower, terrain: &SiteTerrain, out: &mut Vec<Block>)
 
         let mid_y = (y0 + y1) / 2;
         let t = ((mid_y - foundation_y) as f64 / total_height as f64).clamp(0.0, 1.0);
-        let batter_inset = round(tower.batter_mm as f64 * t) as i64;
         let is_plinth = y0 < plinth_top_y;
         let plinth = if is_plinth {
             tower.plinth_projection_mm
@@ -1201,8 +1279,13 @@ fn layout_tower(tower: &RoundTower, terrain: &SiteTerrain, out: &mut Vec<Block>)
             0
         };
         let expose_top = y1 >= top_y || (is_plinth && y1 >= plinth_top_y);
-        let r_outer = (radius - batter_inset / 2 + plinth).max(400);
-        let r_inner = (radius - thickness - batter_inset / 2 - plinth).max(80);
+        // Sloped batter: bed and top rings get their own radii so stacked
+        // courses share an exact horizontal plane. The plinth projection stays
+        // constant within the course and steps at the capped ledge.
+        let (r_out_bot, r_in_bot) =
+            tower_face_radii(tower, thickness, foundation_y, total_height, y0, plinth);
+        let (r_out_top, r_in_top) =
+            tower_face_radii(tower, thickness, foundation_y, total_height, y1, plinth);
 
         let bond = if course_index % 2 == 0 {
             0.0
@@ -1220,16 +1303,23 @@ fn layout_tower(tower: &RoundTower, terrain: &SiteTerrain, out: &mut Vec<Block>)
         for j in 0..ring_count {
             let a0 = joint_angle(j);
             let a1 = joint_angle(j + 1);
-            let jr = stone_jitter(element_seed, course_index, j, 3);
-            let ro = (r_outer + jr).max(300);
-            let ri = (r_inner + jr / 2).max(60);
 
-            let corners = tower_corners(tower.centre_mm, a0, a1, ro, ri, y0, y1);
+            let corners = tower_corners(
+                tower.centre_mm,
+                a0,
+                a1,
+                r_out_bot,
+                r_in_bot,
+                r_out_top,
+                r_in_top,
+                y0,
+                y1,
+            );
             if is_buried(&corners, terrain) {
                 continue;
             }
 
-            let width = round(ro as f64 * step) as i64;
+            let width = round(r_out_bot as f64 * step) as i64;
             out.push(Block {
                 element_id: tower.id,
                 kind: ElementKind::RoundTower,
@@ -1257,8 +1347,10 @@ fn tower_corners(
     centre_mm: [i64; 2],
     a0: f64,
     a1: f64,
-    r_outer: i64,
-    r_inner: i64,
+    r_out_bot: i64,
+    r_in_bot: i64,
+    r_out_top: i64,
+    r_in_top: i64,
     y0: i64,
     y1: i64,
 ) -> [[i64; 3]; 8] {
@@ -1270,15 +1362,51 @@ fn tower_corners(
         [round(x) as i64, y, round(z) as i64]
     };
     [
-        p(a0, r_outer, y0),
-        p(a1, r_outer, y0),
-        p(a1, r_inner, y0),
-        p(a0, r_inner, y0),
-        p(a0, r_outer, y1),
-        p(a1, r_outer, y1),
-        p(a1, r_inner, y1),
-        p(a0, r_inner, y1),
+        p(a0, r_out_bot, y0),
+        p(a1, r_out_bot, y0),
+        p(a1, r_in_bot, y0),
+        p(a0, r_in_bot, y0),
+        p(a0, r_out_top, y1),
+        p(a1, r_out_top, y1),
+        p(a1, r_in_top, y1),
+        p(a0, r_in_top, y1),
     ]
+}
+
+/// Wall face offsets `(d0, d1)` at elevation `y`, with the plinth projection
+/// held constant across a course so the ledge steps at a course boundary.
+fn wall_face_offsets(
+    wall: &BatteredWall,
+    foundation_y: i64,
+    total_height: i64,
+    y: i64,
+    plinth: i64,
+) -> (i64, i64) {
+    let t = ((y - foundation_y) as f64 / total_height as f64).clamp(0.0, 1.0);
+    let batter_inset = round(wall.batter_mm as f64 * t) as i64;
+    let d0 = -wall.thickness_mm / 2 + batter_inset / 2 - plinth;
+    let mut d1 = wall.thickness_mm / 2 - batter_inset / 2 + plinth;
+    if d1 <= d0 {
+        d1 = d0 + 100;
+    }
+    (d0, d1)
+}
+
+/// Tower shell radii `(r_out, r_in)` at elevation `y`, with the plinth
+/// projection held constant across a course.
+fn tower_face_radii(
+    tower: &RoundTower,
+    thickness: i64,
+    foundation_y: i64,
+    total_height: i64,
+    y: i64,
+    plinth: i64,
+) -> (i64, i64) {
+    let t = ((y - foundation_y) as f64 / total_height as f64).clamp(0.0, 1.0);
+    let batter_inset = round(tower.batter_mm as f64 * t) as i64;
+    let r_out = (tower.radius_mm - batter_inset / 2 + plinth).max(400);
+    let r_in = (tower.radius_mm - thickness - batter_inset / 2 - plinth).max(80);
+    (r_out, r_in)
 }
 
 fn stone_jitter(seed: u64, course: i32, column: i32, slot: i64) -> i64 {
@@ -1436,6 +1564,152 @@ mod tests {
             }
         }
         assert!(checked > 0);
+    }
+
+    /// Collect the actual bottom and top elevation of every emitted course for
+    /// one element. All stones in a course share the same bed planes.
+    fn emitted_courses(
+        blocks: &[Block],
+        element_id: u64,
+    ) -> std::collections::BTreeMap<i32, (i64, i64)> {
+        let mut courses: std::collections::BTreeMap<i32, (i64, i64)> =
+            std::collections::BTreeMap::new();
+        for block in blocks
+            .iter()
+            .filter(|b| b.element_id == element_id && b.role != BlockRole::Jamb)
+        {
+            let y0 = block.corners_mm[0][1];
+            let y1 = block.corners_mm[4][1];
+            courses
+                .entry(block.course_index)
+                .and_modify(|(low, high)| {
+                    *low = (*low).min(y0);
+                    *high = (*high).max(y1);
+                })
+                .or_insert((y0, y1));
+        }
+        courses
+    }
+
+    #[test]
+    fn stacked_courses_share_watertight_bed_joints() {
+        let terrain = SiteTerrain::m0a_promontory();
+        let doc = m0b_showcase_document();
+        let blocks = generate_blocks(&doc, &terrain);
+        let mut wall_pairs = 0;
+        let mut tower_pairs = 0;
+
+        for element in doc.elements() {
+            match element {
+                Element::BatteredWall(wall) => {
+                    let (foundation_y, plinth_top_y, top_y) =
+                        junction::wall_elevations(wall, &terrain);
+                    let total_height = (top_y - foundation_y).max(1);
+                    let courses = emitted_courses(&blocks, wall.id);
+                    for ((course, &(y0, _)), (next_course, &(next_y0, _))) in
+                        courses.iter().zip(courses.iter().skip(1))
+                    {
+                        if *next_course != *course + 1 {
+                            continue;
+                        }
+                        let plinth = y0 < plinth_top_y;
+                        let next_plinth = next_y0 < plinth_top_y;
+                        // The capped plinth ledge is a deliberate outward step.
+                        if plinth != next_plinth {
+                            continue;
+                        }
+                        let top = courses[course].1;
+                        assert_eq!(top, next_y0, "wall {} course {} bed gap", wall.id, course);
+                        let (d0_top, d1_top) = wall_face_offsets(
+                            wall,
+                            foundation_y,
+                            total_height,
+                            top,
+                            if plinth { wall.plinth_projection_mm } else { 0 },
+                        );
+                        let (d0_bot, d1_bot) = wall_face_offsets(
+                            wall,
+                            foundation_y,
+                            total_height,
+                            next_y0,
+                            if next_plinth {
+                                wall.plinth_projection_mm
+                            } else {
+                                0
+                            },
+                        );
+                        assert!(
+                            (d0_top - d0_bot).abs() <= 1 && (d1_top - d1_bot).abs() <= 1,
+                            "wall {} course {course}->{next_course}: face step {d0_top}/{d1_top} vs {d0_bot}/{d1_bot}",
+                            wall.id
+                        );
+                        wall_pairs += 1;
+                    }
+                }
+                Element::RoundTower(tower) => {
+                    let (foundation_y, plinth_top_y, top_y) =
+                        junction::tower_elevations(tower, &terrain);
+                    let total_height = (top_y - foundation_y).max(1);
+                    let radius = tower.radius_mm.max(500);
+                    let thickness = tower.thickness_mm.clamp(300, radius);
+                    let courses = emitted_courses(&blocks, tower.id);
+                    for ((course, &(y0, _)), (next_course, &(next_y0, _))) in
+                        courses.iter().zip(courses.iter().skip(1))
+                    {
+                        if *next_course != *course + 1 {
+                            continue;
+                        }
+                        let plinth = y0 < plinth_top_y;
+                        let next_plinth = next_y0 < plinth_top_y;
+                        if plinth != next_plinth {
+                            continue;
+                        }
+                        let top = courses[course].1;
+                        assert_eq!(top, next_y0, "tower {} course {} bed gap", tower.id, course);
+                        let (r_out_top, r_in_top) = tower_face_radii(
+                            tower,
+                            thickness,
+                            foundation_y,
+                            total_height,
+                            top,
+                            if plinth {
+                                tower.plinth_projection_mm
+                            } else {
+                                0
+                            },
+                        );
+                        let (r_out_bot, r_in_bot) = tower_face_radii(
+                            tower,
+                            thickness,
+                            foundation_y,
+                            total_height,
+                            next_y0,
+                            if next_plinth {
+                                tower.plinth_projection_mm
+                            } else {
+                                0
+                            },
+                        );
+                        assert!(
+                            (r_out_top - r_out_bot).abs() <= 1
+                                && (r_in_top - r_in_bot).abs() <= 1,
+                            "tower {} course {course}->{next_course}: radius step {r_out_top}/{r_in_top} vs {r_out_bot}/{r_in_bot}",
+                            tower.id
+                        );
+                        tower_pairs += 1;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            wall_pairs >= 10,
+            "only checked {wall_pairs} wall bed joints"
+        );
+        assert!(
+            tower_pairs >= 10,
+            "only checked {tower_pairs} tower bed joints"
+        );
     }
 
     #[test]

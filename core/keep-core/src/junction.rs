@@ -241,8 +241,10 @@ pub fn wall_corner_extensions(
 pub fn wall_course_intervals(
     document: &CastleDocument,
     wall: &BatteredWall,
-    d0: i64,
-    d1: i64,
+    d0_bot: i64,
+    d1_bot: i64,
+    d0_top: i64,
+    d1_top: i64,
     run_start: i64,
     run_end: i64,
     y0: i64,
@@ -263,10 +265,12 @@ pub fn wall_course_intervals(
         }
         let blocked = match element {
             Element::RoundTower(tower) => blocked_by_tower(
-                wall, dir, right, d0, d1, run_start, run_end, y0, y1, tower, terrain,
+                wall, dir, right, d0_bot, d1_bot, d0_top, d1_top, run_start, run_end, y0, y1,
+                tower, terrain,
             ),
             Element::BatteredWall(other) => blocked_by_wall(
-                document, wall, dir, right, d0, d1, run_start, run_end, y0, y1, other, terrain,
+                document, wall, dir, right, d0_bot, d1_bot, run_start, run_end, y0, y1, other,
+                terrain,
             ),
         };
         if let Some((lo, hi)) = blocked {
@@ -314,8 +318,10 @@ fn blocked_by_tower(
     wall: &BatteredWall,
     dir: [f64; 2],
     right: [f64; 2],
-    d0: i64,
-    d1: i64,
+    d0_bot: i64,
+    d1_bot: i64,
+    d0_top: i64,
+    d1_top: i64,
     run_start: i64,
     run_end: i64,
     y0: i64,
@@ -330,13 +336,11 @@ fn blocked_by_tower(
     let mut near_max = i64::MIN;
     let mut far_min = i64::MAX;
     let mut any = false;
-    for d in [d0, d1] {
-        for y in [y0, y1] {
-            if let Some((near, far)) = tower_face_roots(wall, dir, right, d, y, tower, terrain) {
-                near_max = near_max.max(near);
-                far_min = far_min.min(far);
-                any = true;
-            }
+    for (d, y) in [(d0_bot, y0), (d1_bot, y0), (d0_top, y1), (d1_top, y1)] {
+        if let Some((near, far)) = tower_face_roots(wall, dir, right, d, y, tower, terrain) {
+            near_max = near_max.max(near);
+            far_min = far_min.min(far);
+            any = true;
         }
     }
     if !any {
@@ -455,13 +459,16 @@ pub struct TowerSeam {
 }
 
 /// Resolve the trapezoidal seam profile for a wall course that terminates in a
-/// round tower. `d0`/`d1` are the course's face offsets; `y0`/`y1` its bottom
-/// and top elevations.
+/// round tower. `d*_bot`/`d*_top` are the face offsets at the course bed and
+/// top; `y0`/`y1` its bottom and top elevations.
+#[allow(clippy::too_many_arguments)]
 pub fn tower_seam(
     document: &CastleDocument,
     wall: &BatteredWall,
-    d0: i64,
-    d1: i64,
+    d0_bot: i64,
+    d1_bot: i64,
+    d0_top: i64,
+    d1_top: i64,
     y0: i64,
     y1: i64,
     terrain: &SiteTerrain,
@@ -480,7 +487,7 @@ pub fn tower_seam(
             continue;
         }
         let mut roots: [Option<(i64, i64)>; 4] = [None; 4];
-        for (index, (d, y)) in [(d0, y0), (d1, y0), (d0, y1), (d1, y1)]
+        for (index, (d, y)) in [(d0_bot, y0), (d1_bot, y0), (d0_top, y1), (d1_top, y1)]
             .into_iter()
             .enumerate()
         {
@@ -544,11 +551,14 @@ fn endpoints_touch(a: [i64; 2], b: [i64; 2]) -> bool {
 /// Resolve the mitre profiles for a lower-priority wall whose ends meet
 /// higher-priority walls. Returns at most one seam per end, choosing the
 /// highest-priority incumbent at a shared endpoint.
+#[allow(clippy::too_many_arguments)]
 pub fn wall_seams(
     document: &CastleDocument,
     wall: &BatteredWall,
-    d0: i64,
-    d1: i64,
+    d0_bot: i64,
+    d1_bot: i64,
+    d0_top: i64,
+    d1_top: i64,
     y0: i64,
     y1: i64,
     terrain: &SiteTerrain,
@@ -603,7 +613,7 @@ pub fn wall_seams(
             }
             let k = right[0] * oright[0] + right[1] * oright[1];
             let mut corners = [0i64; 4];
-            for (index, (d, y)) in [(d0, y0), (d1, y0), (d0, y1), (d1, y1)]
+            for (index, (d, y)) in [(d0_bot, y0), (d1_bot, y0), (d0_top, y1), (d1_top, y1)]
                 .into_iter()
                 .enumerate()
             {
@@ -750,7 +760,8 @@ mod tests {
 
         let d0 = -a.thickness_mm / 2;
         let d1 = a.thickness_mm / 2;
-        let intervals = wall_course_intervals(&doc, &a, d0, d1, 0, a.length_mm(), 0, 450, &terrain);
+        let intervals =
+            wall_course_intervals(&doc, &a, d0, d1, d0, d1, 0, a.length_mm(), 0, 450, &terrain);
         assert_eq!(
             intervals,
             vec![(0, a.length_mm())],
