@@ -440,6 +440,13 @@ func _setup_agent_layer() -> void:
 	)
 	_agent_panel.connect("ghost_toggled", Callable(self, "_on_ghost_toggled"))
 	_agent_panel.connect("demo_proposal_requested", Callable(self, "_on_demo_proposal_requested"))
+	_agent_panel.connect(
+		"agent_pause_toggled", Callable(self, "_on_agent_pause_toggled")
+	)
+	_agent_panel.connect("request_submitted", Callable(self, "_on_request_submitted"))
+	_agent_panel.connect(
+		"proposal_changes_requested", Callable(self, "_on_proposal_changes_requested")
+	)
 
 
 func _start_control_server() -> void:
@@ -705,6 +712,47 @@ func _on_agent_permission_changed(agent_id: String, permission: String) -> void:
 	_refresh_agent_panel()
 
 
+func _on_agent_pause_toggled(agent_id: String, paused: bool) -> void:
+	if _bridge == null:
+		return
+	var method := "pause_agent" if paused else "resume_agent"
+	if not _bridge.has_method(method):
+		return
+	var result: Variant = _bridge.call(method, agent_id)
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_hud.call("show_error", "Agent update failed: %s" % _dictionary_error(result))
+		return
+	_hud.call("clear_error")
+	_refresh_agent_panel()
+
+
+func _on_request_submitted(prompt: String) -> void:
+	if _bridge == null or not _bridge.has_method("submit_request"):
+		return
+	var result: Variant = _bridge.call("submit_request", prompt, "", 0)
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_hud.call("show_error", "Request failed: %s" % _dictionary_error(result))
+		return
+	_hud.call("clear_error")
+	_hud.call(
+		"set_tool_status",
+		"Request %s queued for an agent" % str((result as Dictionary).get("request_id", ""))
+	)
+	_refresh_agent_panel()
+
+
+func _on_proposal_changes_requested(proposal_id: String, feedback: String) -> void:
+	if _bridge == null or not _bridge.has_method("ask_for_changes"):
+		return
+	var result: Variant = _bridge.call("ask_for_changes", proposal_id, feedback)
+	if not (result is Dictionary) or not bool((result as Dictionary).get("ok", false)):
+		_hud.call("show_error", "Change request failed: %s" % _dictionary_error(result))
+		return
+	_hud.call("clear_error")
+	_hud.call("set_tool_status", "Asked for changes to %s" % proposal_id)
+	_refresh_agent_panel()
+
+
 func _on_ghost_toggled(proposal_id: String, visible: bool) -> void:
 	_ghost_visibility[proposal_id] = visible
 	_refresh_ghosts()
@@ -834,6 +882,13 @@ func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 
 	if reframe:
 		_frame_camera(data)
+
+	# Every player edit lands here, so refresh the agent panel and proposal
+	# ghosts too: stale proposal badges and Accept buttons must follow the live
+	# document immediately (neither helper calls back into _apply_scene).
+	if _agent_panel != null:
+		_refresh_agent_panel()
+		_refresh_ghosts()
 
 
 func _spawn_terrain(mesh: Variant) -> void:

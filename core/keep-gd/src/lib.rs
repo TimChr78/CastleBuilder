@@ -34,14 +34,16 @@ use keep_core::mesh::{ChunkMeshData, SceneData};
 use keep_core::picking::SnapKind;
 use keep_core::plan_render::{render_plan_svg, PlanView};
 use keep_core::proposal::{
-    AgentParticipant, AgentPermission, AgentState, Proposal, ProposalStatus,
+    ActivityEntry, AgentParticipant, AgentPermission, AgentRequest, AgentState, Proposal,
+    ProposalStatus, RequestStatus, MAX_ACTIVITY_ENTRIES,
 };
 use keep_core::session::Session;
 use keep_core::style::StylePack;
 use keep_core::terrain::{SiteTerrain, TerrainMeshData};
 use keep_core::validate::{validate_structure, Severity};
 use keep_proto::{
-    build_castle_response, build_element_list_response, RenderViewResponse, DEFAULT_PLAN_VIEW,
+    build_castle_response, build_element_list_response, ActivityFeedArgs, RenderViewResponse,
+    DEFAULT_PLAN_VIEW,
 };
 
 /// Site the M1 vertical slice starts on.
@@ -96,6 +98,7 @@ impl INode for KeepBridge {
             style_id: "edwardian_welsh".to_string(),
         };
         bridge.ensure_control_agents();
+        bridge.sync_style_id();
         bridge
     }
 }
@@ -137,6 +140,7 @@ impl KeepBridge {
             return result;
         };
         self.style_id = pack.id.clone();
+        self.sync_style_id();
         let historian = assess_historian(self.session.document(), self.session.terrain(), &pack);
         let mut result = VarDictionary::new();
         result.set("ok", true);
@@ -664,12 +668,12 @@ impl KeepBridge {
             }
 
             let before_hash = self.session.document().document_hash();
-            let before_proposals = proposal_signature(&self.session);
+            let before_panel = panel_signature(&self.session);
             let outcome = self.execute_control(&method, &params);
             if self.session.document().document_hash() != before_hash {
                 dirty = true;
             }
-            if proposal_signature(&self.session) != before_proposals {
+            if panel_signature(&self.session) != before_panel {
                 proposals_changed = true;
             }
 
@@ -794,6 +798,10 @@ impl KeepBridge {
             entry.set("structure_before", i64::from(proposal.structure_before));
             entry.set("structure_after", i64::from(proposal.structure_after));
             entry.set("structure_delta", i64::from(proposal.structure_delta));
+            entry.set("historian_before", i64::from(proposal.historian_before));
+            entry.set("historian_after", i64::from(proposal.historian_after));
+            entry.set("historian_delta", i64::from(proposal.historian_delta));
+            entry.set("stale", self.session.is_proposal_stale(&proposal.id));
             entry.set("status", &GString::from(status_key(proposal.status)));
             entry.set(
                 "reject_reason",
@@ -803,6 +811,19 @@ impl KeepBridge {
             proposals.push(&entry);
         }
         result.set("proposals", &proposals);
+
+        let mut requests: Array<VarDictionary> = Array::new();
+        for request in self.session.requests() {
+            requests.push(&request_dictionary(request));
+        }
+        result.set("requests", &requests);
+
+        // Newest first, so the panel can render the feed directly.
+        let mut activity: Array<VarDictionary> = Array::new();
+        for entry in self.session.activity_feed().iter().rev().take(25) {
+            activity.push(&activity_dictionary(entry));
+        }
+        result.set("activity", &activity);
         result
     }
 
@@ -849,6 +870,123 @@ impl KeepBridge {
                 result.set("proposal_id", &proposal_id);
                 result
             }
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Pause an agent: every proposal, command and request mutation from it is
+    /// refused until it is resumed (architecture section 7.7).
+    #[func]
+    fn pause_agent(&mut self, agent_id: GString) -> VarDictionary {
+        let id = agent_id.to_string();
+        match self.session.pause_agent(&id) {
+            Ok(()) => agent_state_dictionary(&self.session, &id),
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Resume a paused agent. An agent that still has a submitted proposal goes
+    /// back to waiting for approval, otherwise it returns to idle.
+    #[func]
+    fn resume_agent(&mut self, agent_id: GString) -> VarDictionary {
+        let id = agent_id.to_string();
+        match self.session.resume_agent(&id) {
+            Ok(()) => agent_state_dictionary(&self.session, &id),
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Disconnect and remove an agent from the session.
+    #[func]
+    fn disconnect_agent(&mut self, agent_id: GString) -> VarDictionary {
+        let id = agent_id.to_string();
+        let removed = self.session.disconnect_agent(&id);
+        let mut result = VarDictionary::new();
+        result.set("ok", removed);
+        result.set("disconnected", removed);
+        result.set("agent_id", &agent_id);
+        if !removed {
+            result.set("error", &GString::from("unknown agent"));
+        }
+        result
+    }
+
+    /// Queue a human request for the agent inbox. An empty proposal id and a
+    /// non-positive pinned element both mean "none".
+    #[func]
+    fn submit_request(
+        &mut self,
+        prompt: GString,
+        proposal_id: GString,
+        pinned_element_id: i64,
+    ) -> VarDictionary {
+        let prompt = prompt.to_string();
+        let proposal = proposal_id.to_string();
+        let proposal_ref = if proposal.trim().is_empty() {
+            None
+        } else {
+            Some(proposal.as_str())
+        };
+        let pinned = if pinned_element_id <= 0 {
+            None
+        } else {
+            Some(pinned_element_id as u64)
+        };
+        let author = self.player_author.clone();
+        match self
+            .session
+            .submit_request(author, &prompt, proposal_ref, pinned)
+        {
+            Ok(request) => request_dictionary_with_ok(&request),
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Ask a submitted proposal's author for changes by queuing a linked
+    /// request.
+    #[func]
+    fn ask_for_changes(&mut self, proposal_id: GString, feedback: GString) -> VarDictionary {
+        let proposal_id = proposal_id.to_string();
+        let feedback = feedback.to_string();
+        let author = self.player_author.clone();
+        match self
+            .session
+            .ask_for_changes(&proposal_id, author, &feedback)
+        {
+            Ok(request) => request_dictionary_with_ok(&request),
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Claim an open request as the given agent.
+    #[func]
+    fn ack_request(&mut self, request_id: GString, agent_id: GString) -> VarDictionary {
+        let request_id = request_id.to_string();
+        let agent_id = agent_id.to_string();
+        match self.session.ack_request(&request_id, &agent_id) {
+            Ok(request) => request_dictionary_with_ok(&request),
+            Err(error) => error_dictionary(&error),
+        }
+    }
+
+    /// Resolve an open or acknowledged request, optionally recording a reply.
+    #[func]
+    fn resolve_request(
+        &mut self,
+        request_id: GString,
+        agent_id: GString,
+        reply: GString,
+    ) -> VarDictionary {
+        let request_id = request_id.to_string();
+        let agent_id = agent_id.to_string();
+        let reply = reply.to_string();
+        let reply = if reply.trim().is_empty() {
+            None
+        } else {
+            Some(reply.as_str())
+        };
+        match self.session.resolve_request(&request_id, &agent_id, reply) {
+            Ok(request) => request_dictionary_with_ok(&request),
             Err(error) => error_dictionary(&error),
         }
     }
@@ -948,6 +1086,14 @@ impl KeepBridge {
 }
 
 impl KeepBridge {
+    /// Keep the session's validation/historian style pack aligned with the
+    /// style the bridge last selected. Sessions are replaced on every showcase
+    /// or site load, so the id must be re-applied after each swap.
+    fn sync_style_id(&mut self) {
+        let style_id = self.style_id.clone();
+        let _ = self.session.set_style_id(style_id);
+    }
+
     /// Register the built-in panel agents on a freshly built session. Sessions
     /// are replaced by every mode/site load, so presence is re-established here.
     fn ensure_control_agents(&mut self) {
@@ -969,6 +1115,7 @@ impl KeepBridge {
     fn replace_session(&mut self, session: Session) {
         let registered: Vec<AgentParticipant> = self.session.agents().cloned().collect();
         self.session = session;
+        self.sync_style_id();
         self.ensure_control_agents();
         for agent in registered {
             let _ = self.session.register_agent(
@@ -994,10 +1141,26 @@ impl KeepBridge {
             .map_err(|error| RpcError::new(-32_602, format!("invalid agent id: {error}")))?;
 
         let value = match method {
-            "get_castle" => serde_json::to_value(build_castle_response(&self.session))
-                .map_err(response_error)?,
-            "list_elements" => serde_json::to_value(build_element_list_response(&self.session))
-                .map_err(response_error)?,
+            "get_castle" => {
+                let value = serde_json::to_value(build_castle_response(&self.session))
+                    .map_err(response_error)?;
+                self.session.record_activity(
+                    format!("agent:{CONTROL_AGENT_ID}"),
+                    method,
+                    "read the castle state",
+                );
+                value
+            }
+            "list_elements" => {
+                let value = serde_json::to_value(build_element_list_response(&self.session))
+                    .map_err(response_error)?;
+                self.session.record_activity(
+                    format!("agent:{CONTROL_AGENT_ID}"),
+                    method,
+                    "read the element list",
+                );
+                value
+            }
             "get_assessment" => {
                 // Match the offline `keep-mcp` contract: an explicit style_id
                 // is honoured (and rejected when unknown); only an omitted
@@ -1011,7 +1174,14 @@ impl KeepBridge {
                         return Err(RpcError::new(-32_602, "'style_id' must be a string"));
                     }
                 };
-                assessment_json(self.session.document(), self.session.terrain(), &style)
+                let value =
+                    assessment_json(self.session.document(), self.session.terrain(), &style);
+                self.session.record_activity(
+                    format!("agent:{CONTROL_AGENT_ID}"),
+                    method,
+                    format!("assessed the castle as {}", style.id),
+                );
+                value
             }
             "list_styles" => json!({ "styles": StylePack::list() }),
             "get_style" => {
@@ -1045,6 +1215,11 @@ impl KeepBridge {
                 };
                 let svg =
                     render_plan_svg(self.session.document(), self.session.terrain(), plan_view);
+                self.session.record_activity(
+                    format!("agent:{CONTROL_AGENT_ID}"),
+                    method,
+                    format!("rendered the {view} plan"),
+                );
                 json!({
                     "view": view,
                     "document_hash": format!(
@@ -1087,6 +1262,47 @@ impl KeepBridge {
             "list_proposals" => {
                 let proposals: Vec<Value> = self.session.proposals().map(proposal_value).collect();
                 json!({ "count": proposals.len(), "proposals": proposals })
+            }
+            "list_requests" => {
+                let requests: Vec<Value> = self.session.requests().map(request_value).collect();
+                json!({ "count": requests.len(), "requests": requests })
+            }
+            "ack_request" => {
+                let request_id = required_string(params, "request_id")?;
+                let request = self
+                    .session
+                    .ack_request(&request_id, CONTROL_AGENT_ID)
+                    .map_err(request_error)?;
+                json!({ "request": request_value(&request) })
+            }
+            "reply_request" => {
+                let request_id = required_string(params, "request_id")?;
+                let reply = params.get("reply").and_then(Value::as_str);
+                let request = self
+                    .session
+                    .resolve_request(&request_id, CONTROL_AGENT_ID, reply)
+                    .map_err(request_error)?;
+                json!({ "request": request_value(&request) })
+            }
+            "get_activity_feed" => {
+                // Share the `keep-proto` contract with the offline sidecar: an
+                // omitted limit defaults to 50, 0 returns no entries, negatives
+                // are invalid and the feed bound caps the request at 200.
+                let args: ActivityFeedArgs = if params.is_null() {
+                    ActivityFeedArgs::default()
+                } else {
+                    serde_json::from_value(params.clone()).map_err(|error| {
+                        RpcError::new(
+                            -32_602,
+                            format!("invalid get_activity_feed params: {error}"),
+                        )
+                    })?
+                };
+                let limit = args.limit.unwrap_or(50).min(MAX_ACTIVITY_ENTRIES);
+                let feed = self.session.activity_feed();
+                let start = feed.len().saturating_sub(limit);
+                let entries: Vec<Value> = feed[start..].iter().map(activity_value).collect();
+                json!({ "count": entries.len(), "entries": entries })
             }
             "apply_operations" => {
                 // B4: direct edits require an active direct-edit participant.
@@ -1165,6 +1381,11 @@ impl KeepBridge {
                 };
                 let request_id = self.next_render_view_id;
                 self.next_render_view_id += 1;
+                self.session.record_activity(
+                    format!("agent:{CONTROL_AGENT_ID}"),
+                    method,
+                    "captured a perspective view",
+                );
                 return Ok(ControlOutcome::RenderView(request_id, view_req));
             }
             other => return Err(RpcError::new(-32_601, format!("unknown method '{other}'"))),
@@ -1230,6 +1451,10 @@ fn proposal_error(error: keep_core::proposal::ProposalError) -> RpcError {
     RpcError::new(-32_000, error.to_string())
 }
 
+fn request_error(error: keep_core::proposal::RequestError) -> RpcError {
+    RpcError::new(-32_000, error.to_string())
+}
+
 fn permission_error(error: keep_core::proposal::ProposalError) -> RpcError {
     RpcError::new(-32_003, format!("permission denied: {error}"))
 }
@@ -1246,23 +1471,145 @@ fn undo_error(error: keep_core::session::UndoError) -> RpcError {
 }
 
 fn proposal_value(proposal: &Proposal) -> Value {
-    serde_json::to_value(proposal).unwrap_or(Value::Null)
+    let mut value =
+        serde_json::to_value(proposal).unwrap_or_else(|_| Value::Object(Default::default()));
+    if let Value::Object(map) = &mut value {
+        map.insert(
+            "historian_before".to_string(),
+            json!(proposal.historian_before),
+        );
+        map.insert(
+            "historian_after".to_string(),
+            json!(proposal.historian_after),
+        );
+        map.insert(
+            "historian_delta".to_string(),
+            json!(proposal.historian_delta),
+        );
+    }
+    value
 }
 
-/// Cheap fingerprint of the proposal set, used to tell `main.gd` when the
-/// panel and ghost overlays need rebuilding.
-fn proposal_signature(session: &Session) -> Vec<(String, &'static str, usize, String)> {
-    session
-        .proposals()
-        .map(|proposal| {
-            (
-                proposal.id.clone(),
-                status_key(proposal.status),
-                proposal.ops.len(),
-                proposal.summary.clone(),
-            )
-        })
-        .collect()
+fn request_value(request: &AgentRequest) -> Value {
+    serde_json::to_value(request).unwrap_or(Value::Null)
+}
+
+fn activity_value(entry: &ActivityEntry) -> Value {
+    serde_json::to_value(entry).unwrap_or(Value::Null)
+}
+
+/// Agent request in the shape the in-game panel consumes.
+fn request_dictionary(request: &AgentRequest) -> VarDictionary {
+    let mut entry = VarDictionary::new();
+    entry.set("id", &GString::from(&request.id));
+    entry.set("author", &GString::from(&request.author.to_string()));
+    entry.set("prompt", &GString::from(&request.prompt));
+    entry.set(
+        "proposal_id",
+        &GString::from(request.proposal_id.as_deref().unwrap_or("")),
+    );
+    entry.set(
+        "pinned_element_id",
+        request.pinned_element_id.map(|id| id as i64).unwrap_or(-1),
+    );
+    entry.set("status", &GString::from(request_status_key(request.status)));
+    entry.set(
+        "claimed_by",
+        &GString::from(request.claimed_by.as_deref().unwrap_or("")),
+    );
+    entry.set(
+        "reply",
+        &GString::from(request.reply.as_deref().unwrap_or("")),
+    );
+    entry.set("created_seq", request.created_seq as i64);
+    entry
+}
+
+fn request_dictionary_with_ok(request: &AgentRequest) -> VarDictionary {
+    let mut result = request_dictionary(request);
+    result.set("ok", true);
+    result.set("request_id", &GString::from(&request.id));
+    result.set("status", &GString::from(request_status_key(request.status)));
+    result
+}
+
+fn activity_dictionary(entry: &ActivityEntry) -> VarDictionary {
+    let mut result = VarDictionary::new();
+    result.set("seq", entry.seq as i64);
+    result.set("actor", &GString::from(&entry.actor));
+    result.set("action", &GString::from(&entry.action));
+    result.set("detail", &GString::from(&entry.detail));
+    result
+}
+
+fn agent_state_dictionary(session: &Session, agent_id: &str) -> VarDictionary {
+    let state = session
+        .agent(agent_id)
+        .map(|agent| state_key(agent.state))
+        .unwrap_or("idle");
+    let mut result = VarDictionary::new();
+    result.set("ok", true);
+    result.set("agent_id", &GString::from(agent_id));
+    result.set("state", &GString::from(state));
+    result
+}
+
+fn request_status_key(status: RequestStatus) -> &'static str {
+    match status {
+        RequestStatus::Open => "open",
+        RequestStatus::Acknowledged => "acknowledged",
+        RequestStatus::Resolved => "resolved",
+    }
+}
+
+/// Fingerprint of everything the agent panel renders (proposals, requests,
+/// agent presence/permissions and the latest activity entry). `main.gd` uses a
+/// change in this signature to rebuild the panel and ghost overlays, so agent
+/// reads, acknowledgements and replies are reflected immediately.
+#[derive(PartialEq, Eq)]
+struct PanelSignature {
+    proposals: Vec<(String, &'static str, usize, String)>,
+    requests: Vec<(String, &'static str, String, String)>,
+    agents: Vec<(String, &'static str, &'static str)>,
+    latest_activity_seq: u64,
+}
+
+fn panel_signature(session: &Session) -> PanelSignature {
+    PanelSignature {
+        proposals: session
+            .proposals()
+            .map(|proposal| {
+                (
+                    proposal.id.clone(),
+                    status_key(proposal.status),
+                    proposal.ops.len(),
+                    proposal.summary.clone(),
+                )
+            })
+            .collect(),
+        requests: session
+            .requests()
+            .map(|request| {
+                (
+                    request.id.clone(),
+                    request_status_key(request.status),
+                    request.claimed_by.clone().unwrap_or_default(),
+                    request.reply.clone().unwrap_or_default(),
+                )
+            })
+            .collect(),
+        agents: session
+            .agents()
+            .map(|agent| {
+                (
+                    agent.id.clone(),
+                    permission_key(agent.permission),
+                    state_key(agent.state),
+                )
+            })
+            .collect(),
+        latest_activity_seq: session.activity_feed().last().map_or(0, |entry| entry.seq),
+    }
 }
 
 fn permission_key(permission: AgentPermission) -> &'static str {

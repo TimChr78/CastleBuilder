@@ -1,0 +1,184 @@
+{
+  "id": "minimal_keep_courtyard",
+  "title": "Minimal Baltic Keep Courtyard",
+  "description": "A compact fourteenth-century Baltic red-brick castle: a square curtain with four corner drums and a twin-tower gatehouse around a tall keep, with a great hall and kitchen range forming a small domestic courtyard, protected by an approach ditch.",
+  "style_id": "baltic_brick",
+  "site_id": "lake_island",
+  "prompt": "Design a compact Baltic brick castle for a minor castellan. Enclose a small square courtyard with a thin coursed-brick curtain, four round corner drums and a twin-tower gatehouse. Centre the bailey on a tall keep, and range a great hall and a kitchen along the courtyard, each under a pitched roof. Cut a short approach ditch before the gate. The result should be economical, defensible and clearly residential, with no structural errors.",
+  "thresholds": {
+    "min_structure_score": 100,
+    "min_historian_score": 80,
+    "max_structure_errors": 0,
+    "min_elements": 13,
+    "require_svg_plan": true
+  },
+  "reference_steps": [
+    {
+      "tool": "apply_operations",
+      "arguments": {
+        "operations": [
+          {
+            "op": "create_wall_run",
+            "ref_id": "south",
+            "name": "South curtain",
+            "start_mm": [-16000, -16000],
+            "end_mm": [16000, -16000],
+            "height_mm": 8000,
+            "thickness_mm": 1800,
+            "batter_mm": 600
+          },
+          {
+            "op": "create_wall_run",
+            "ref_id": "east",
+            "name": "East curtain",
+            "start_mm": [16000, -16000],
+            "end_mm": [16000, 16000],
+            "height_mm": 8000,
+            "thickness_mm": 1800,
+            "batter_mm": 600
+          },
+          {
+            "op": "create_wall_run",
+            "ref_id": "north",
+            "name": "North curtain",
+            "start_mm": [16000, 16000],
+            "end_mm": [-16000, 16000],
+            "height_mm": 8000,
+            "thickness_mm": 1800,
+            "batter_mm": 600
+          },
+          {
+            "op": "create_wall_run",
+            "ref_id": "west",
+            "name": "West curtain",
+            "start_mm": [-16000, 16000],
+            "end_mm": [-16000, -16000],
+            "height_mm": 8000,
+            "thickness_mm": 1800,
+            "batter_mm": 600
+          },
+          {
+            "op": "create_gatehouse",
+            "ref_id": "gate",
+            "name": "South gatehouse",
+            "centre_mm": [0, -16000],
+            "orientation_deg": 90,
+            "passage_width_mm": 3200,
+            "height_mm": 12000,
+            "tower_radius_mm": 3000
+          },
+          {
+            "op": "create_tower",
+            "ref_id": "sw",
+            "name": "South-west drum",
+            "centre_mm": [-16000, -16000],
+            "radius_mm": 3000,
+            "height_mm": 11000,
+            "batter_mm": 450
+          },
+          {
+            "op": "create_tower",
+            "ref_id": "se",
+            "name": "South-east drum",
+            "centre_mm": [16000, -16000],
+            "radius_mm": 3000,
+            "height_mm": 11000,
+            "batter_mm": 450
+          },
+          {
+            "op": "create_tower",
+            "ref_id": "ne",
+            "name": "North-east drum",
+            "centre_mm": [16000, 16000],
+            "radius_mm": 3000,
+            "height_mm": 11000,
+            "batter_mm": 450
+          },
+          {
+            "op": "create_tower",
+            "ref_id": "nw",
+            "name": "North-west drum",
+            "centre_mm": [-16000, 16000],
+            "radius_mm": 3000,
+            "height_mm": 11000,
+            "batter_mm": 450
+          },
+          {
+            "op": "create_keep",
+            "ref_id": "keep",
+            "name": "High keep",
+            "centre_mm": [0, -1000],
+            "width_mm": 14000,
+            "depth_mm": 12000,
+            "height_mm": 22000,
+            "wall_thickness_mm": 2600,
+            "batter_mm": 450,
+            "plinth_height_mm": 700
+          },
+          {
+            "op": "create_range",
+            "ref_id": "hall",
+            "name": "Great hall",
+            "kind": "hall",
+            "centre_mm": [0, 10000],
+            "length_mm": 18000,
+            "width_mm": 8500,
+            "wall_height_mm": 7500,
+            "roof_pitch_deg": 42
+          },
+          {
+            "op": "create_range",
+            "ref_id": "kitchen",
+            "name": "Kitchen range",
+            "kind": "kitchen",
+            "centre_mm": [-10500, -4000],
+            "length_mm": 9000,
+            "width_mm": 5000,
+            "wall_height_mm": 6000,
+            "roof_pitch_deg": 40,
+            "orientation_deg": 90
+          },
+          {
+            "op": "create_ditch",
+            "ref_id": "ditch",
+            "name": "Approach ditch",
+            "start_mm": [-22000, -26000],
+            "end_mm": [22000, -26000],
+            "width_mm": 5000,
+            "depth_mm": 2000
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "south",
+            "t_permille": 300,
+            "sill_height_mm": 1700
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "south",
+            "t_permille": 700,
+            "sill_height_mm": 1700
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "east",
+            "t_permille": 500,
+            "sill_height_mm": 1700
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "north",
+            "t_permille": 500,
+            "sill_height_mm": 1700
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "west",
+            "t_permille": 500,
+            "sill_height_mm": 1700
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -77,6 +77,14 @@ func _initialize() -> void:
 		quit(1)
 		return
 
+	if bridge != null:
+		_check_m2_2(bridge, failures)
+
+	if not failures.is_empty():
+		_for_each_failure(failures)
+		quit(1)
+		return
+
 	_check_feel_scripts(failures)
 
 	if not failures.is_empty():
@@ -954,6 +962,207 @@ func _require_ok(result: Variant, label: String, failures: Array[String]) -> Dic
 		failures.append("%s was rejected: %s" % [label, str(data.get("error", "unknown error"))])
 		return {}
 	return data
+
+
+## M2.2 Wave 2b: pause/resume, the request inbox, ask-for-changes, historian
+## deltas, stale proposals and the activity feed.
+func _check_m2_2(bridge: Object, failures: Array[String]) -> void:
+	for method in [
+		"pause_agent",
+		"resume_agent",
+		"disconnect_agent",
+		"submit_request",
+		"ask_for_changes",
+		"ack_request",
+		"resolve_request",
+	]:
+		if not bridge.has_method(method):
+			failures.append("KeepBridge has no %s() method." % method)
+	if not failures.is_empty():
+		return
+
+	var base_result: Variant = bridge.call("build_m1_edwardian")
+	if not (base_result is Dictionary):
+		failures.append("build_m1_edwardian(M2.2 test) did not return a Dictionary.")
+		return
+
+	# 1. Pause/resume is reflected in the panel state.
+	var paused := _require_ok(
+		bridge.call("pause_agent", "mason"), "pause_agent(mason)", failures
+	)
+	if not paused.is_empty():
+		if str(paused.get("state", "")) != "paused":
+			failures.append("pause_agent() did not report the paused state.")
+		var paused_panel: Variant = bridge.call("get_agent_panel_state")
+		if paused_panel is Dictionary:
+			var paused_state := _agent_state(paused_panel as Dictionary, "mason")
+			if paused_state.is_empty():
+				failures.append("get_agent_panel_state() lost the paused agent.")
+			elif paused_state != "paused":
+				failures.append("get_agent_panel_state() did not reflect the paused agent.")
+
+	var resumed := _require_ok(
+		bridge.call("resume_agent", "mason"), "resume_agent(mason)", failures
+	)
+	if not resumed.is_empty() and str(resumed.get("state", "")) == "paused":
+		failures.append("resume_agent() left the agent paused.")
+
+	# 2. Request inbox round trip.
+	var submitted := _require_ok(
+		bridge.call("submit_request", "Add a gatehouse on the south approach", "", 0),
+		"submit_request()",
+		failures
+	)
+	if submitted.is_empty():
+		return
+	var request_id := str(submitted.get("request_id", ""))
+	if request_id.is_empty():
+		failures.append("submit_request() returned an empty request_id.")
+	if str(submitted.get("status", "")) != "open":
+		failures.append("submit_request() did not return an open request.")
+
+	var acked := _require_ok(
+		bridge.call("ack_request", request_id, "mcp-agent"), "ack_request()", failures
+	)
+	if not acked.is_empty() and str(acked.get("status", "")) != "acknowledged":
+		failures.append("ack_request() did not mark the request acknowledged.")
+
+	var resolved := _require_ok(
+		bridge.call("resolve_request", request_id, "mcp-agent", "Gatehouse placed"),
+		"resolve_request()",
+		failures
+	)
+	if not resolved.is_empty():
+		if str(resolved.get("status", "")) != "resolved":
+			failures.append("resolve_request() did not mark the request resolved.")
+		if str(resolved.get("reply", "")) != "Gatehouse placed":
+			failures.append("resolve_request() did not record the reply.")
+
+	var panel_after_requests: Variant = bridge.call("get_agent_panel_state")
+	if not (panel_after_requests is Dictionary):
+		failures.append("get_agent_panel_state() did not return a Dictionary after requests.")
+	else:
+		var panel_data: Dictionary = panel_after_requests
+		var requests: Variant = panel_data.get("requests", null)
+		if not (requests is Array):
+			failures.append("get_agent_panel_state().requests is not an Array.")
+		elif not _has_request(requests as Array, request_id):
+			failures.append("get_agent_panel_state() did not list the submitted request.")
+		var activity: Variant = panel_data.get("activity", null)
+		if not (activity is Array) or (activity as Array).is_empty():
+			failures.append("get_agent_panel_state() returned an empty activity feed.")
+
+	# 3. Ask-for-changes is linked to a demo proposal, whose panel entry carries
+	# historian deltas and a stale flag.
+	var demo := _require_ok(
+		bridge.call("create_demo_proposal"), "create_demo_proposal(M2.2)", failures
+	)
+	if not demo.is_empty():
+		var demo_id := str(demo.get("proposal_id", ""))
+		var demo_entry := _proposal_entry(bridge, demo_id)
+		if demo_entry.is_empty():
+			failures.append("get_agent_panel_state() did not list the demo proposal.")
+		else:
+			for key in ["historian_before", "historian_after", "historian_delta"]:
+				if not demo_entry.has(key):
+					failures.append("Demo proposal is missing \"%s\"." % key)
+				elif not (demo_entry.get(key) is int or demo_entry.get(key) is float):
+					failures.append("Demo proposal \"%s\" is not numeric." % key)
+			if bool(demo_entry.get("stale", true)):
+				failures.append("A fresh demo proposal was reported as stale.")
+
+		var changes := _require_ok(
+			bridge.call("ask_for_changes", demo_id, "Please make the tower taller"),
+			"ask_for_changes()",
+			failures
+		)
+		if not changes.is_empty():
+			if str(changes.get("proposal_id", "")) != demo_id:
+				failures.append("ask_for_changes() did not link the request to the proposal.")
+			if str(changes.get("prompt", "")) != "Please make the tower taller":
+				failures.append("ask_for_changes() did not keep the feedback text.")
+
+		# Editing the castle after the proposal was begun must mark it stale.
+		var edit := _require_ok(
+			bridge.call("add_tower", Vector2(40.0, 0.0), 2.0, 8.0),
+			"add_tower(stale)",
+			failures
+		)
+		if not edit.is_empty():
+			var stale_entry := _proposal_entry(bridge, demo_id)
+			if stale_entry.is_empty():
+				failures.append("The stale test lost the demo proposal.")
+			elif not bool(stale_entry.get("stale", false)):
+				failures.append("agent_panel_state() did not mark a superseded proposal stale.")
+
+	# 4. Disconnect removes the agent.
+	var disconnected := _require_ok(
+		bridge.call("disconnect_agent", "mason"), "disconnect_agent(mason)", failures
+	)
+	if not disconnected.is_empty():
+		var after_disconnect: Variant = bridge.call("get_agent_panel_state")
+		if (
+			after_disconnect is Dictionary
+			and not _agent_state(after_disconnect as Dictionary, "mason").is_empty()
+		):
+			failures.append("disconnect_agent() did not remove the agent from the panel.")
+
+	# 5. The upgraded panel renders the full M2.2 state without errors.
+	var panel_script: Variant = load("res://scripts/agent_panel.gd")
+	if not (panel_script is GDScript):
+		failures.append("agent_panel.gd did not load as a GDScript.")
+	elif panel_after_requests is Dictionary:
+		var panel: Variant = (panel_script as GDScript).new()
+		if panel == null or not (panel is CanvasLayer):
+			failures.append("AgentPanel is not a CanvasLayer.")
+		else:
+			root.add_child(panel as CanvasLayer)
+			for signal_name in [
+				"agent_pause_toggled",
+				"request_submitted",
+				"proposal_changes_requested",
+			]:
+				if not panel.has_signal(signal_name):
+					failures.append("AgentPanel has no %s signal." % signal_name)
+			panel.call("set_server", "127.0.0.1:17731", true, "token")
+			panel.call("refresh", panel_after_requests as Dictionary)
+			if not (panel.call("get_ghost_visibility") is Dictionary):
+				failures.append("AgentPanel.get_ghost_visibility() is not a Dictionary.")
+			(panel as Node).free()
+
+	if failures.is_empty():
+		print(
+			"M2.2 agent control OK: pause/resume, request inbox, ask-for-changes, stale+activity"
+		)
+
+
+func _agent_state(state: Dictionary, agent_id: String) -> String:
+	for entry in state.get("agents", []):
+		if entry is Dictionary and str((entry as Dictionary).get("id", "")) == agent_id:
+			return str((entry as Dictionary).get("state", ""))
+	return ""
+
+
+func _has_request(requests: Array, request_id: String) -> bool:
+	for entry in requests:
+		if entry is Dictionary and str((entry as Dictionary).get("id", "")) == request_id:
+			return true
+	return false
+
+
+func _proposal_entry(bridge: Object, proposal_id: String) -> Dictionary:
+	var state: Variant = bridge.call("get_agent_panel_state")
+	if not (state is Dictionary):
+		return {}
+	var listed: Variant = (state as Dictionary).get("proposals", [])
+	if not (listed is Array):
+		return {}
+	for entry in (listed as Array):
+		if entry is Dictionary and str((entry as Dictionary).get("id", "")) == proposal_id:
+			return entry as Dictionary
+	return {}
+
+
 func _check_feel_scripts(failures: Array[String]) -> void:
 	var fx_script: Variant = load("res://scripts/construction_fx.gd")
 	if not (fx_script is GDScript):

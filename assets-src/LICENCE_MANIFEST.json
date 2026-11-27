@@ -52,6 +52,16 @@
       "ai_generated": false
     },
     {
+      "path": "styles/baltic_brick.json",
+      "kind": "data_pack",
+      "source": "Self-made Baltic Teutonic Brick Gothic (1280-1410) style pack with source notes for Malbork, Gniew, Kwidzyn and Lidzbark Warminski.",
+      "author": "TimChr78",
+      "licence": "self-made",
+      "url": "https://github.com/TimChr78/CastleBuilder",
+      "shipped": true,
+      "ai_generated": false
+    },
+    {
       "path": "sites/coastal_headland.json",
       "kind": "data_pack",
       "source": "Self-made curated site: steep coastal rock headland with a broad fortified upper shelf.",

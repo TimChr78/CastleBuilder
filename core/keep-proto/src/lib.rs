@@ -45,7 +45,8 @@ pub use keep_core::command::{
 pub use keep_core::document::RangeKind;
 pub use keep_core::historian::{HistorianFinding, HistorianReport};
 pub use keep_core::proposal::{
-    AgentParticipant, AgentPermission, AgentState, Proposal, ProposalStatus,
+    ActivityEntry, AgentParticipant, AgentPermission, AgentRequest, AgentState, Proposal,
+    ProposalStatus, RequestStatus,
 };
 pub use keep_core::style::StylePack;
 pub use keep_core::terrain::SiteInfo;
@@ -191,6 +192,51 @@ pub struct ProposalResponse {
 pub struct ListProposalsResponse {
     pub count: usize,
     pub proposals: Vec<Proposal>,
+}
+
+/// Result of the `list_requests` tool and the `keep://session/requests`
+/// resource: every player request in the session inbox.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestListResponse {
+    pub count: usize,
+    pub requests: Vec<AgentRequest>,
+}
+
+/// Arguments for the `ack_request` tool.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckRequestArgs {
+    pub request_id: String,
+}
+
+/// Arguments for the `reply_request` tool. The reply is optional; omitting it
+/// resolves the request without recording any text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyRequestArgs {
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
+}
+
+/// Result of `ack_request` and `reply_request`: the updated request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestResponse {
+    pub request: AgentRequest,
+}
+
+/// Arguments for the `get_activity_feed` tool. Omitted `limit` defaults to 50;
+/// the server caps it at 200, the same bound as the bounded activity feed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityFeedArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// Result of the `get_activity_feed` tool and the `keep://session/activity`
+/// resource: recent session activity entries in chronological order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityFeedResponse {
+    pub count: usize,
+    pub entries: Vec<ActivityEntry>,
 }
 
 /// Request for the live-only `render_view` tool. Every field is optional: an
@@ -827,19 +873,23 @@ fn get_site_schema() -> serde_json::Value {
     })
 }
 
+fn author_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "kind": { "type": "string", "enum": ["player", "agent", "system"] },
+            "id": { "type": "string" }
+        },
+        "required": ["kind", "id"]
+    })
+}
+
 fn proposal_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
             "id": { "type": "string" },
-            "author": {
-                "type": "object",
-                "properties": {
-                    "kind": { "type": "string", "enum": ["player", "agent", "system"] },
-                    "id": { "type": "string" }
-                },
-                "required": ["kind", "id"]
-            },
+            "author": author_schema(),
             "title": { "type": "string" },
             "summary": { "type": "string" },
             "base_document_hash": { "type": "string" },
@@ -856,6 +906,9 @@ fn proposal_schema() -> serde_json::Value {
             "structure_before": { "type": "integer", "minimum": 0 },
             "structure_after": { "type": "integer", "minimum": 0 },
             "structure_delta": { "type": "integer" },
+            "historian_before": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "historian_after": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "historian_delta": { "type": "integer" },
             "status": {
                 "type": "string",
                 "enum": ["draft", "submitted", "accepted", "rejected"]
@@ -865,7 +918,8 @@ fn proposal_schema() -> serde_json::Value {
         "required": [
             "id", "author", "title", "summary", "base_document_hash", "ops",
             "created_element_ids", "semantic_diff", "structure_before",
-            "structure_after", "structure_delta", "status"
+            "structure_after", "structure_delta", "historian_before",
+            "historian_after", "historian_delta", "status"
         ]
     })
 }
@@ -891,6 +945,132 @@ fn list_proposals_schema() -> serde_json::Value {
             }
         },
         "required": ["count", "proposals"]
+    })
+}
+
+fn request_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "author": author_schema(),
+            "prompt": { "type": "string" },
+            "proposal_id": { "type": ["string", "null"] },
+            "pinned_element_id": { "type": ["integer", "null"], "minimum": 0 },
+            "status": {
+                "type": "string",
+                "enum": ["open", "acknowledged", "resolved"]
+            },
+            "claimed_by": { "type": ["string", "null"] },
+            "reply": { "type": ["string", "null"] },
+            "created_seq": { "type": "integer", "minimum": 0 }
+        },
+        "required": [
+            "id", "author", "prompt", "proposal_id", "pinned_element_id",
+            "status", "claimed_by", "reply", "created_seq"
+        ]
+    })
+}
+
+fn activity_entry_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "seq": { "type": "integer", "minimum": 0 },
+            "timestamp_ms": { "type": "integer", "minimum": 0 },
+            "actor": { "type": "string" },
+            "action": { "type": "string" },
+            "detail": { "type": "string" }
+        },
+        "required": ["seq", "timestamp_ms", "actor", "action", "detail"]
+    })
+}
+
+/// JSON schema for [`RequestListResponse`].
+#[allow(non_snake_case)]
+pub fn REQUEST_LIST_SCHEMA() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "requests": {
+                "type": "array",
+                "items": request_schema()
+            }
+        },
+        "required": ["count", "requests"]
+    })
+}
+
+/// JSON schema for [`AckRequestArgs`].
+#[allow(non_snake_case)]
+pub fn ACK_REQUEST_ARGS_SCHEMA() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "request_id": { "type": "string", "minLength": 1 }
+        },
+        "required": ["request_id"],
+        "additionalProperties": false
+    })
+}
+
+/// JSON schema for [`ReplyRequestArgs`].
+#[allow(non_snake_case)]
+pub fn REPLY_REQUEST_ARGS_SCHEMA() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "request_id": { "type": "string", "minLength": 1 },
+            "reply": { "type": ["string", "null"] }
+        },
+        "required": ["request_id"],
+        "additionalProperties": false
+    })
+}
+
+/// JSON schema for [`RequestResponse`].
+#[allow(non_snake_case)]
+pub fn REQUEST_RESPONSE_SCHEMA() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "request": request_schema()
+        },
+        "required": ["request"]
+    })
+}
+
+/// JSON schema for [`ActivityFeedArgs`].
+#[allow(non_snake_case)]
+pub fn ACTIVITY_FEED_ARGS_SCHEMA() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": ["integer", "null"],
+                "minimum": 1,
+                "maximum": keep_core::proposal::MAX_ACTIVITY_ENTRIES,
+                "default": 50
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// JSON schema for [`ActivityFeedResponse`].
+#[allow(non_snake_case)]
+pub fn ACTIVITY_FEED_RESPONSE_SCHEMA() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "entries": {
+                "type": "array",
+                "items": activity_entry_schema()
+            }
+        },
+        "required": ["count", "entries"]
     })
 }
 
@@ -1344,6 +1524,58 @@ pub fn tool_definitions() -> serde_json::Value {
                 "idempotentHint": true,
                 "openWorldHint": false
             }
+        },
+        {
+            "name": "list_requests",
+            "description": "List every player request in the session inbox with status, author, optional proposal/element link and any reply. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "outputSchema": REQUEST_LIST_SCHEMA(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "ack_request",
+            "description": "Acknowledge (claim) an open player request so the human can see an agent is working on it.",
+            "inputSchema": ACK_REQUEST_ARGS_SCHEMA(),
+            "outputSchema": REQUEST_RESPONSE_SCHEMA(),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "reply_request",
+            "description": "Resolve an open or acknowledged player request, optionally recording a reply for the human.",
+            "inputSchema": REPLY_REQUEST_ARGS_SCHEMA(),
+            "outputSchema": REQUEST_RESPONSE_SCHEMA(),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "get_activity_feed",
+            "description": "Read recent session activity (requests, proposals, agents and tool use), optionally limited to the newest `limit` entries (default 50, max 200). Read-only.",
+            "inputSchema": ACTIVITY_FEED_ARGS_SCHEMA(),
+            "outputSchema": ACTIVITY_FEED_RESPONSE_SCHEMA(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
         }
     ])
 }
@@ -1723,7 +1955,11 @@ mod tests {
                 "stage_proposal_ops",
                 "submit_proposal",
                 "list_proposals",
-                "render_view"
+                "render_view",
+                "list_requests",
+                "ack_request",
+                "reply_request",
+                "get_activity_feed"
             ]
         );
         for tool in tools {
@@ -1997,6 +2233,46 @@ mod tests {
         assert_eq!(tools[14]["annotations"]["readOnlyHint"], true);
         assert_eq!(tools[14]["outputSchema"]["required"][3], "image_base64");
 
+        // M2.2 request inbox and activity feed tools.
+        assert_eq!(tools[15]["name"], "list_requests");
+        assert_eq!(tools[15]["annotations"]["readOnlyHint"], true);
+        assert_eq!(
+            tools[15]["outputSchema"]["properties"]["requests"]["items"]["properties"]["status"]
+                ["enum"],
+            json!(["open", "acknowledged", "resolved"])
+        );
+        assert_eq!(tools[16]["name"], "ack_request");
+        assert_eq!(tools[16]["annotations"]["idempotentHint"], false);
+        assert_eq!(tools[16]["inputSchema"]["required"], json!(["request_id"]));
+        assert_eq!(tools[17]["name"], "reply_request");
+        assert_eq!(
+            tools[17]["inputSchema"]["properties"]["reply"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(tools[18]["name"], "get_activity_feed");
+        assert_eq!(tools[18]["annotations"]["readOnlyHint"], true);
+        assert_eq!(
+            tools[18]["inputSchema"]["properties"]["limit"]["maximum"],
+            keep_core::proposal::MAX_ACTIVITY_ENTRIES
+        );
+        assert_eq!(
+            tools[18]["outputSchema"]["properties"]["entries"]["items"]["required"],
+            json!(["seq", "timestamp_ms", "actor", "action", "detail"])
+        );
+
+        // Proposals expose the historian before/after/delta fields.
+        assert_eq!(
+            tools[13]["outputSchema"]["properties"]["proposals"]["items"]["properties"]
+                ["historian_delta"]["type"],
+            "integer"
+        );
+        assert!(
+            tools[13]["outputSchema"]["properties"]["proposals"]["items"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("historian_before"))
+        );
+
         // Round-trip every tool definition through JSON to make sure it is
         // actually serialisable and stable.
         let text = serde_json::to_string(&tool_definitions()).unwrap();
@@ -2180,6 +2456,9 @@ mod tests {
             structure_before: 50,
             structure_after: 60,
             structure_delta: 10,
+            historian_before: 55,
+            historian_after: 65,
+            historian_delta: 10,
             status: ProposalStatus::Submitted,
             reject_reason: None,
         };
@@ -2189,6 +2468,9 @@ mod tests {
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["proposal"]["status"], "submitted");
         assert_eq!(value["proposal"]["author"]["kind"], "agent");
+        assert_eq!(value["proposal"]["historian_before"], 55);
+        assert_eq!(value["proposal"]["historian_after"], 65);
+        assert_eq!(value["proposal"]["historian_delta"], 10);
         assert_eq!(
             serde_json::from_value::<ProposalResponse>(value).unwrap(),
             response
@@ -2250,6 +2532,157 @@ mod tests {
             serde_json::from_value::<RenderViewResponse>(value).unwrap(),
             render
         );
+    }
+
+    #[test]
+    fn request_and_activity_wire_types_round_trip() {
+        let request = AgentRequest {
+            id: "req_0001".into(),
+            author: keep_core::command::AuthorId::player("alex").unwrap(),
+            prompt: "Add a gatehouse".into(),
+            proposal_id: Some("prop_0001".into()),
+            pinned_element_id: Some(7),
+            status: RequestStatus::Open,
+            claimed_by: None,
+            reply: None,
+            created_seq: 1,
+        };
+        let list = RequestListResponse {
+            count: 1,
+            requests: vec![request.clone()],
+        };
+        let value = serde_json::to_value(&list).unwrap();
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["requests"][0]["status"], "open");
+        assert_eq!(value["requests"][0]["author"]["kind"], "player");
+        assert_eq!(value["requests"][0]["pinned_element_id"], 7);
+        assert_eq!(
+            serde_json::from_value::<RequestListResponse>(value).unwrap(),
+            list
+        );
+
+        let response = RequestResponse {
+            request: request.clone(),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["request"]["id"], "req_0001");
+        assert_eq!(
+            serde_json::from_value::<RequestResponse>(value).unwrap(),
+            response
+        );
+
+        assert_eq!(
+            serde_json::from_value::<AckRequestArgs>(json!({ "request_id": "req_0001" })).unwrap(),
+            AckRequestArgs {
+                request_id: "req_0001".into()
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<ReplyRequestArgs>(json!({
+                "request_id": "req_0001",
+                "reply": "On it"
+            }))
+            .unwrap(),
+            ReplyRequestArgs {
+                request_id: "req_0001".into(),
+                reply: Some("On it".into())
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<ReplyRequestArgs>(json!({ "request_id": "req_0001" }))
+                .unwrap(),
+            ReplyRequestArgs {
+                request_id: "req_0001".into(),
+                reply: None
+            }
+        );
+
+        let entries = vec![ActivityEntry {
+            seq: 0,
+            timestamp_ms: 1_000,
+            actor: "agent:mcp-agent".into(),
+            action: "get_castle".into(),
+            detail: "elements=3".into(),
+        }];
+        let feed = ActivityFeedResponse {
+            count: entries.len(),
+            entries,
+        };
+        let value = serde_json::to_value(&feed).unwrap();
+        assert_eq!(value["entries"][0]["action"], "get_castle");
+        assert_eq!(
+            serde_json::from_value::<ActivityFeedResponse>(value).unwrap(),
+            feed
+        );
+        assert_eq!(
+            serde_json::from_value::<ActivityFeedArgs>(json!({})).unwrap(),
+            ActivityFeedArgs::default()
+        );
+        assert_eq!(
+            serde_json::from_value::<ActivityFeedArgs>(json!({ "limit": 10 }))
+                .unwrap()
+                .limit,
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn request_and_activity_schemas_describe_the_wire_types() {
+        let list = REQUEST_LIST_SCHEMA();
+        assert_eq!(list["properties"]["count"]["type"], "integer");
+        assert_eq!(
+            list["properties"]["requests"]["items"]["required"],
+            json!([
+                "id",
+                "author",
+                "prompt",
+                "proposal_id",
+                "pinned_element_id",
+                "status",
+                "claimed_by",
+                "reply",
+                "created_seq"
+            ])
+        );
+        assert_eq!(
+            list["properties"]["requests"]["items"]["properties"]["status"]["enum"],
+            json!(["open", "acknowledged", "resolved"])
+        );
+
+        assert_eq!(ACK_REQUEST_ARGS_SCHEMA()["required"], json!(["request_id"]));
+        assert_eq!(ACK_REQUEST_ARGS_SCHEMA()["additionalProperties"], false);
+        assert_eq!(
+            REPLY_REQUEST_ARGS_SCHEMA()["properties"]["reply"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(REQUEST_RESPONSE_SCHEMA()["required"], json!(["request"]));
+        assert_eq!(
+            ACTIVITY_FEED_ARGS_SCHEMA()["properties"]["limit"]["default"],
+            50
+        );
+        assert_eq!(
+            ACTIVITY_FEED_ARGS_SCHEMA()["properties"]["limit"]["maximum"],
+            keep_core::proposal::MAX_ACTIVITY_ENTRIES
+        );
+        assert_eq!(
+            ACTIVITY_FEED_RESPONSE_SCHEMA()["properties"]["entries"]["items"]["properties"]
+                ["timestamp_ms"]["type"],
+            "integer"
+        );
+
+        // Every schema must be serialisable and stable.
+        for schema in [
+            REQUEST_LIST_SCHEMA(),
+            ACK_REQUEST_ARGS_SCHEMA(),
+            REPLY_REQUEST_ARGS_SCHEMA(),
+            REQUEST_RESPONSE_SCHEMA(),
+            ACTIVITY_FEED_ARGS_SCHEMA(),
+            ACTIVITY_FEED_RESPONSE_SCHEMA(),
+        ] {
+            let text = serde_json::to_string(&schema).unwrap();
+            let reparsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(reparsed, schema);
+        }
     }
 
     #[test]

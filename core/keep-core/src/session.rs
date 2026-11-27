@@ -19,11 +19,13 @@ use crate::command::{
     CommandError, CommandOp, CommandPayload, InverseRecord, LoggedCommand,
 };
 use crate::document::{CastleDocument, Element, ElementId, Opening};
+use crate::historian::assess_historian;
 use crate::junction::junction_partners;
 use crate::mesh::{build_scene, SceneData};
 use crate::proposal::{
-    sanitize_summary, AgentParticipant, AgentPermission, AgentState, Proposal, ProposalError,
-    ProposalStatus,
+    sanitize_prompt, sanitize_summary, ActivityEntry, AgentParticipant, AgentPermission,
+    AgentRequest, AgentState, Proposal, ProposalError, ProposalStatus, RequestError, RequestStatus,
+    MAX_ACTIVITY_ENTRIES,
 };
 use crate::style::StylePack;
 use crate::terrain::SiteTerrain;
@@ -31,6 +33,9 @@ use crate::validate::validate_structure;
 
 /// Default site id used by the M0a fixtures.
 pub const DEFAULT_SITE_ID: &str = "m0a_promontory";
+
+/// Style pack used until the player picks another one.
+pub const DEFAULT_STYLE_ID: &str = "edwardian_welsh";
 
 /// Deterministic start of the session clock (2023-11-14T22:13:20Z). UUIDv7 ids
 /// only need to be unique and monotonic, not wall-clock accurate.
@@ -129,6 +134,16 @@ pub struct Session {
     pub(crate) proposals: BTreeMap<String, Proposal>,
     /// Deterministic proposal id allocator (`prop_0001`, `prop_0002`, ...).
     pub(crate) next_proposal_seq: u64,
+    /// Style pack currently guiding validation and the historian.
+    pub(crate) active_style_id: String,
+    /// Request inbox, keyed by deterministic request id.
+    pub(crate) requests: BTreeMap<String, AgentRequest>,
+    /// Deterministic request id allocator (`req_0001`, `req_0002`, ...).
+    pub(crate) next_request_seq: u64,
+    /// Bounded activity feed, oldest entries evicted first.
+    pub(crate) activity: Vec<ActivityEntry>,
+    /// Monotonic activity feed sequence.
+    pub(crate) next_activity_seq: u64,
 }
 
 impl Session {
@@ -162,11 +177,76 @@ impl Session {
             agents: BTreeMap::new(),
             proposals: BTreeMap::new(),
             next_proposal_seq: 1,
+            active_style_id: DEFAULT_STYLE_ID.to_string(),
+            requests: BTreeMap::new(),
+            next_request_seq: 1,
+            activity: Vec::new(),
+            next_activity_seq: 1,
         }
     }
 
     pub fn site_id(&self) -> &str {
         &self.site_id
+    }
+
+    // -----------------------------------------------------------------------
+    // Style selection
+    // -----------------------------------------------------------------------
+
+    /// Id of the style pack currently guiding validation and the historian.
+    pub fn style_id(&self) -> &str {
+        &self.active_style_id
+    }
+
+    /// Select the active style pack. Unknown ids are ignored and `false` is
+    /// returned, leaving the previous selection in place.
+    pub fn set_style_id(&mut self, style_id: impl Into<String>) -> bool {
+        let style_id = style_id.into();
+        if StylePack::find(&style_id).is_some() {
+            self.active_style_id = style_id;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The active style pack, falling back to the default if the id was
+    /// somehow cleared or corrupted.
+    fn active_style(&self) -> StylePack {
+        StylePack::find(&self.active_style_id).unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
+    // Activity feed
+    // -----------------------------------------------------------------------
+
+    /// Append one sanitised entry to the bounded activity feed. The session
+    /// clock is read but deliberately not advanced so command UUIDs stay tied
+    /// to command-log ticks.
+    pub fn record_activity(
+        &mut self,
+        actor: impl AsRef<str>,
+        action: impl AsRef<str>,
+        detail: impl AsRef<str>,
+    ) {
+        let entry = ActivityEntry {
+            seq: self.next_activity_seq,
+            timestamp_ms: self.clock_ms,
+            actor: ActivityEntry::sanitize_field(actor.as_ref()),
+            action: ActivityEntry::sanitize_field(action.as_ref()),
+            detail: ActivityEntry::sanitize_field(detail.as_ref()),
+        };
+        self.next_activity_seq += 1;
+        self.activity.push(entry);
+        if self.activity.len() > MAX_ACTIVITY_ENTRIES {
+            let excess = self.activity.len() - MAX_ACTIVITY_ENTRIES;
+            self.activity.drain(0..excess);
+        }
+    }
+
+    /// The activity feed, newest last.
+    pub fn activity_feed(&self) -> &[ActivityEntry] {
+        &self.activity
     }
 
     pub fn document(&self) -> &CastleDocument {
@@ -387,7 +467,14 @@ impl Session {
             permission,
             state: AgentState::Idle,
         };
-        self.agents.insert(author.id.clone(), participant);
+        let display_name = participant.name.clone();
+        let agent_id = participant.id.clone();
+        self.agents.insert(agent_id.clone(), participant);
+        self.record_activity(
+            &agent_id,
+            "agent_registered",
+            format!("{display_name} ({permission:?})"),
+        );
         Ok(self
             .agents
             .get(&author.id)
@@ -406,6 +493,11 @@ impl Session {
             .get_mut(id)
             .ok_or(ProposalError::PermissionDenied)?;
         agent.permission = permission;
+        self.record_activity(
+            "host",
+            "agent_permission_changed",
+            format!("{id}: {permission:?}"),
+        );
         Ok(())
     }
 
@@ -415,6 +507,55 @@ impl Session {
         if let Some(agent) = self.agents.get_mut(id) {
             agent.state = state;
         }
+    }
+
+    /// Pause an agent. Paused agents are refused by every proposal, command and
+    /// request mutation until resumed. Unknown ids are refused.
+    pub fn pause_agent(&mut self, id: &str) -> Result<(), ProposalError> {
+        let agent = self
+            .agents
+            .get_mut(id)
+            .ok_or(ProposalError::PermissionDenied)?;
+        agent.state = AgentState::Paused;
+        self.record_activity("host", "agent_paused", id);
+        Ok(())
+    }
+
+    /// Resume a paused agent. It returns to `WaitingForApproval` when it still
+    /// has a submitted proposal, to `BuildingProposal` when it has an unfinished
+    /// draft, otherwise to `Idle`. Unknown ids are refused; resuming an
+    /// already-active agent is a harmless no-op that still records the action.
+    pub fn resume_agent(&mut self, id: &str) -> Result<(), ProposalError> {
+        let agent = self
+            .agents
+            .get_mut(id)
+            .ok_or(ProposalError::PermissionDenied)?;
+        let has_status = |status: ProposalStatus| {
+            self.proposals.values().any(|proposal| {
+                proposal.author.kind == AuthorKind::Agent
+                    && proposal.author.id == id
+                    && proposal.status == status
+            })
+        };
+        agent.state = if has_status(ProposalStatus::Submitted) {
+            AgentState::WaitingForApproval
+        } else if has_status(ProposalStatus::Draft) {
+            AgentState::BuildingProposal
+        } else {
+            AgentState::Idle
+        };
+        self.record_activity("host", "agent_resumed", id);
+        Ok(())
+    }
+
+    /// Disconnect and remove an agent. Returns `true` when an agent was
+    /// present.
+    pub fn disconnect_agent(&mut self, id: &str) -> bool {
+        let removed = self.agents.remove(id).is_some();
+        if removed {
+            self.record_activity("host", "agent_disconnected", id);
+        }
+        removed
     }
 
     /// One agent by sanitised id.
@@ -455,6 +596,9 @@ impl Session {
             structure_before: 0,
             structure_after: 0,
             structure_delta: 0,
+            historian_before: 0,
+            historian_after: 0,
+            historian_delta: 0,
             status: ProposalStatus::Draft,
             reject_reason: None,
         };
@@ -464,6 +608,11 @@ impl Session {
                 agent.state = AgentState::BuildingProposal;
             }
         }
+        self.record_activity(
+            proposal.author.to_string(),
+            "proposal_begun",
+            format!("{}: {}", proposal.id, proposal.title),
+        );
         Ok(proposal)
     }
 
@@ -494,10 +643,14 @@ impl Session {
         combined.extend(ops);
         let application = execute_batch(&self.document, self.next_element_id, &combined)?;
 
-        let style = StylePack::default();
+        let style = self.active_style();
         let structure_before = validate_structure(&self.document, &self.terrain, &style).score;
         let structure_after =
             validate_structure(&application.document, &self.terrain, &style).score;
+        let historian_before =
+            assess_historian(&self.document, &self.terrain, &style).overall_score;
+        let historian_after =
+            assess_historian(&application.document, &self.terrain, &style).overall_score;
 
         // Preview ids of everything the proposal adds or modifies. Deleted ids
         // are excluded: they have nothing to render in the ghost overlay.
@@ -517,10 +670,24 @@ impl Session {
             structure_before,
             structure_after,
             structure_delta: structure_after as i32 - structure_before as i32,
+            historian_before,
+            historian_after,
+            historian_delta: historian_after as i32 - historian_before as i32,
             ..proposal
         };
         self.proposals
             .insert(proposal_id.to_string(), updated.clone());
+        self.record_activity(
+            author.to_string(),
+            "proposal_staged",
+            format!(
+                "{}: {} ops, structure {:+}, historian {:+}",
+                updated.id,
+                updated.ops.len(),
+                updated.structure_delta,
+                updated.historian_delta
+            ),
+        );
         Ok(updated)
     }
 
@@ -557,6 +724,11 @@ impl Session {
                 agent.state = AgentState::WaitingForApproval;
             }
         }
+        self.record_activity(
+            author.to_string(),
+            "proposal_submitted",
+            format!("{}: {}", proposal.id, proposal.summary),
+        );
         Ok(proposal)
     }
 
@@ -591,6 +763,11 @@ impl Session {
                 agent.state = AgentState::Idle;
             }
         }
+        self.record_activity(
+            "host",
+            "proposal_accepted",
+            format!("{}: {} ops applied", proposal.id, proposal.ops.len()),
+        );
         Ok(outcome)
     }
 
@@ -622,6 +799,11 @@ impl Session {
                 agent.state = AgentState::Idle;
             }
         }
+        let detail = match &proposal.reject_reason {
+            Some(reason) => format!("{}: {reason}", proposal.id),
+            None => proposal.id.clone(),
+        };
+        self.record_activity("host", "proposal_rejected", detail);
         Ok(proposal)
     }
 
@@ -633,6 +815,17 @@ impl Session {
     /// One proposal by id.
     pub fn proposal(&self, id: &str) -> Option<&Proposal> {
         self.proposals.get(id)
+    }
+
+    /// True when the named proposal exists and the live document has moved
+    /// since it was begun. Unknown proposals are not stale (they are simply
+    /// absent).
+    pub fn is_proposal_stale(&self, proposal_id: &str) -> bool {
+        let Some(proposal) = self.proposals.get(proposal_id) else {
+            return false;
+        };
+        proposal.base_document_hash != document_hash_hex(&self.document)
+            || proposal.base_next_element_id != self.next_element_id
     }
 
     /// Build a translucent-overlay scene for a proposal: only the elements the
@@ -669,6 +862,156 @@ impl Session {
             }
         }
         Some(build_scene(&ghost, &self.terrain))
+    }
+
+    // -----------------------------------------------------------------------
+    // Request inbox (architecture section 7.7)
+    // -----------------------------------------------------------------------
+
+    /// Submit a request to the inbox. The prompt is sanitised and bounded; an
+    /// optional linked proposal must already exist.
+    pub fn submit_request(
+        &mut self,
+        author: AuthorId,
+        prompt: &str,
+        proposal_id: Option<&str>,
+        pinned_element_id: Option<ElementId>,
+    ) -> Result<AgentRequest, RequestError> {
+        let prompt = sanitize_prompt(prompt)?;
+        if let Some(id) = proposal_id {
+            if !self.proposals.contains_key(id) {
+                return Err(RequestError::UnknownRequest);
+            }
+        }
+        let seq = self.next_request_seq;
+        let request = AgentRequest {
+            id: format!("req_{seq:04}"),
+            author,
+            prompt,
+            proposal_id: proposal_id.map(str::to_string),
+            pinned_element_id,
+            status: RequestStatus::Open,
+            claimed_by: None,
+            reply: None,
+            created_seq: seq,
+        };
+        self.next_request_seq += 1;
+        self.requests.insert(request.id.clone(), request.clone());
+        self.record_activity(
+            request.author.to_string(),
+            "request_submitted",
+            format!("{}: {}", request.id, request.prompt),
+        );
+        Ok(request)
+    }
+
+    /// Ask for changes to a submitted proposal, queuing a request linked to it.
+    pub fn ask_for_changes(
+        &mut self,
+        proposal_id: &str,
+        author: AuthorId,
+        feedback: &str,
+    ) -> Result<AgentRequest, RequestError> {
+        let proposal = self
+            .proposals
+            .get(proposal_id)
+            .ok_or(RequestError::UnknownRequest)?;
+        if proposal.status != ProposalStatus::Submitted {
+            return Err(RequestError::InvalidStatus);
+        }
+        let request = self.submit_request(author, feedback, Some(proposal_id), None)?;
+        self.record_activity(
+            request.author.to_string(),
+            "changes_requested",
+            format!("{} -> {proposal_id}", request.id),
+        );
+        Ok(request)
+    }
+
+    /// Claim an open request. Requires an active agent with at least
+    /// [`AgentPermission::ReadOnly`].
+    pub fn ack_request(
+        &mut self,
+        request_id: &str,
+        agent_id: &str,
+    ) -> Result<AgentRequest, RequestError> {
+        let author = AuthorId::agent(agent_id).map_err(RequestError::Command)?;
+        self.ensure_agent_active(&author, AgentPermission::ReadOnly)
+            .map_err(|_| RequestError::PermissionDenied)?;
+        let request = self
+            .requests
+            .get_mut(request_id)
+            .ok_or(RequestError::UnknownRequest)?;
+        if request.status != RequestStatus::Open {
+            return Err(RequestError::InvalidStatus);
+        }
+        request.status = RequestStatus::Acknowledged;
+        request.claimed_by = Some(agent_id.to_string());
+        let updated = request.clone();
+        self.record_activity(
+            format!("agent:{agent_id}"),
+            "request_acknowledged",
+            &updated.id,
+        );
+        Ok(updated)
+    }
+
+    /// Resolve an open or acknowledged request, optionally recording a reply.
+    /// Requires an active agent with at least [`AgentPermission::ReadOnly`].
+    pub fn resolve_request(
+        &mut self,
+        request_id: &str,
+        agent_id: &str,
+        reply: Option<&str>,
+    ) -> Result<AgentRequest, RequestError> {
+        let author = AuthorId::agent(agent_id).map_err(RequestError::Command)?;
+        self.ensure_agent_active(&author, AgentPermission::ReadOnly)
+            .map_err(|_| RequestError::PermissionDenied)?;
+        let reply = match reply {
+            Some(reply) => Some(sanitize_prompt(reply)?),
+            None => None,
+        };
+        let request = self
+            .requests
+            .get_mut(request_id)
+            .ok_or(RequestError::UnknownRequest)?;
+        if !matches!(
+            request.status,
+            RequestStatus::Open | RequestStatus::Acknowledged
+        ) {
+            return Err(RequestError::InvalidStatus);
+        }
+        request.status = RequestStatus::Resolved;
+        if request.claimed_by.is_none() {
+            request.claimed_by = Some(agent_id.to_string());
+        }
+        request.reply = reply;
+        let updated = request.clone();
+        self.record_activity(format!("agent:{agent_id}"), "request_resolved", &updated.id);
+        Ok(updated)
+    }
+
+    /// All requests in deterministic id order.
+    pub fn requests(&self) -> impl Iterator<Item = &AgentRequest> {
+        self.requests.values()
+    }
+
+    /// Open and acknowledged requests in deterministic id order.
+    pub fn open_requests(&self) -> Vec<&AgentRequest> {
+        self.requests
+            .values()
+            .filter(|request| {
+                matches!(
+                    request.status,
+                    RequestStatus::Open | RequestStatus::Acknowledged
+                )
+            })
+            .collect()
+    }
+
+    /// One request by id.
+    pub fn request(&self, id: &str) -> Option<&AgentRequest> {
+        self.requests.get(id)
     }
 
     /// Shared gate for every agent-facing mutation: the author must be a
@@ -1217,6 +1560,58 @@ mod tests {
             panic!("tower missing");
         };
         assert_eq!(tower.plan, crate::document::TowerPlan::Round);
+    }
+
+    #[test]
+    fn resume_restores_building_state_for_an_unfinished_draft() {
+        let mut session = Session::new_empty();
+        session
+            .register_agent("mason", "Mason", "#e8b04b", AgentPermission::ProposalOnly)
+            .unwrap();
+        let author = agent();
+        let proposal = session
+            .begin_proposal(author.clone(), "Flanking tower")
+            .unwrap();
+        session
+            .stage_proposal_ops(&proposal.id, &author, vec![tower("Drum", [0, 0])])
+            .unwrap();
+        session.pause_agent("mason").unwrap();
+        assert_eq!(session.agent("mason").unwrap().state, AgentState::Paused);
+
+        session.resume_agent("mason").unwrap();
+        assert_eq!(
+            session.agent("mason").unwrap().state,
+            AgentState::BuildingProposal,
+            "a paused agent with an unfinished draft resumes mid-build"
+        );
+    }
+
+    #[test]
+    fn request_activity_logs_the_agent_actor_prefix() {
+        let mut session = Session::new_empty();
+        session
+            .register_agent("mason", "Mason", "#e8b04b", AgentPermission::ReadOnly)
+            .unwrap();
+        let request = session
+            .submit_request(player(), "Please add a tower", None, None)
+            .unwrap();
+        session.ack_request(&request.id, "mason").unwrap();
+        session
+            .resolve_request(&request.id, "mason", Some("Done"))
+            .unwrap();
+
+        let actors: Vec<_> = session
+            .activity_feed()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.action.as_str(),
+                    "request_acknowledged" | "request_resolved"
+                )
+            })
+            .map(|entry| entry.actor.as_str())
+            .collect();
+        assert_eq!(actors, vec!["agent:mason", "agent:mason"]);
     }
 
     #[test]

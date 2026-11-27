@@ -1,0 +1,228 @@
+{
+  "id": "promontory_curtain_defense",
+  "title": "Promontory Curtain Defence",
+  "description": "An Edwardian Welsh defensive curtain closing off a promontory: a full stone circuit with round and D-shaped towers, a twin-tower gatehouse, arrow loops along every face, a deep approach ditch, and a compact keep with hall, chapel and kitchen ranges behind the curtain.",
+  "style_id": "edwardian_welsh",
+  "site_id": "m0a_promontory",
+  "prompt": "You are fortifying a rocky promontory in Edwardian Wales. Close the neck with a battered curtain wall and full bailey circuit. Anchor the angles with round drum towers and at least one D-shaped tower facing the sea, and place a twin-tower gatehouse in the landward curtain. Pierce every curtain face with splayed arrow loops. Across the approach cut a deep ditch. Behind the curtain provide a compact keep, a great hall, a chapel and a kitchen range so the garrison can sustain a siege.",
+  "thresholds": {
+    "min_structure_score": 100,
+    "min_historian_score": 90,
+    "max_structure_errors": 0,
+    "min_elements": 14,
+    "require_svg_plan": true
+  },
+  "reference_steps": [
+    {
+      "tool": "apply_operations",
+      "arguments": {
+        "operations": [
+          {
+            "op": "create_tower",
+            "ref_id": "sea_tower",
+            "name": "D-shaped sea tower",
+            "centre_mm": [-16000, 12000],
+            "radius_mm": 3600,
+            "height_mm": 14000,
+            "batter_mm": 600
+          }
+        ]
+      }
+    },
+    {
+      "tool": "apply_operations",
+      "arguments": {
+        "operations": [
+          {
+            "op": "modify_element",
+            "id": 1,
+            "plan": "d_shaped",
+            "orientation_deg": 180
+          }
+        ]
+      }
+    },
+    {
+      "tool": "apply_operations",
+      "arguments": {
+        "operations": [
+          {
+            "op": "create_wall_run",
+            "ref_id": "south",
+            "name": "South curtain",
+            "start_mm": [-16000, -12000],
+            "end_mm": [16000, -12000],
+            "height_mm": 9000,
+            "thickness_mm": 2200,
+            "batter_mm": 900
+          },
+          {
+            "op": "create_wall_run",
+            "ref_id": "east",
+            "name": "East curtain",
+            "start_mm": [16000, -12000],
+            "end_mm": [16000, 12000],
+            "height_mm": 9000,
+            "thickness_mm": 2200,
+            "batter_mm": 900
+          },
+          {
+            "op": "create_wall_run",
+            "ref_id": "north",
+            "name": "North curtain",
+            "start_mm": [16000, 12000],
+            "end_mm": [-16000, 12000],
+            "height_mm": 9000,
+            "thickness_mm": 2200,
+            "batter_mm": 900
+          },
+          {
+            "op": "create_wall_run",
+            "ref_id": "west",
+            "name": "West curtain",
+            "start_mm": [-16000, 12000],
+            "end_mm": [-16000, -12000],
+            "height_mm": 9000,
+            "thickness_mm": 2200,
+            "batter_mm": 900
+          },
+          {
+            "op": "create_gatehouse",
+            "ref_id": "gate",
+            "name": "Landward gatehouse",
+            "centre_mm": [0, -12000],
+            "orientation_deg": 90,
+            "passage_width_mm": 3200,
+            "height_mm": 13000,
+            "tower_radius_mm": 3200
+          },
+          {
+            "op": "create_tower",
+            "ref_id": "ne",
+            "name": "North-east drum",
+            "centre_mm": [16000, 12000],
+            "radius_mm": 3600,
+            "height_mm": 14000,
+            "batter_mm": 600
+          },
+          {
+            "op": "create_tower",
+            "ref_id": "se",
+            "name": "South-east drum",
+            "centre_mm": [16000, -12000],
+            "radius_mm": 3400,
+            "height_mm": 13000,
+            "batter_mm": 600
+          },
+          {
+            "op": "create_tower",
+            "ref_id": "sw",
+            "name": "South-west drum",
+            "centre_mm": [-16000, -12000],
+            "radius_mm": 3400,
+            "height_mm": 13000,
+            "batter_mm": 600
+          },
+          {
+            "op": "create_keep",
+            "ref_id": "keep",
+            "name": "Garrison keep",
+            "centre_mm": [0, 0],
+            "width_mm": 14000,
+            "depth_mm": 12000,
+            "height_mm": 20000,
+            "wall_thickness_mm": 2600,
+            "batter_mm": 450,
+            "plinth_height_mm": 700
+          },
+          {
+            "op": "create_range",
+            "ref_id": "hall",
+            "name": "Great hall",
+            "kind": "hall",
+            "centre_mm": [0, 7500],
+            "length_mm": 16000,
+            "width_mm": 8000,
+            "wall_height_mm": 7500,
+            "roof_pitch_deg": 42
+          },
+          {
+            "op": "create_range",
+            "ref_id": "chapel",
+            "name": "Chapel range",
+            "kind": "chapel",
+            "centre_mm": [9000, -6000],
+            "length_mm": 10000,
+            "width_mm": 5500,
+            "wall_height_mm": 6500,
+            "roof_pitch_deg": 46,
+            "orientation_deg": 90
+          },
+          {
+            "op": "create_range",
+            "ref_id": "kitchen",
+            "name": "Kitchen range",
+            "kind": "kitchen",
+            "centre_mm": [-9000, -6000],
+            "length_mm": 9000,
+            "width_mm": 5000,
+            "wall_height_mm": 6000,
+            "roof_pitch_deg": 40,
+            "orientation_deg": 90
+          },
+          {
+            "op": "create_ditch",
+            "ref_id": "ditch",
+            "name": "Approach ditch",
+            "start_mm": [-22000, -19000],
+            "end_mm": [22000, -19000],
+            "width_mm": 6000,
+            "depth_mm": 2600
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "south",
+            "t_permille": 300,
+            "sill_height_mm": 1800
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "south",
+            "t_permille": 700,
+            "sill_height_mm": 1800
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "east",
+            "t_permille": 500,
+            "sill_height_mm": 1800
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "north",
+            "t_permille": 250,
+            "sill_height_mm": 1800
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "north",
+            "t_permille": 500,
+            "sill_height_mm": 1800
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "north",
+            "t_permille": 750,
+            "sill_height_mm": 1800
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "west",
+            "t_permille": 500,
+            "sill_height_mm": 1800
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -18,6 +18,15 @@ use crate::document::ElementId;
 /// Maximum number of characters in a proposal summary or reject reason.
 pub const MAX_SUMMARY_CHARS: usize = 256;
 
+/// Maximum number of characters in a request prompt or reply.
+pub const MAX_REQUEST_PROMPT_CHARS: usize = 512;
+
+/// Maximum number of activity feed entries retained on a session.
+pub const MAX_ACTIVITY_ENTRIES: usize = 200;
+
+/// Maximum number of characters retained in an activity entry field.
+const MAX_ACTIVITY_FIELD_CHARS: usize = 256;
+
 /// What an agent participant is allowed to do (architecture section 7.6).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +126,15 @@ pub struct Proposal {
     pub structure_after: u32,
     /// `structure_after - structure_before`.
     pub structure_delta: i32,
+    /// Overall historian score of the base document.
+    #[serde(default)]
+    pub historian_before: u32,
+    /// Overall historian score of the forked document with the proposal applied.
+    #[serde(default)]
+    pub historian_after: u32,
+    /// `historian_after - historian_before`.
+    #[serde(default)]
+    pub historian_delta: i32,
     pub status: ProposalStatus,
     /// Sanitised reason supplied when a human rejected the proposal.
     pub reject_reason: Option<String>,
@@ -203,10 +221,126 @@ fn is_forbidden_display_char(c: char) -> bool {
         || matches!(c as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD)
 }
 
+/// Lifecycle of an [`AgentRequest`] in the request inbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestStatus {
+    /// Nobody has claimed the request yet.
+    Open,
+    /// An agent has claimed the request and is working on it.
+    Acknowledged,
+    /// The request has been answered and closed.
+    Resolved,
+}
+
+/// A human (or agent) request queued for an agent to pick up.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRequest {
+    /// Deterministic `"req_0001"`, `"req_0002"`, ... identifier.
+    pub id: String,
+    pub author: AuthorId,
+    /// Sanitised request text; at most [`MAX_REQUEST_PROMPT_CHARS`] characters.
+    pub prompt: String,
+    /// Optional proposal this request is feedback on.
+    pub proposal_id: Option<String>,
+    /// Optional element the request is pinned to.
+    pub pinned_element_id: Option<ElementId>,
+    pub status: RequestStatus,
+    /// Agent id that claimed the request, if any.
+    pub claimed_by: Option<String>,
+    /// Sanitised agent reply recorded on resolution.
+    pub reply: Option<String>,
+    /// Monotonic request sequence number (also reflected in the id).
+    pub created_seq: u64,
+}
+
+/// Why a request operation was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestError {
+    /// No request exists with the given id.
+    UnknownRequest,
+    /// The prompt or reply was empty after trimming.
+    EmptyPrompt,
+    /// The request is not in a state that allows this transition.
+    InvalidStatus,
+    /// The agent is unknown, paused, or lacks the required permission.
+    PermissionDenied,
+    /// Prompt or reply validation failed.
+    Command(CommandError),
+}
+
+impl fmt::Display for RequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownRequest => write!(f, "unknown request"),
+            Self::EmptyPrompt => write!(f, "request prompt must not be empty"),
+            Self::InvalidStatus => write!(f, "request is not in a valid state for this action"),
+            Self::PermissionDenied => write!(f, "agent permission or paused state forbids this"),
+            Self::Command(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+impl From<CommandError> for RequestError {
+    fn from(error: CommandError) -> Self {
+        Self::Command(error)
+    }
+}
+
+/// Trim and sanitise a request prompt or reply: non-empty, at most
+/// [`MAX_REQUEST_PROMPT_CHARS`] characters, and free of control, bidi,
+/// formatting, separator and private-use characters.
+pub fn sanitize_prompt(text: &str) -> Result<String, RequestError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(RequestError::EmptyPrompt);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(RequestError::Command(CommandError::NameHasControlChars));
+    }
+    if trimmed.chars().any(is_forbidden_display_char) {
+        return Err(RequestError::Command(CommandError::NameHasForbiddenChars));
+    }
+    let chars = trimmed.chars().count();
+    if chars > MAX_REQUEST_PROMPT_CHARS {
+        return Err(RequestError::Command(CommandError::NameTooLong {
+            chars,
+            max: MAX_REQUEST_PROMPT_CHARS,
+        }));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// One immutable entry in the session activity feed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityEntry {
+    /// Monotonic feed sequence number.
+    pub seq: u64,
+    /// Session clock timestamp in milliseconds when the entry was recorded.
+    pub timestamp_ms: u64,
+    pub actor: String,
+    pub action: String,
+    pub detail: String,
+}
+
+impl ActivityEntry {
+    /// Sanitise one activity field: strip control and forbidden display
+    /// characters, then truncate to [`MAX_ACTIVITY_FIELD_CHARS`].
+    pub(crate) fn sanitize_field(value: &str) -> String {
+        value
+            .chars()
+            .filter(|c| !c.is_control() && !is_forbidden_display_char(*c))
+            .take(MAX_ACTIVITY_FIELD_CHARS)
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::Element;
+    use crate::document::{Element, RangeKind};
     use crate::session::Session;
 
     fn agent_id() -> AuthorId {
@@ -774,5 +908,339 @@ mod tests {
             .unwrap();
         session.accept_proposal(&proposal.id).unwrap();
         assert!(session.build_proposal_ghost_scene(&proposal.id).is_none());
+    }
+
+    fn hall(name: &str, centre: [i64; 2]) -> CommandOp {
+        CommandOp::CreateRange {
+            ref_id: None,
+            name: name.into(),
+            kind: RangeKind::Hall,
+            centre_mm: centre,
+            length_mm: None,
+            width_mm: None,
+            wall_height_mm: None,
+            roof_pitch_deg: None,
+            orientation_deg: None,
+        }
+    }
+
+    #[test]
+    fn staging_records_a_positive_historian_delta() {
+        let mut session = session_with_agent(AgentPermission::ProposalOnly);
+        let proposal = session.begin_proposal(agent_id(), "Hall and drum").unwrap();
+        assert_eq!(proposal.historian_before, 0);
+        assert_eq!(proposal.historian_after, 0);
+        assert_eq!(proposal.historian_delta, 0);
+
+        let staged = session
+            .stage_proposal_ops(
+                &proposal.id,
+                &agent_id(),
+                vec![
+                    tower("Drum tower", [10_000, 0]),
+                    hall("Great hall", [0, 10_000]),
+                ],
+            )
+            .unwrap();
+
+        assert!(staged.historian_before > 0);
+        assert!(staged.historian_after > staged.historian_before);
+        assert_eq!(
+            staged.historian_delta,
+            staged.historian_after as i32 - staged.historian_before as i32
+        );
+        assert!(staged.historian_delta > 0);
+    }
+
+    #[test]
+    fn active_style_is_selected_and_used_for_staging() {
+        let mut session = session_with_agent(AgentPermission::ProposalOnly);
+        assert_eq!(session.style_id(), "edwardian_welsh");
+        assert!(session.set_style_id("baltic_brick"));
+        assert_eq!(session.style_id(), "baltic_brick");
+        assert!(!session.set_style_id("not_a_style"));
+        assert_eq!(session.style_id(), "baltic_brick");
+
+        let proposal = session.begin_proposal(agent_id(), "Hall").unwrap();
+        let staged = session
+            .stage_proposal_ops(&proposal.id, &agent_id(), vec![hall("Great hall", [0, 0])])
+            .unwrap();
+        assert!(staged.structure_after > 0);
+        assert!(staged.historian_after > 0);
+    }
+
+    #[test]
+    fn is_proposal_stale_tracks_document_and_allocator_changes() {
+        let mut session = session_with_agent(AgentPermission::ProposalOnly);
+        let proposal = session.begin_proposal(agent_id(), "Wall").unwrap();
+        assert!(!session.is_proposal_stale(&proposal.id));
+        assert!(!session.is_proposal_stale("prop_9999"));
+
+        session
+            .apply_batch(player_id(), vec![tower("Player drum", [30_000, 0])])
+            .unwrap();
+        assert!(session.is_proposal_stale(&proposal.id));
+
+        // A delete-and-recreate cycle restores the hash but moves the
+        // allocator, which must still count as stale.
+        let mut session = session_with_agent(AgentPermission::ProposalOnly);
+        let proposal = session.begin_proposal(agent_id(), "Wall").unwrap();
+        let base_hash = session.document().document_hash();
+        session
+            .apply_batch(player_id(), vec![tower("Temporary", [30_000, 0])])
+            .unwrap();
+        session
+            .apply_batch(player_id(), vec![CommandOp::DeleteElement { id: 1 }])
+            .unwrap();
+        assert_eq!(session.document().document_hash(), base_hash);
+        assert!(session.is_proposal_stale(&proposal.id));
+    }
+
+    #[test]
+    fn pause_resume_and_disconnect_control_agent_lifecycle() {
+        let mut session = session_with_agent(AgentPermission::ProposalOnly);
+
+        session.pause_agent("mason").unwrap();
+        assert_eq!(session.agent("mason").unwrap().state, AgentState::Paused);
+        assert_eq!(
+            session.begin_proposal(agent_id(), "Blocked"),
+            Err(ProposalError::PermissionDenied)
+        );
+
+        session.resume_agent("mason").unwrap();
+        assert_eq!(session.agent("mason").unwrap().state, AgentState::Idle);
+
+        // A resumed agent with a submitted proposal returns to approval wait.
+        let proposal = session.begin_proposal(agent_id(), "Wall").unwrap();
+        session
+            .stage_proposal_ops(
+                &proposal.id,
+                &agent_id(),
+                vec![wall("Proposed wall", [0, 0], [12_000, 0])],
+            )
+            .unwrap();
+        session
+            .submit_proposal(&proposal.id, &agent_id(), "Wall")
+            .unwrap();
+        session.pause_agent("mason").unwrap();
+        session.resume_agent("mason").unwrap();
+        assert_eq!(
+            session.agent("mason").unwrap().state,
+            AgentState::WaitingForApproval
+        );
+
+        assert_eq!(
+            session.pause_agent("ghost"),
+            Err(ProposalError::PermissionDenied)
+        );
+        assert_eq!(
+            session.resume_agent("ghost"),
+            Err(ProposalError::PermissionDenied)
+        );
+
+        assert!(session.disconnect_agent("mason"));
+        assert!(session.agent("mason").is_none());
+        assert!(!session.disconnect_agent("mason"));
+    }
+
+    #[test]
+    fn request_lifecycle_submit_acknowledge_and_resolve() {
+        let mut session = session_with_agent(AgentPermission::ProposalOnly);
+        let request = session
+            .submit_request(player_id(), "  Add a gatehouse  ", None, Some(7))
+            .unwrap();
+        assert_eq!(request.id, "req_0001");
+        assert_eq!(request.status, RequestStatus::Open);
+        assert_eq!(request.prompt, "Add a gatehouse");
+        assert_eq!(request.pinned_element_id, Some(7));
+        assert_eq!(request.created_seq, 1);
+        assert_eq!(session.open_requests().len(), 1);
+        assert_eq!(session.request("req_0001"), Some(&request));
+
+        let acked = session.ack_request("req_0001", "mason").unwrap();
+        assert_eq!(acked.status, RequestStatus::Acknowledged);
+        assert_eq!(acked.claimed_by.as_deref(), Some("mason"));
+
+        let resolved = session
+            .resolve_request("req_0001", "mason", Some("  Gatehouse added  "))
+            .unwrap();
+        assert_eq!(resolved.status, RequestStatus::Resolved);
+        assert_eq!(resolved.reply.as_deref(), Some("Gatehouse added"));
+        assert_eq!(resolved.claimed_by.as_deref(), Some("mason"));
+        assert!(session.open_requests().is_empty());
+        assert_eq!(session.requests().count(), 1);
+
+        assert_eq!(
+            session.ack_request("req_0001", "mason"),
+            Err(RequestError::InvalidStatus)
+        );
+        assert_eq!(
+            session.resolve_request("req_0001", "mason", None),
+            Err(RequestError::InvalidStatus)
+        );
+        assert_eq!(
+            session.ack_request("req_9999", "mason"),
+            Err(RequestError::UnknownRequest)
+        );
+        assert_eq!(
+            session.resolve_request("req_9999", "mason", None),
+            Err(RequestError::UnknownRequest)
+        );
+
+        // A read-only agent may still acknowledge and reply to requests.
+        let mut session = session_with_agent(AgentPermission::ReadOnly);
+        session
+            .submit_request(player_id(), "Check the gate", None, None)
+            .unwrap();
+        assert!(session.ack_request("req_0001", "mason").is_ok());
+        assert!(session
+            .resolve_request("req_0001", "mason", Some("Checked"))
+            .is_ok());
+    }
+
+    #[test]
+    fn ask_for_changes_links_to_a_submitted_proposal() {
+        let mut session = session_with_agent(AgentPermission::ProposalOnly);
+        let proposal = session.begin_proposal(agent_id(), "Tower").unwrap();
+        assert_eq!(
+            session.ask_for_changes(&proposal.id, player_id(), "Too small"),
+            Err(RequestError::InvalidStatus)
+        );
+        session
+            .stage_proposal_ops(
+                &proposal.id,
+                &agent_id(),
+                vec![tower("Drum tower", [10_000, 0])],
+            )
+            .unwrap();
+        session
+            .submit_proposal(&proposal.id, &agent_id(), "A drum tower")
+            .unwrap();
+
+        let request = session
+            .ask_for_changes(&proposal.id, player_id(), "Make the drum larger")
+            .unwrap();
+        assert_eq!(request.proposal_id.as_deref(), Some(proposal.id.as_str()));
+        assert_eq!(request.status, RequestStatus::Open);
+        assert_eq!(request.prompt, "Make the drum larger");
+        assert_eq!(
+            session.ask_for_changes("prop_9999", player_id(), "Nope"),
+            Err(RequestError::UnknownRequest)
+        );
+        assert_eq!(
+            session.submit_request(player_id(), "Linked", Some("prop_9999"), None),
+            Err(RequestError::UnknownRequest)
+        );
+    }
+
+    #[test]
+    fn request_prompts_reject_empty_forbidden_and_oversized_text() {
+        assert_eq!(sanitize_prompt("   "), Err(RequestError::EmptyPrompt));
+        assert_eq!(
+            sanitize_prompt("bad\nprompt"),
+            Err(RequestError::Command(CommandError::NameHasControlChars))
+        );
+        assert_eq!(
+            sanitize_prompt("x\u{202E}y"),
+            Err(RequestError::Command(CommandError::NameHasForbiddenChars))
+        );
+        let too_long = "x".repeat(MAX_REQUEST_PROMPT_CHARS + 1);
+        assert!(matches!(
+            sanitize_prompt(&too_long),
+            Err(RequestError::Command(CommandError::NameTooLong { .. }))
+        ));
+        assert_eq!(
+            sanitize_prompt("  Fine  ").unwrap(),
+            "Fine".to_string(),
+            "prompts are trimmed"
+        );
+    }
+
+    #[test]
+    fn paused_agent_cannot_acknowledge_or_resolve_requests() {
+        let mut session = session_with_agent(AgentPermission::ProposalOnly);
+        session
+            .submit_request(player_id(), "Inspect the wall", None, None)
+            .unwrap();
+        session.pause_agent("mason").unwrap();
+        assert_eq!(
+            session.ack_request("req_0001", "mason"),
+            Err(RequestError::PermissionDenied)
+        );
+        assert_eq!(
+            session.resolve_request("req_0001", "mason", None),
+            Err(RequestError::PermissionDenied)
+        );
+
+        // Resuming restores the ability to work the inbox.
+        session.resume_agent("mason").unwrap();
+        assert!(session.ack_request("req_0001", "mason").is_ok());
+    }
+
+    #[test]
+    fn activity_feed_records_sanitised_entries_and_evicts_oldest() {
+        let mut session = Session::new_empty();
+        let start_clock = session.clock_ms;
+        session.record_activity("bad\nactor", "did\u{202E}thing", "detail ".repeat(100));
+        let entries = session.activity_feed();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[0].timestamp_ms, start_clock);
+        assert_eq!(entries[0].actor, "badactor");
+        assert_eq!(entries[0].action, "didthing");
+        assert_eq!(entries[0].detail.chars().count(), 256);
+        assert_eq!(
+            session.clock_ms, start_clock,
+            "activity must not advance the command clock"
+        );
+
+        for _ in 0..(MAX_ACTIVITY_ENTRIES + 50) {
+            session.record_activity("host", "tick", "filler");
+        }
+        let feed = session.activity_feed();
+        assert_eq!(feed.len(), MAX_ACTIVITY_ENTRIES);
+        assert_eq!(feed.first().unwrap().seq, 52);
+        assert_eq!(feed.last().unwrap().seq, (MAX_ACTIVITY_ENTRIES + 51) as u64);
+    }
+
+    #[test]
+    fn proposal_and_agent_actions_are_recorded_in_the_activity_feed() {
+        let mut session = session_with_agent(AgentPermission::ProposalOnly);
+        let actions: Vec<String> = session
+            .activity_feed()
+            .iter()
+            .map(|entry| entry.action.clone())
+            .collect();
+        assert!(actions.contains(&"agent_registered".to_string()));
+
+        let proposal = session.begin_proposal(agent_id(), "Wall").unwrap();
+        session
+            .stage_proposal_ops(
+                &proposal.id,
+                &agent_id(),
+                vec![wall("Proposed wall", [0, 0], [12_000, 0])],
+            )
+            .unwrap();
+        session
+            .submit_proposal(&proposal.id, &agent_id(), "Wall")
+            .unwrap();
+        session.accept_proposal(&proposal.id).unwrap();
+
+        let actions: Vec<String> = session
+            .activity_feed()
+            .iter()
+            .map(|entry| entry.action.clone())
+            .collect();
+        for expected in [
+            "proposal_begun",
+            "proposal_staged",
+            "proposal_submitted",
+            "proposal_accepted",
+        ] {
+            assert!(
+                actions.contains(&expected.to_string()),
+                "missing {expected} in {actions:?}"
+            );
+        }
     }
 }

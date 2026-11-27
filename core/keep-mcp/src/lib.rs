@@ -20,11 +20,13 @@ use keep_core::style::StylePack;
 use keep_core::terrain::SiteTerrain;
 use keep_core::validate::validate_structure;
 use keep_proto::{
-    ApplyOperationsRequest, ApplyOperationsResponse, AssessmentResponse, BeginProposalRequest,
-    ElementListResponse, GetCastleResponse, GetHistoryResponse, GetSiteResponse, GetStyleResponse,
-    HistoryEntry, ListProposalsResponse, ListStylesResponse, ProposalResponse, RenderPlanRequest,
-    RenderPlanResponse, RenderViewRequest, RenderViewResponse, StageProposalOpsRequest,
-    SubmitProposalRequest, UndoResponse,
+    AckRequestArgs, ActivityFeedArgs, ActivityFeedResponse, ApplyOperationsRequest,
+    ApplyOperationsResponse, AssessmentResponse, BeginProposalRequest, ElementListResponse,
+    GetCastleResponse, GetHistoryResponse, GetSiteResponse, GetStyleResponse, HistoryEntry,
+    ListProposalsResponse, ListStylesResponse, ProposalResponse, RenderPlanRequest,
+    RenderPlanResponse, RenderViewRequest, RenderViewResponse, ReplyRequestArgs,
+    RequestListResponse, RequestResponse, StageProposalOpsRequest, SubmitProposalRequest,
+    UndoResponse,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -39,6 +41,12 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub const SERVER_NAME: &str = "keep-mcp";
 /// Author identity written into the command log for offline agent edits.
 pub const OFFLINE_AUTHOR_ID: &str = "mcp-offline";
+/// Actor recorded in the offline activity feed for sidecar tool calls. Matches
+/// the offline agent's registered id (`OFFLINE_AUTHOR_ID`) so the panel shows a
+/// real participant.
+pub const OFFLINE_ACTOR_ID: &str = "agent:mcp-offline";
+/// Default number of activity entries returned when `limit` is omitted.
+pub const DEFAULT_ACTIVITY_LIMIT: usize = 50;
 
 /// JSON-RPC error codes used by the handler.
 mod code {
@@ -297,6 +305,16 @@ impl McpServer {
                 .tool_submit_proposal(arguments)
                 .map(|value| tool_result(&value)),
             "list_proposals" => self.tool_list_proposals().map(|value| tool_result(&value)),
+            "list_requests" => self.tool_list_requests().map(|value| tool_result(&value)),
+            "ack_request" => self
+                .tool_ack_request(arguments)
+                .map(|value| tool_result(&value)),
+            "reply_request" => self
+                .tool_reply_request(arguments)
+                .map(|value| tool_result(&value)),
+            "get_activity_feed" => self
+                .tool_get_activity_feed(arguments)
+                .map(|value| tool_result(&value)),
             "render_view" => Err(
                 "render_view requires --live mode with a running game; use render_plan offline"
                     .to_string(),
@@ -376,6 +394,42 @@ impl McpServer {
                     .map_err(|error| format!("invalid list_elements response: {error}"))?;
                 Ok(tool_result(&response))
             }
+            "list_requests" => {
+                let value = self.call_live(name, arguments)?;
+                let response: RequestListResponse = serde_json::from_value(value)
+                    .map_err(|error| format!("invalid list_requests response: {error}"))?;
+                Ok(tool_result(&response))
+            }
+            "ack_request" => {
+                let request: AckRequestArgs = serde_json::from_value(arguments)
+                    .map_err(|error| format!("invalid arguments: {error}"))?;
+                let params = serde_json::to_value(&request)
+                    .map_err(|error| format!("invalid arguments: {error}"))?;
+                let value = self.call_live(name, params)?;
+                let response: RequestResponse = serde_json::from_value(value)
+                    .map_err(|error| format!("invalid ack_request response: {error}"))?;
+                Ok(tool_result(&response))
+            }
+            "reply_request" => {
+                let request: ReplyRequestArgs = serde_json::from_value(arguments)
+                    .map_err(|error| format!("invalid arguments: {error}"))?;
+                let params = serde_json::to_value(&request)
+                    .map_err(|error| format!("invalid arguments: {error}"))?;
+                let value = self.call_live(name, params)?;
+                let response: RequestResponse = serde_json::from_value(value)
+                    .map_err(|error| format!("invalid reply_request response: {error}"))?;
+                Ok(tool_result(&response))
+            }
+            "get_activity_feed" => {
+                let request: ActivityFeedArgs = serde_json::from_value(arguments)
+                    .map_err(|error| format!("invalid arguments: {error}"))?;
+                let params = serde_json::to_value(&request)
+                    .map_err(|error| format!("invalid arguments: {error}"))?;
+                let value = self.call_live(name, params)?;
+                let response: ActivityFeedResponse = serde_json::from_value(value)
+                    .map_err(|error| format!("invalid get_activity_feed response: {error}"))?;
+                Ok(tool_result(&response))
+            }
             "render_view" => {
                 let request: RenderViewRequest = serde_json::from_value(arguments)
                     .map_err(|error| format!("invalid arguments: {error}"))?;
@@ -400,15 +454,33 @@ impl McpServer {
         client.call(method, params)
     }
 
-    fn tool_get_castle(&self) -> Result<GetCastleResponse, String> {
-        Ok(keep_proto::build_castle_response(&self.session))
+    fn tool_get_castle(&mut self) -> Result<GetCastleResponse, String> {
+        let response = keep_proto::build_castle_response(&self.session);
+        self.session.record_activity(
+            OFFLINE_ACTOR_ID,
+            "get_castle",
+            format!(
+                "elements={}; openings={}",
+                response.element_count, response.opening_count
+            ),
+        );
+        Ok(response)
     }
 
-    fn tool_list_elements(&self) -> Result<ElementListResponse, String> {
-        Ok(keep_proto::build_element_list_response(&self.session))
+    fn tool_list_elements(&mut self) -> Result<ElementListResponse, String> {
+        let response = keep_proto::build_element_list_response(&self.session);
+        self.session.record_activity(
+            OFFLINE_ACTOR_ID,
+            "list_elements",
+            format!(
+                "elements={}; openings={}",
+                response.element_count, response.opening_count
+            ),
+        );
+        Ok(response)
     }
 
-    fn tool_render_plan(&self, arguments: Value) -> Result<RenderPlanResponse, String> {
+    fn tool_render_plan(&mut self, arguments: Value) -> Result<RenderPlanResponse, String> {
         let request: RenderPlanRequest = serde_json::from_value(arguments)
             .map_err(|error| format!("invalid arguments: {error}"))?;
         let (view_name, view) = match request.view.as_str() {
@@ -421,12 +493,15 @@ impl McpServer {
             }
         };
         let svg = render_plan_svg(self.session.document(), self.session.terrain(), view);
-        Ok(RenderPlanResponse {
+        let response = RenderPlanResponse {
             view: view_name.to_string(),
             document_hash: hex_hash(self.session.document().document_hash()),
             mime_type: "image/svg+xml".to_string(),
             svg,
-        })
+        };
+        self.session
+            .record_activity(OFFLINE_ACTOR_ID, "render_plan", view_name);
+        Ok(response)
     }
 
     /// Apply a batch atomically through the shared session engine. Validation,
@@ -504,7 +579,7 @@ impl McpServer {
 
     /// Assess the castle against the requested style pack (Edwardian Welsh by
     /// default) and cite both the structural and historical readings.
-    fn tool_get_assessment(&self, arguments: Value) -> Result<AssessmentResponse, String> {
+    fn tool_get_assessment(&mut self, arguments: Value) -> Result<AssessmentResponse, String> {
         let style_id = match arguments.get("style_id") {
             None | Some(Value::Null) => "edwardian_welsh",
             Some(Value::String(id)) => id.as_str(),
@@ -525,7 +600,16 @@ impl McpServer {
         let terrain = self.session.terrain();
         let report = validate_structure(document, terrain, &style);
         let historian = assess_historian(document, terrain, &style);
-        Ok(AssessmentResponse::new(style.id.clone(), report, historian))
+        let response = AssessmentResponse::new(style.id.clone(), report, historian);
+        self.session.record_activity(
+            OFFLINE_ACTOR_ID,
+            "get_assessment",
+            format!(
+                "style={}; score={}; passed={}",
+                response.style_id, response.score, response.passed
+            ),
+        );
+        Ok(response)
     }
 
     /// Every curated style pack, in stable id order.
@@ -603,6 +687,55 @@ impl McpServer {
         })
     }
 
+    /// Every player request in the session inbox, in deterministic id order.
+    fn tool_list_requests(&self) -> Result<RequestListResponse, String> {
+        let requests: Vec<_> = self.session.requests().cloned().collect();
+        Ok(RequestListResponse {
+            count: requests.len(),
+            requests,
+        })
+    }
+
+    /// Claim an open player request as the offline agent.
+    fn tool_ack_request(&mut self, arguments: Value) -> Result<RequestResponse, String> {
+        let args: AckRequestArgs = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        let request = self
+            .session
+            .ack_request(&args.request_id, OFFLINE_AUTHOR_ID)
+            .map_err(|error| error.to_string())?;
+        Ok(RequestResponse { request })
+    }
+
+    /// Resolve a player request, optionally recording a reply.
+    fn tool_reply_request(&mut self, arguments: Value) -> Result<RequestResponse, String> {
+        let args: ReplyRequestArgs = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        let request = self
+            .session
+            .resolve_request(&args.request_id, OFFLINE_AUTHOR_ID, args.reply.as_deref())
+            .map_err(|error| error.to_string())?;
+        Ok(RequestResponse { request })
+    }
+
+    /// The newest `limit` activity entries (default 50, capped at the feed
+    /// bound), in chronological order.
+    fn tool_get_activity_feed(&self, arguments: Value) -> Result<ActivityFeedResponse, String> {
+        let args: ActivityFeedArgs = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        let feed = self.session.activity_feed();
+        let limit = args
+            .limit
+            .unwrap_or(DEFAULT_ACTIVITY_LIMIT)
+            .min(keep_core::proposal::MAX_ACTIVITY_ENTRIES);
+        let start = feed.len().saturating_sub(limit);
+        let entries: Vec<_> = feed[start..].to_vec();
+        Ok(ActivityFeedResponse {
+            count: entries.len(),
+            entries,
+        })
+    }
+
     fn handle_resource_read(&mut self, params: &Value) -> Result<Value, (i64, String)> {
         let Some(uri) = params.get("uri").and_then(Value::as_str) else {
             return Err((code::INVALID_PARAMS, "missing resource uri".into()));
@@ -636,6 +769,22 @@ impl McpServer {
                     .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?;
                 Ok(resource_contents(uri, "application/json", text))
             }
+            "keep://session/requests" => {
+                let requests = self
+                    .tool_list_requests()
+                    .map_err(|message| (code::INTERNAL_ERROR, message))?;
+                let text = serde_json::to_string_pretty(&requests)
+                    .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?;
+                Ok(resource_contents(uri, "application/json", text))
+            }
+            "keep://session/activity" => {
+                let feed = self
+                    .tool_get_activity_feed(json!({}))
+                    .map_err(|message| (code::INTERNAL_ERROR, message))?;
+                let text = serde_json::to_string_pretty(&feed)
+                    .map_err(|error| (code::INTERNAL_ERROR, error.to_string()))?;
+                Ok(resource_contents(uri, "application/json", text))
+            }
             "keep://styles/edwardian_welsh" => {
                 let style = StylePack::edwardian_welsh();
                 let text = serde_json::to_string_pretty(&style)
@@ -662,6 +811,8 @@ impl McpServer {
         let (method, params, mime_type) = match uri {
             "keep://castle/document" => ("get_castle", json!({}), "application/json"),
             "keep://castle/assessment" => ("get_assessment", json!({}), "application/json"),
+            "keep://session/requests" => ("list_requests", json!({}), "application/json"),
+            "keep://session/activity" => ("get_activity_feed", json!({}), "application/json"),
             "keep://castle/plan/top" => (
                 "render_plan",
                 json!({ "view": "top_plan" }),
@@ -731,7 +882,7 @@ fn initialize_result() -> Value {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Keepwright castle sidecar. Use get_castle, list_elements, render_plan, apply_operations, undo and get_history, plus get_assessment (optional style_id), list_styles, get_style and get_site for structural, historical and style reads. Use begin_proposal, stage_proposal_ops and submit_proposal to propose edits for the human to accept in-game (list_proposals shows their status). render_view needs live mode; render_plan works offline."
+        "instructions": "Keepwright castle sidecar. Use get_castle, list_elements, render_plan, apply_operations, undo and get_history, plus get_assessment (optional style_id), list_styles, get_style and get_site for structural, historical and style reads. Use begin_proposal, stage_proposal_ops and submit_proposal to propose edits for the human to accept in-game (list_proposals shows their status). Use list_requests, ack_request and reply_request to work the player request inbox, and get_activity_feed for recent session activity. render_view needs live mode; render_plan works offline."
     })
 }
 
@@ -766,6 +917,18 @@ fn resources_list() -> Value {
                 "uri": "keep://castle/assessment",
                 "name": "Structural assessment",
                 "description": "Structural and historian findings for a style pack (default Edwardian Welsh), with severity, source notes and suggested fixes.",
+                "mimeType": "application/json"
+            },
+            {
+                "uri": "keep://session/requests",
+                "name": "Request inbox",
+                "description": "Every player request in the session inbox with status, author, optional proposal/element link and any reply.",
+                "mimeType": "application/json"
+            },
+            {
+                "uri": "keep://session/activity",
+                "name": "Activity feed",
+                "description": "Recent session activity entries (requests, proposals, agents and tool use) in chronological order.",
                 "mimeType": "application/json"
             },
             {
@@ -1012,11 +1175,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_fifteen_tools_with_schemas() {
+    fn tools_list_exposes_nineteen_tools_with_schemas() {
         let mut server = server();
         let response = call(&mut server, 4, "tools/list", json!({}));
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 19);
         for tool in tools {
             assert!(tool["inputSchema"].is_object());
             assert!(tool["outputSchema"].is_object());
@@ -1040,7 +1203,11 @@ mod tests {
                 "stage_proposal_ops",
                 "submit_proposal",
                 "list_proposals",
-                "render_view"
+                "render_view",
+                "list_requests",
+                "ack_request",
+                "reply_request",
+                "get_activity_feed"
             ]
         );
     }
@@ -1717,14 +1884,16 @@ mod tests {
         let mut server = server();
         let response = call(&mut server, 5, "resources/list", json!({}));
         let resources = response["result"]["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 7);
+        assert_eq!(resources.len(), 9);
         assert_eq!(resources[0]["uri"], "keep://castle/document");
         assert_eq!(resources[1]["uri"], "keep://castle/save");
         assert_eq!(resources[1]["mimeType"], "application/json");
         assert_eq!(resources[2]["mimeType"], "image/svg+xml");
         assert_eq!(resources[4]["uri"], "keep://castle/assessment");
-        assert_eq!(resources[5]["uri"], "keep://styles/edwardian_welsh");
-        assert_eq!(resources[6]["uri"], "keep://styles/baltic_brick");
+        assert_eq!(resources[5]["uri"], "keep://session/requests");
+        assert_eq!(resources[6]["uri"], "keep://session/activity");
+        assert_eq!(resources[7]["uri"], "keep://styles/edwardian_welsh");
+        assert_eq!(resources[8]["uri"], "keep://styles/baltic_brick");
         assert_eq!(resources[4]["mimeType"], "application/json");
 
         let document = call(
@@ -2435,6 +2604,229 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Request inbox and activity feed (M2.2 wave 2a)
+    // -------------------------------------------------------------------
+
+    fn request_server() -> (McpServer, String) {
+        let mut server = proposal_server(AgentPermission::DirectEdit);
+        let request = server
+            .session
+            .submit_request(
+                AuthorId::player("alex").expect("player id"),
+                "Add a tower",
+                None,
+                None,
+            )
+            .expect("request submitted");
+        (server, request.id)
+    }
+
+    fn request_json(id: &str, status: &str) -> Value {
+        json!({
+            "id": id,
+            "author": { "kind": "player", "id": "alex" },
+            "prompt": "Add a tower",
+            "proposal_id": null,
+            "pinned_element_id": null,
+            "status": status,
+            "claimed_by": null,
+            "reply": null,
+            "created_seq": 1
+        })
+    }
+
+    #[test]
+    fn list_requests_returns_the_session_inbox() {
+        let (mut server, id) = request_server();
+        let listed = structured(&mut server, "list_requests", json!({}));
+        assert_eq!(listed["count"], 1);
+        let request = &listed["requests"][0];
+        assert_eq!(request["id"], id);
+        assert_eq!(request["status"], "open");
+        assert_eq!(request["prompt"], "Add a tower");
+        assert_eq!(request["author"]["kind"], "player");
+        assert_eq!(request["author"]["id"], "alex");
+        assert_eq!(request["claimed_by"], Value::Null);
+        assert_eq!(request["reply"], Value::Null);
+    }
+
+    #[test]
+    fn ack_request_claims_an_open_request_once() {
+        let (mut server, id) = request_server();
+        let acked = structured(&mut server, "ack_request", json!({ "request_id": id }));
+        assert_eq!(acked["request"]["id"], id);
+        assert_eq!(acked["request"]["status"], "acknowledged");
+        assert_eq!(acked["request"]["claimed_by"], OFFLINE_AUTHOR_ID);
+
+        let message = tool_error_message(&mut server, "ack_request", json!({ "request_id": id }));
+        assert!(
+            message.contains("not in a valid state"),
+            "second ack must be refused: {message}"
+        );
+
+        let message = tool_error_message(
+            &mut server,
+            "ack_request",
+            json!({ "request_id": "req_9999" }),
+        );
+        assert!(message.contains("unknown request"), "got {message}");
+
+        let message = tool_error_message(&mut server, "ack_request", json!({}));
+        assert!(message.contains("invalid arguments"), "got {message}");
+    }
+
+    #[test]
+    fn reply_request_resolves_with_an_optional_reply() {
+        let (mut server, first) = request_server();
+        let second = server
+            .session
+            .submit_request(
+                AuthorId::player("alex").expect("player id"),
+                "Add a chapel",
+                None,
+                None,
+            )
+            .expect("second request")
+            .id;
+
+        let resolved = structured(
+            &mut server,
+            "reply_request",
+            json!({ "request_id": first, "reply": "On it" }),
+        );
+        assert_eq!(resolved["request"]["status"], "resolved");
+        assert_eq!(resolved["request"]["reply"], "On it");
+        assert_eq!(resolved["request"]["claimed_by"], OFFLINE_AUTHOR_ID);
+
+        let resolved = structured(
+            &mut server,
+            "reply_request",
+            json!({ "request_id": second }),
+        );
+        assert_eq!(resolved["request"]["status"], "resolved");
+        assert_eq!(resolved["request"]["reply"], Value::Null);
+
+        let message =
+            tool_error_message(&mut server, "reply_request", json!({ "request_id": first }));
+        assert!(message.contains("not in a valid state"), "got {message}");
+
+        let message = tool_error_message(
+            &mut server,
+            "reply_request",
+            json!({ "request_id": "req_9999", "reply": "Nope" }),
+        );
+        assert!(message.contains("unknown request"), "got {message}");
+    }
+
+    #[test]
+    fn get_activity_feed_records_offline_tool_calls_and_honours_limit() {
+        let (mut server, _) = request_server();
+        structured(&mut server, "get_castle", json!({}));
+        structured(&mut server, "list_elements", json!({}));
+        structured(&mut server, "render_plan", json!({}));
+        structured(&mut server, "get_assessment", json!({}));
+
+        let feed = structured(&mut server, "get_activity_feed", json!({}));
+        assert!(feed["count"].as_u64().unwrap() >= 5, "feed: {feed}");
+        let actions: Vec<&str> = feed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["action"].as_str().unwrap())
+            .collect();
+        assert!(actions.contains(&"request_submitted"));
+        assert!(actions.contains(&"get_castle"));
+        assert!(actions.contains(&"list_elements"));
+        assert!(actions.contains(&"render_plan"));
+        assert!(actions.contains(&"get_assessment"));
+        assert!(feed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| [
+                "get_castle",
+                "list_elements",
+                "render_plan",
+                "get_assessment"
+            ]
+            .contains(&entry["action"].as_str().unwrap()))
+            .all(|entry| entry["actor"] == OFFLINE_ACTOR_ID));
+        let seqs: Vec<u64> = feed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["seq"].as_u64().unwrap())
+            .collect();
+        assert!(
+            seqs.windows(2).all(|pair| pair[0] < pair[1]),
+            "feed must stay chronological: {seqs:?}"
+        );
+
+        let limited = structured(&mut server, "get_activity_feed", json!({ "limit": 2 }));
+        assert_eq!(limited["count"], 2);
+        assert_eq!(limited["entries"].as_array().unwrap().len(), 2);
+        let limited_seqs: Vec<u64> = limited["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["seq"].as_u64().unwrap())
+            .collect();
+        assert!(
+            limited_seqs[0] < limited_seqs[1],
+            "limited feed must be oldest-first: {limited_seqs:?}"
+        );
+        assert_eq!(
+            limited["entries"][1],
+            feed["entries"].as_array().unwrap().last().unwrap().clone()
+        );
+
+        let empty = structured(&mut server, "get_activity_feed", json!({ "limit": 0 }));
+        assert_eq!(empty["count"], 0);
+        assert!(empty["entries"].as_array().unwrap().is_empty());
+
+        let message = tool_error_message(&mut server, "get_activity_feed", json!({ "limit": -1 }));
+        assert!(message.contains("invalid arguments"), "got {message}");
+
+        let clamped = structured(&mut server, "get_activity_feed", json!({ "limit": 10_000 }));
+        assert!(clamped["count"].as_u64().unwrap() <= 200);
+    }
+
+    #[test]
+    fn session_resources_serve_requests_and_activity() {
+        let (mut server, id) = request_server();
+        structured(&mut server, "get_castle", json!({}));
+
+        let response = call(
+            &mut server,
+            40,
+            "resources/read",
+            json!({ "uri": "keep://session/requests" }),
+        );
+        let contents = &response["result"]["contents"][0];
+        assert_eq!(contents["mimeType"], "application/json");
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["requests"][0]["id"], id);
+        assert_eq!(parsed["requests"][0]["status"], "open");
+
+        let response = call(
+            &mut server,
+            41,
+            "resources/read",
+            json!({ "uri": "keep://session/activity" }),
+        );
+        let contents = &response["result"]["contents"][0];
+        assert_eq!(contents["mimeType"], "application/json");
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert!(parsed["count"].as_u64().unwrap() >= 2);
+        assert!(parsed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["action"] == "get_castle"));
+    }
+
+    // -------------------------------------------------------------------
     // Live HTTP JSON-RPC mode
     // -------------------------------------------------------------------
 
@@ -2732,6 +3124,149 @@ mod tests {
         assert!(requests[0].contains("\"method\":\"get_castle\""));
         assert!(requests[1].contains("\"method\":\"render_plan\""));
         assert!(requests[1].contains("top_plan"));
+    }
+
+    #[test]
+    fn live_request_and_activity_tools_deserialize_typed_responses() {
+        let mut acked = request_json("req_0001", "acknowledged");
+        acked["claimed_by"] = json!("mcp-offline");
+        let mut resolved = request_json("req_0001", "resolved");
+        resolved["claimed_by"] = json!("mcp-offline");
+        resolved["reply"] = json!("Done");
+
+        let mock = spawn_mock(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "count": 1, "requests": [request_json("req_0001", "open")] }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": { "request": acked }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": { "request": resolved }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {
+                    "count": 1,
+                    "entries": [{
+                        "seq": 0,
+                        "timestamp_ms": 1_000,
+                        "actor": "host",
+                        "action": "request_submitted",
+                        "detail": "req_0001"
+                    }]
+                }
+            }),
+        ]);
+        let requests = Arc::clone(&mock.requests);
+        let mut server = McpServer::live(&mock.url, "token", AgentPermission::DirectEdit).unwrap();
+
+        let listed = structured(&mut server, "list_requests", json!({}));
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["requests"][0]["id"], "req_0001");
+
+        let acked = structured(
+            &mut server,
+            "ack_request",
+            json!({ "request_id": "req_0001" }),
+        );
+        assert_eq!(acked["request"]["status"], "acknowledged");
+        assert_eq!(acked["request"]["claimed_by"], "mcp-offline");
+
+        let resolved = structured(
+            &mut server,
+            "reply_request",
+            json!({ "request_id": "req_0001", "reply": "Done" }),
+        );
+        assert_eq!(resolved["request"]["status"], "resolved");
+        assert_eq!(resolved["request"]["reply"], "Done");
+
+        let feed = structured(&mut server, "get_activity_feed", json!({ "limit": 5 }));
+        assert_eq!(feed["count"], 1);
+        assert_eq!(feed["entries"][0]["action"], "request_submitted");
+
+        mock.finish();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        let methods: Vec<&str> = [
+            "list_requests",
+            "ack_request",
+            "reply_request",
+            "get_activity_feed",
+        ]
+        .to_vec();
+        for (request, method) in requests.iter().zip(methods) {
+            assert!(
+                request.contains(&format!("\"method\":\"{method}\"")),
+                "expected {method} in {request}"
+            );
+        }
+        assert!(requests[2].contains("\"reply\":\"Done\""));
+        assert!(requests[3].contains("\"limit\":5"));
+    }
+
+    #[test]
+    fn live_session_resources_forward_to_the_game() {
+        let mock = spawn_mock(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "count": 1, "requests": [request_json("req_0001", "open")] }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "count": 1,
+                    "entries": [{
+                        "seq": 0,
+                        "timestamp_ms": 1_000,
+                        "actor": "host",
+                        "action": "request_submitted",
+                        "detail": "req_0001"
+                    }]
+                }
+            }),
+        ]);
+        let requests = Arc::clone(&mock.requests);
+        let mut server = McpServer::live(&mock.url, "token", AgentPermission::DirectEdit).unwrap();
+
+        let response = call(
+            &mut server,
+            50,
+            "resources/read",
+            json!({ "uri": "keep://session/requests" }),
+        );
+        let contents = &response["result"]["contents"][0];
+        assert_eq!(contents["mimeType"], "application/json");
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["requests"][0]["id"], "req_0001");
+
+        let response = call(
+            &mut server,
+            51,
+            "resources/read",
+            json!({ "uri": "keep://session/activity" }),
+        );
+        let contents = &response["result"]["contents"][0];
+        assert_eq!(contents["mimeType"], "application/json");
+        let parsed: Value = serde_json::from_str(contents["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["entries"][0]["action"], "request_submitted");
+
+        mock.finish();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("\"method\":\"list_requests\""));
+        assert!(requests[1].contains("\"method\":\"get_activity_feed\""));
     }
 
     #[test]

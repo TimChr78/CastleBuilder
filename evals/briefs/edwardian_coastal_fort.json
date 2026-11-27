@@ -1,0 +1,196 @@
+{
+  "id": "edwardian_coastal_fort",
+  "title": "Edwardian Coastal Headland Fort",
+  "description": "A late-thirteenth-century Edwardian Welsh stone fortress on a coastal headland: a rectangular curtain enclosure with corner drum towers, a twin-tower gatehouse, arrow loops, a tall keep, and a domestic courtyard with great hall, chapel and kitchen ranges, protected by an approach ditch.",
+  "style_id": "edwardian_welsh",
+  "site_id": "coastal_headland",
+  "prompt": "You are a master mason serving Edward I in Wales. On the coastal headland, enclose a bailey with a battered stone curtain and four round corner drum towers. Place a twin-tower gatehouse in the south curtain, pierce the curtains with splayed arrow loops, and raise a tall square keep with the lord's apartments. Around the courtyard add a great hall, a chapel range and a kitchen range under pitched roofs. Cut a wide approach ditch across the landward side. Keep every wall thick enough and battered, and leave the gate passage clear.",
+  "thresholds": {
+    "min_structure_score": 100,
+    "min_historian_score": 85,
+    "max_structure_errors": 0,
+    "min_elements": 14,
+    "require_svg_plan": true
+  },
+  "reference_steps": [
+    {
+      "tool": "apply_operations",
+      "arguments": {
+        "operations": [
+          {
+            "op": "create_wall_run",
+            "ref_id": "south",
+            "name": "South curtain",
+            "start_mm": [-18000, -14000],
+            "end_mm": [18000, -14000],
+            "height_mm": 9000,
+            "thickness_mm": 2200,
+            "batter_mm": 900
+          },
+          {
+            "op": "create_wall_run",
+            "ref_id": "east",
+            "name": "East curtain",
+            "start_mm": [18000, -14000],
+            "end_mm": [18000, 14000],
+            "height_mm": 9000,
+            "thickness_mm": 2200,
+            "batter_mm": 900
+          },
+          {
+            "op": "create_wall_run",
+            "ref_id": "north",
+            "name": "North curtain",
+            "start_mm": [18000, 14000],
+            "end_mm": [-18000, 14000],
+            "height_mm": 9000,
+            "thickness_mm": 2200,
+            "batter_mm": 900
+          },
+          {
+            "op": "create_wall_run",
+            "ref_id": "west",
+            "name": "West curtain",
+            "start_mm": [-18000, 14000],
+            "end_mm": [-18000, -14000],
+            "height_mm": 9000,
+            "thickness_mm": 2200,
+            "batter_mm": 900
+          },
+          {
+            "op": "create_gatehouse",
+            "ref_id": "gate",
+            "name": "South gatehouse",
+            "centre_mm": [0, -14000],
+            "orientation_deg": 90,
+            "passage_width_mm": 3200,
+            "height_mm": 14000,
+            "tower_radius_mm": 3400
+          },
+          {
+            "op": "create_tower",
+            "ref_id": "sw",
+            "name": "South-west drum",
+            "centre_mm": [-18000, -14000],
+            "radius_mm": 3400,
+            "height_mm": 13000,
+            "batter_mm": 600
+          },
+          {
+            "op": "create_tower",
+            "ref_id": "se",
+            "name": "South-east drum",
+            "centre_mm": [18000, -14000],
+            "radius_mm": 3400,
+            "height_mm": 13000,
+            "batter_mm": 600
+          },
+          {
+            "op": "create_tower",
+            "ref_id": "ne",
+            "name": "North-east drum",
+            "centre_mm": [18000, 14000],
+            "radius_mm": 3400,
+            "height_mm": 13000,
+            "batter_mm": 600
+          },
+          {
+            "op": "create_tower",
+            "ref_id": "nw",
+            "name": "North-west drum",
+            "centre_mm": [-18000, 14000],
+            "radius_mm": 3400,
+            "height_mm": 13000,
+            "batter_mm": 600
+          },
+          {
+            "op": "create_keep",
+            "ref_id": "keep",
+            "name": "High keep",
+            "centre_mm": [0, -2000],
+            "width_mm": 14000,
+            "depth_mm": 12000,
+            "height_mm": 22000,
+            "wall_thickness_mm": 2600,
+            "batter_mm": 450,
+            "plinth_height_mm": 700
+          },
+          {
+            "op": "create_range",
+            "ref_id": "hall",
+            "name": "Great hall",
+            "kind": "hall",
+            "centre_mm": [0, 9000],
+            "length_mm": 18000,
+            "width_mm": 8500,
+            "wall_height_mm": 7500,
+            "roof_pitch_deg": 42
+          },
+          {
+            "op": "create_range",
+            "ref_id": "chapel",
+            "name": "Chapel range",
+            "kind": "chapel",
+            "centre_mm": [9000, 0],
+            "length_mm": 10000,
+            "width_mm": 5500,
+            "wall_height_mm": 6500,
+            "roof_pitch_deg": 46,
+            "orientation_deg": 90
+          },
+          {
+            "op": "create_range",
+            "ref_id": "kitchen",
+            "name": "Kitchen range",
+            "kind": "kitchen",
+            "centre_mm": [-9000, 0],
+            "length_mm": 9000,
+            "width_mm": 5000,
+            "wall_height_mm": 6000,
+            "roof_pitch_deg": 40,
+            "orientation_deg": 90
+          },
+          {
+            "op": "create_ditch",
+            "ref_id": "ditch",
+            "name": "Approach ditch",
+            "start_mm": [-24000, -22000],
+            "end_mm": [24000, -22000],
+            "width_mm": 6000,
+            "depth_mm": 2600
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "south",
+            "t_permille": 300,
+            "sill_height_mm": 1800
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "south",
+            "t_permille": 700,
+            "sill_height_mm": 1800
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "east",
+            "t_permille": 500,
+            "sill_height_mm": 1800
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "north",
+            "t_permille": 400,
+            "sill_height_mm": 1800
+          },
+          {
+            "op": "add_arrow_loop",
+            "wall_ref": "west",
+            "t_permille": 600,
+            "sill_height_mm": 1800
+          }
+        ]
+      }
+    }
+  ]
+}

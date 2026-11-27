@@ -27,12 +27,13 @@ Keepwright ships only procedural, self-made, MIT, CC0-1.0, or CC-BY-4.0 assets. 
 | coastal_headland.json | `sites/coastal_headland.json` | TimChr78 | self-made | [github.com/TimChr78/CastleBuilder](https://github.com/TimChr78/CastleBuilder) |
 | lake_island.json | `sites/lake_island.json` | TimChr78 | self-made | [github.com/TimChr78/CastleBuilder](https://github.com/TimChr78/CastleBuilder) |
 | m0a_promontory.json | `sites/m0a_promontory.json` | TimChr78 | self-made | [github.com/TimChr78/CastleBuilder](https://github.com/TimChr78/CastleBuilder) |
+| baltic_brick.json | `styles/baltic_brick.json` | TimChr78 | self-made | [github.com/TimChr78/CastleBuilder](https://github.com/TimChr78/CastleBuilder) |
 | edwardian_welsh.json | `styles/edwardian_welsh.json` | TimChr78 | self-made | [github.com/TimChr78/CastleBuilder](https://github.com/TimChr78/CastleBuilder) |
 
 ## Licence summary
 
 | Licence | Shipped entries |
 | --- | ---: |
-| self-made | 8 |
+| self-made | 9 |
 
 Manifest schema version 1.

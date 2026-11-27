@@ -133,7 +133,7 @@ fn offline_binary_completes_a_full_mcp_session() {
     assert_eq!(responses[0]["result"]["serverInfo"]["name"], "keep-mcp");
     assert_eq!(
         responses[1]["result"]["tools"].as_array().unwrap().len(),
-        15
+        19
     );
 
     let castle = &responses[2]["result"]["structuredContent"];
@@ -161,6 +161,90 @@ fn offline_binary_completes_a_full_mcp_session() {
     assert_eq!(history["entries"][1]["seq"], 2);
     assert_eq!(history["entries"][1]["summary"], "Undo command #1");
     assert_eq!(history["entries"][1]["undone"], false);
+}
+
+#[test]
+fn offline_binary_serves_the_request_inbox_and_activity_feed() {
+    let mut child = spawn(&["--offline"]);
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "get_castle", "arguments": {} }
+        }),
+    );
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "get_activity_feed", "arguments": { "limit": 5 } }
+        }),
+    );
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "list_requests", "arguments": {} }
+        }),
+    );
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "resources/read",
+            "params": { "uri": "keep://session/requests" }
+        }),
+    );
+    write_line(
+        &mut child,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "resources/read",
+            "params": { "uri": "keep://session/activity" }
+        }),
+    );
+
+    drop(child.stdin.take());
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let responses: Vec<Value> = BufReader::new(stdout)
+        .lines()
+        .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+        .collect();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(responses.len(), 5, "responses: {responses:#?}");
+
+    let feed = &responses[1]["result"]["structuredContent"];
+    assert!(feed["count"].as_u64().unwrap() >= 2);
+    assert!(feed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["action"] == "get_castle" && entry["actor"] == "agent:mcp-offline"));
+
+    let listed = &responses[2]["result"]["structuredContent"];
+    assert_eq!(listed["count"], 0);
+    assert_eq!(listed["requests"], json!([]));
+
+    let requests = &responses[3]["result"]["contents"][0];
+    let parsed: Value = serde_json::from_str(requests["text"].as_str().unwrap()).unwrap();
+    assert_eq!(parsed["count"], 0);
+
+    let activity = &responses[4]["result"]["contents"][0];
+    let parsed: Value = serde_json::from_str(activity["text"].as_str().unwrap()).unwrap();
+    assert!(parsed["count"].as_u64().unwrap() >= 1);
+    assert!(parsed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["action"] == "get_castle"));
 }
 
 #[test]
