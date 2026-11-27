@@ -44,6 +44,10 @@ uniform float grain_strength : hint_range(0.0, 1.0) = 0.28;
 uniform float weathering_strength : hint_range(0.0, 2.0) = 0.80;
 uniform float sky_fill_strength : hint_range(0.0, 2.0) = 0.60;
 uniform float bounce_strength : hint_range(0.0, 2.0) = 0.45;
+// Ground level for the wet/damp course at the foot of the wall (metres).
+uniform float wet_base_y : hint_range(-50.0, 100.0) = 0.0;
+// Height over which dampness and moss fade out above the base (metres).
+uniform float damp_height : hint_range(0.2, 8.0) = 2.2;
 
 // --- LOD shells --------------------------------------------------------
 // LOD1/LOD2 are single quads per element face whose UV spans the whole face,
@@ -110,6 +114,31 @@ float fbm3(vec3 p) {
 	return sum;
 }
 
+// Gentle weathering shared by both LOD pipelines:
+//   * damp darkening in the lowest ~2 m, strongest where the wall meets soil;
+//   * a cool, faintly mossy cast on north-facing masonry;
+//   * a warm fresh-mortar blush just behind the active construction lift.
+vec3 weathered_stone(vec3 albedo, vec3 wp, vec3 wn, float fresh_lift) {
+	float above_base = max(wp.y - wet_base_y, 0.0);
+	float damp = 1.0 - smoothstep(0.0, damp_height, above_base);
+	float north = smoothstep(0.0, 0.75, -wn.z);
+	float moss = damp * north;
+
+	albedo *= 1.0 - damp * 0.15 * weathering_strength;
+	albedo = mix(
+		albedo,
+		albedo * vec3(0.86, 0.97, 0.90),
+		north * 0.30 * weathering_strength
+	);
+	albedo *= 1.0 - moss * 0.10 * weathering_strength;
+	albedo = mix(
+		albedo,
+		albedo * vec3(1.05, 1.01, 0.95) + vec3(0.045, 0.040, 0.030),
+		fresh_lift * 0.60
+	);
+	return albedo;
+}
+
 void vertex() {
 	// Chunk meshes arrive in world space and instances stay at the identity
 	// transform, so VERTEX is already in world coordinates here.
@@ -132,6 +161,15 @@ void vertex() {
 }
 
 void fragment() {
+	// Narrow warm band of freshly laid mortar just behind the active lift.
+	// Disabled as soon as the build finishes so the completed wall reads calm.
+	float block_index = v_custom.r;
+	float fresh_lift = 0.0;
+	if (build_front < 0.995) {
+		float behind = build_front - block_index;
+		fresh_lift = (1.0 - smoothstep(0.0, 0.08, behind)) * step(0.0, behind);
+	}
+
 	if (lod_level >= 1) {
 		// --- World-space coursed ashlar for simplified LOD shells ---------
 		vec3 wp = v_world_pos;
@@ -218,6 +256,7 @@ void fragment() {
 
 		vec3 joint = mortar_color.rgb * (0.85 + 0.30 * patches);
 		vec3 albedo = mix(stone, joint, mortar * 0.92);
+		albedo = weathered_stone(albedo, wp, wn, fresh_lift);
 
 		ALBEDO = albedo;
 		ROUGHNESS = clamp(
@@ -255,8 +294,34 @@ void fragment() {
 	vec2 edge_m = edge_uv * block_size_m;
 	float edge_distance = min(edge_m.x, edge_m.y);
 
-	float mortar = 1.0 - smoothstep(0.0, mortar_width, edge_distance);
-	float bevel = 1.0 - smoothstep(0.0, bevel_width, edge_distance);
+	// Analytical band-limiting. fwidth() gives the UV footprint of one pixel;
+	// multiplying by the block size converts it to metres. At grazing angles and
+	// 40-90 m the joint/bevel/grain features fall below a pixel, so they fade to
+	// their mean instead of shimmering (the same contract LOD1 enforces).
+	vec2 uv_footprint = vec2(
+		length(vec2(dFdx(uv.x), dFdy(uv.x))),
+		length(vec2(dFdx(uv.y), dFdy(uv.y)))
+	);
+	vec2 aa_m = max(uv_footprint * block_size_m, vec2(1e-5));
+	float aa_edge = max(aa_m.x, aa_m.y);
+
+	float mortar_visible = 1.0 - smoothstep(
+		1.0, 3.0, aa_edge / max(mortar_width, 1e-5)
+	);
+	// Widening the transition by the pixel footprint keeps the joint's true
+	// width up close while averaging it away once it falls below a pixel.
+	float mortar = 1.0 - smoothstep(
+		max(mortar_width - aa_edge, 0.0),
+		mortar_width + aa_edge,
+		edge_distance
+	);
+	mortar *= mortar_visible;
+
+	float bevel_visible = 1.0 - smoothstep(
+		0.35, 1.0, aa_edge / max(bevel_width, 1e-5)
+	);
+	float bevel = 1.0 - smoothstep(0.0, max(bevel_width, aa_edge), edge_distance);
+	bevel *= bevel_visible;
 
 	// Derivative tangent frame (Mikkelsen-style) so bevel normals work even
 	// though chunk meshes deliberately omit tangents.
@@ -286,11 +351,21 @@ void fragment() {
 
 	// --- Procedural limestone grain, mottling and weathering streaks ---
 	vec3 wp = v_world_pos;
+	vec3 wn = normalize(v_world_normal);
 	float grain = fbm3(wp * grain_scale);
 	float patches = fbm3(wp * (grain_scale * 0.17) + vec3(7.1, 3.7, 11.3));
 	float streak_field = fbm3(vec3(wp.x * 1.8, wp.y * 0.22, wp.z * 1.8) + 5.0);
 	float age = clamp(v_color.b, 0.0, 1.0);
 	float streaks = smoothstep(0.48, 0.86, streak_field) * (0.35 + age * 0.65);
+
+	// Band-limit the procedural fields: once one grain cell (or mottling cell)
+	// covers less than a few pixels, blend it back to its mean value. This is
+	// what kills the moiré shimmer on distant/grazing LOD0 faces.
+	float grain_aa = aa_edge * grain_scale;
+	float grain_visible = 1.0 - smoothstep(0.20, 0.60, grain_aa);
+	float grain_mix = mix(0.5, grain, grain_visible);
+	float patch_aa = aa_edge * grain_scale * 0.17;
+	float patches_mix = mix(0.5, patches, 1.0 - smoothstep(0.50, 1.50, patch_aa));
 
 	// --- Per-vertex data ---
 	float baked_ao = clamp(v_color.r, 0.0, 1.0);
@@ -300,15 +375,16 @@ void fragment() {
 	vec3 stone = mix(stone_cool.rgb, stone_warm.rgb, smoothstep(0.12, 0.92, tint));
 	stone = mix(stone_light.rgb, stone, 0.55);
 	stone *= 1.0 + (seed - 0.5) * 0.12;
-	stone *= mix(1.0, 0.78 + 0.42 * grain, grain_strength);
+	stone *= mix(1.0, 0.78 + 0.42 * grain_mix, grain_strength);
 	stone *= mix(vec3(1.0), vec3(0.86, 0.90, 0.80), age * 0.55);
 	stone *= 1.0 - streaks * 0.32 * weathering_strength;
 
-	vec3 joint = mortar_color.rgb * (0.85 + 0.30 * patches);
+	vec3 joint = mortar_color.rgb * (0.85 + 0.30 * patches_mix);
 	vec3 albedo = mix(stone, joint, mortar * 0.92);
+	albedo = weathered_stone(albedo, wp, wn, fresh_lift);
 
 	ALBEDO = albedo;
-	ROUGHNESS = clamp(0.58 + 0.16 * grain + 0.18 * mortar + 0.12 * age - streaks * 0.10 * weathering_strength, 0.0, 1.0);
+	ROUGHNESS = clamp(0.58 + 0.16 * grain_mix + 0.18 * mortar + 0.12 * age - streaks * 0.10 * weathering_strength, 0.0, 1.0);
 	SPECULAR = 0.32;
 	METALLIC = 0.0;
 
@@ -319,7 +395,6 @@ void fragment() {
 	AO_LIGHT_AFFECT = 0.35;
 
 	// --- Sky fill + warm directional bounce (no dynamic GI needed) ---
-	vec3 wn = normalize(v_world_normal);
 	float up = clamp(wn.y * 0.5 + 0.5, 0.0, 1.0);
 	float sky_vis = mix(0.35, 1.0, up);
 	float sun_facing = clamp(dot(wn, normalize(sun_bounce_dir)), 0.0, 1.0);

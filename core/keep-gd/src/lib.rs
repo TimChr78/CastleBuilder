@@ -55,7 +55,7 @@ const DEMO_AGENT_ID: &str = "mason";
 /// What executing one control request produced.
 enum ControlOutcome {
     Reply(Value),
-    RenderView(i64),
+    RenderView(i64, keep_proto::RenderViewRequest),
 }
 
 /// The only class the game needs for M0a/M0b.
@@ -529,6 +529,7 @@ impl KeepBridge {
         let mut dirty = false;
         let mut proposals_changed = false;
         let mut render_view_request_id: i64 = -1;
+        let mut render_view_options: Option<VarDictionary> = None;
 
         loop {
             let Some(request) = self
@@ -569,7 +570,7 @@ impl KeepBridge {
                 Ok(ControlOutcome::Reply(value)) => {
                     let _ = reply.send(RpcReply::Ok(value));
                 }
-                Ok(ControlOutcome::RenderView(request_id)) => {
+                Ok(ControlOutcome::RenderView(request_id, view_req)) => {
                     if self.pending_render_view.is_some() {
                         let _ = reply.send(RpcReply::Err(RpcError::new(
                             -32_000,
@@ -578,6 +579,17 @@ impl KeepBridge {
                     } else {
                         self.pending_render_view = Some((request_id, reply));
                         render_view_request_id = request_id;
+                        let mut opts = VarDictionary::new();
+                        if let Some(yaw) = view_req.yaw_deg {
+                            opts.set("yaw_deg", f64::from(yaw));
+                        }
+                        if let Some(pitch) = view_req.pitch_deg {
+                            opts.set("pitch_deg", f64::from(pitch));
+                        }
+                        if let Some(dist) = view_req.distance_m {
+                            opts.set("distance_m", f64::from(dist));
+                        }
+                        render_view_options = Some(opts);
                     }
                 }
                 Err(error) => {
@@ -590,6 +602,9 @@ impl KeepBridge {
         result.set("dirty", dirty);
         result.set("proposals_changed", proposals_changed);
         result.set("render_view_request_id", render_view_request_id);
+        if let Some(opts) = render_view_options {
+            result.set("render_view", &opts);
+        }
         result
     }
 
@@ -1014,9 +1029,20 @@ impl KeepBridge {
                 json!({ "count": entries.len(), "entries": entries })
             }
             "render_view" => {
+                let view_req: keep_proto::RenderViewRequest = if params.is_null() {
+                    keep_proto::RenderViewRequest {
+                        yaw_deg: None,
+                        pitch_deg: None,
+                        distance_m: None,
+                    }
+                } else {
+                    serde_json::from_value(params.clone()).map_err(|err| {
+                        RpcError::new(-32_602, format!("invalid render_view params: {err}"))
+                    })?
+                };
                 let request_id = self.next_render_view_id;
                 self.next_render_view_id += 1;
-                return Ok(ControlOutcome::RenderView(request_id));
+                return Ok(ControlOutcome::RenderView(request_id, view_req));
             }
             other => return Err(RpcError::new(-32_601, format!("unknown method '{other}'"))),
         };

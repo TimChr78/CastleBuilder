@@ -6,6 +6,10 @@ extends Camera3D
 ## It also exposes a helper that retunes the directional-light shadow cascades
 ## from camera altitude, so panoramas and close-ups both get crisp shadows.
 
+## Emitted when the user takes manual control during a scripted orbit, so
+## main.gd can stop its time-lapse replay cleanly.
+signal auto_orbit_cancelled()
+
 @export var orbit_sensitivity := 0.0045
 @export var pan_sensitivity := 1.0
 @export var zoom_step := 0.86
@@ -45,6 +49,9 @@ var _home_distance := HOME_DISTANCE
 var _drag_mode := 0 # 0 = none, 1 = orbit, 2 = pan
 var _drag_button := 0
 
+# Scripted time-lapse orbit: rad/s applied to yaw while non-zero.
+var _auto_orbit_speed := 0.0
+
 # Shadow cascades are only retuned when the view changes enough to matter;
 # otherwise tiny per-frame altitude changes make the shadow map shimmer.
 # A 15% hysteresis plus coarse 25 m span quantisation means orbiting and
@@ -79,10 +86,36 @@ func focus_on(point: Vector3, distance := -1.0) -> void:
 ## Re-frame the camera to the most recent site/castle framing and the default
 ## orbit orientation. Bound to Home.
 func reset_view() -> void:
+	_cancel_auto_orbit()
 	_target_focus = _home_focus
 	_target_distance = _home_distance
 	_target_yaw = HOME_YAW
 	_target_pitch = HOME_PITCH
+
+
+## Begin a scripted orbit. main.gd's time-lapse replay uses ~0.28 rad/s.
+func start_auto_orbit(rad_per_sec: float) -> void:
+	_auto_orbit_speed = rad_per_sec
+
+
+func stop_auto_orbit() -> void:
+	_auto_orbit_speed = 0.0
+
+
+func is_auto_orbiting() -> bool:
+	return not is_zero_approx(_auto_orbit_speed)
+
+
+## Snap to an explicit orbit for clean `render_view` captures. Angles in
+## degrees; NAN or a non-positive distance keeps the current value.
+func set_orbit_view(yaw_deg: float, pitch_deg: float, distance_m: float) -> void:
+	if is_finite(yaw_deg):
+		_target_yaw = deg_to_rad(yaw_deg)
+	if is_finite(pitch_deg):
+		_target_pitch = clampf(deg_to_rad(pitch_deg), min_pitch, max_pitch)
+	if distance_m > 0.0:
+		_target_distance = clampf(distance_m, min_distance, max_distance)
+	_sync_immediate()
 
 
 func _keyboard_allowed() -> bool:
@@ -105,6 +138,9 @@ func _process(delta: float) -> void:
 	if _keyboard_allowed():
 		_handle_keyboard_navigation(delta)
 
+	if not is_zero_approx(_auto_orbit_speed):
+		_target_yaw += _auto_orbit_speed * delta
+
 	var t := 1.0 - exp(-smoothing * delta)
 	_yaw = lerp_angle(_yaw, _target_yaw, t)
 	_pitch = lerpf(_pitch, _target_pitch, t)
@@ -119,7 +155,13 @@ func _apply_transform() -> void:
 		sin(_pitch),
 		cos(_pitch) * cos(_yaw)
 	)
-	global_position = _focus + direction * _distance
+	var eye := _focus + direction * _distance
+	# Tests and probes may frame the camera before it enters the SceneTree;
+	# Node3D's global transforms are illegal in that state.
+	if not is_inside_tree():
+		position = eye
+		return
+	global_position = eye
 	look_at(_focus, Vector3.UP)
 
 
@@ -157,7 +199,9 @@ func _handle_keyboard_orbit(delta: float) -> void:
 		yaw_input += 1.0
 	if Input.is_key_pressed(KEY_E):
 		yaw_input -= 1.0
-	_target_yaw += yaw_input * keyboard_orbit_speed * delta
+	if not is_zero_approx(yaw_input):
+		_cancel_auto_orbit()
+		_target_yaw += yaw_input * keyboard_orbit_speed * delta
 
 	var pitch_input := 0.0
 	if Input.is_key_pressed(KEY_R):
@@ -165,6 +209,7 @@ func _handle_keyboard_orbit(delta: float) -> void:
 	if Input.is_key_pressed(KEY_F):
 		pitch_input -= 1.0
 	if not is_zero_approx(pitch_input):
+		_cancel_auto_orbit()
 		_target_pitch = clampf(
 			_target_pitch + pitch_input * keyboard_pitch_speed * delta,
 			min_pitch,
@@ -232,10 +277,19 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and _drag_mode != 0:
 		var motion := event as InputEventMouseMotion
 		if _drag_mode == 1:
+			_cancel_auto_orbit()
 			_target_yaw -= motion.relative.x * orbit_sensitivity
 			_target_pitch = clampf(_target_pitch - motion.relative.y * orbit_sensitivity, min_pitch, max_pitch)
 		else:
 			_pan_screen(motion.relative)
+
+
+## Stop a scripted orbit as soon as the user takes manual control.
+func _cancel_auto_orbit() -> void:
+	if is_zero_approx(_auto_orbit_speed):
+		return
+	_auto_orbit_speed = 0.0
+	auto_orbit_cancelled.emit()
 
 
 func _pan_screen(relative: Vector2) -> void:

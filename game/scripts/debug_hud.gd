@@ -7,6 +7,9 @@ extends CanvasLayer
 
 signal build_front_changed(value: float)
 signal playing_changed(playing: bool)
+signal speed_requested(multiplier: float)
+signal timelapse_requested()
+signal mute_toggled(muted: bool)
 signal mode_requested(mode: String)
 signal site_requested(site_id: String)
 signal tool_requested(tool: String)
@@ -29,6 +32,9 @@ var _warning_label: Label
 var _error_label: Label
 var _slider: HSlider
 var _play_button: Button
+var _speed_buttons: Dictionary = {}
+var _timelapse_button: Button
+var _mute_button: Button
 var _m1_button: Button
 var _showcase_button: Button
 var _m0b_button: Button
@@ -42,6 +48,9 @@ var _assessment_label: Label
 var _assessment_findings: VBoxContainer
 
 var _playing := false
+var _speed_multiplier := 1.0
+var _timelapse_active := false
+var _muted := false
 var _refresh_timer := 0.0
 
 
@@ -205,6 +214,45 @@ func _build_ui() -> void:
 
 	_front_label = _make_stat_label("Build front 100%")
 	column.add_child(_front_label)
+
+	# Construction speed: 30 s / 7.5 s / 1.5 s rises, plus an instant snap.
+	var speed_row := HBoxContainer.new()
+	speed_row.add_theme_constant_override("separation", 6)
+	column.add_child(speed_row)
+
+	var speed_label := Label.new()
+	speed_label.text = "Speed"
+	speed_label.add_theme_font_size_override("font_size", 11)
+	speed_label.add_theme_color_override("font_color", Color(0.62, 0.64, 0.58))
+	speed_row.add_child(speed_label)
+
+	var speed_group := ButtonGroup.new()
+	speed_group.allow_unpress = false
+	for entry in [[1.0, "1×"], [4.0, "4×"], [20.0, "20×"], [0.0, "Instant"]]:
+		var speed_button := Button.new()
+		speed_button.text = entry[1]
+		speed_button.toggle_mode = true
+		speed_button.button_group = speed_group
+		speed_button.focus_mode = Control.FOCUS_NONE
+		speed_button.custom_minimum_size = Vector2(52.0, 0.0)
+		speed_button.pressed.connect(_on_speed_pressed.bind(entry[0]))
+		speed_row.add_child(speed_button)
+		_speed_buttons[float(entry[0])] = speed_button
+	_speed_buttons[1.0].set_pressed_no_signal(true)
+
+	_timelapse_button = Button.new()
+	_timelapse_button.text = "Timelapse"
+	_timelapse_button.toggle_mode = true
+	_timelapse_button.focus_mode = Control.FOCUS_NONE
+	_timelapse_button.pressed.connect(_on_timelapse_pressed)
+	speed_row.add_child(_timelapse_button)
+
+	_mute_button = Button.new()
+	_mute_button.text = "Mute"
+	_mute_button.toggle_mode = true
+	_mute_button.focus_mode = Control.FOCUS_NONE
+	_mute_button.toggled.connect(_on_mute_toggled)
+	speed_row.add_child(_mute_button)
 
 	column.add_child(HSeparator.new())
 
@@ -411,6 +459,41 @@ func set_playing(playing: bool) -> void:
 	_play_button.text = "Pause" if playing else "Play"
 
 
+## Select a construction-speed preset. 0.0 means "Instant" (snap to 1.0).
+func set_speed(multiplier: float) -> void:
+	_speed_multiplier = multiplier
+	var key := float(multiplier)
+	if _speed_buttons.has(key):
+		var button: Button = _speed_buttons[key]
+		button.set_pressed_no_signal(true)
+
+
+func get_speed_multiplier() -> float:
+	return _speed_multiplier
+
+
+func set_timelapse(active: bool) -> void:
+	_timelapse_active = active
+	if _timelapse_button != null:
+		_timelapse_button.set_pressed_no_signal(active)
+		_timelapse_button.text = "Stop Replay" if active else "Timelapse"
+
+
+func is_timelapse_active() -> bool:
+	return _timelapse_active
+
+
+func set_muted(muted: bool) -> void:
+	_muted = muted
+	if _mute_button != null:
+		_mute_button.set_pressed_no_signal(muted)
+		_mute_button.text = "Unmute" if muted else "Mute"
+
+
+func is_muted() -> bool:
+	return _muted
+
+
 func show_error(message: String) -> void:
 	_error_label.text = message
 	_error_label.visible = true
@@ -442,6 +525,21 @@ func _on_play_toggled(pressed: bool) -> void:
 	if pressed and _slider.value >= 0.99:
 		_slider.value = 0.0
 	playing_changed.emit(pressed)
+
+
+func _on_speed_pressed(multiplier: float) -> void:
+	_speed_multiplier = multiplier
+	speed_requested.emit(multiplier)
+
+
+func _on_timelapse_pressed() -> void:
+	timelapse_requested.emit()
+
+
+func _on_mute_toggled(pressed: bool) -> void:
+	_muted = pressed
+	_mute_button.text = "Unmute" if pressed else "Mute"
+	mute_toggled.emit(pressed)
 
 
 func _on_showcase_pressed() -> void:

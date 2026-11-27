@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "path": "game/shaders/masonry.gdshader",
+      "kind": "procedural_shader",
+      "source": "Self-made procedural coursed-ashlar shader with GPU build-front animation, weathering and LOD transitions.",
+      "author": "TimChr78",
+      "licence": "self-made",
+      "url": "https://github.com/TimChr78/CastleBuilder",
+      "shipped": true,
+      "ai_generated": false
+    },
+    {
+      "path": "game/shaders/terrain.gdshader",
+      "kind": "procedural_shader",
+      "source": "Self-made procedural terrain shader with height/slope blending, biome tinting and cliff detail.",
+      "author": "TimChr78",
+      "licence": "self-made",
+      "url": "https://github.com/TimChr78/CastleBuilder",
+      "shipped": true,
+      "ai_generated": false
+    },
+    {
+      "path": "game/shaders/water.gdshader",
+      "kind": "procedural_shader",
+      "source": "Self-made procedural water shader for lake and river surfaces.",
+      "author": "TimChr78",
+      "licence": "self-made",
+      "url": "https://github.com/TimChr78/CastleBuilder",
+      "shipped": true,
+      "ai_generated": false
+    },
+    {
+      "path": "game/scripts/build_audio.gd",
+      "kind": "procedural_audio",
+      "source": "Self-made procedural construction audio synthesised at runtime (stone ticks, placement feedback and zoom-reactive ambience).",
+      "author": "TimChr78",
+      "licence": "self-made",
+      "url": "https://github.com/TimChr78/CastleBuilder",
+      "shipped": true,
+      "ai_generated": false
+    },
+    {
+      "path": "styles/edwardian_welsh.json",
+      "kind": "data_pack",
+      "source": "Self-made Edwardian Welsh (1277-1300) style pack with source notes for Caernarfon, Conwy, Harlech and Beaumaris.",
+      "author": "TimChr78",
+      "licence": "self-made",
+      "url": "https://github.com/TimChr78/CastleBuilder",
+      "shipped": true,
+      "ai_generated": false
+    },
+    {
+      "path": "sites/coastal_headland.json",
+      "kind": "data_pack",
+      "source": "Self-made curated site: steep coastal rock headland with a broad fortified upper shelf.",
+      "author": "TimChr78",
+      "licence": "self-made",
+      "url": "https://github.com/TimChr78/CastleBuilder",
+      "shipped": true,
+      "ai_generated": false
+    },
+    {
+      "path": "sites/lake_island.json",
+      "kind": "data_pack",
+      "source": "Self-made curated site: low limestone island plateau in a shallow lake and moat basin.",
+      "author": "TimChr78",
+      "licence": "self-made",
+      "url": "https://github.com/TimChr78/CastleBuilder",
+      "shipped": true,
+      "ai_generated": false
+    },
+    {
+      "path": "sites/m0a_promontory.json",
+      "kind": "data_pack",
+      "source": "Self-made curated site: broad rock plateau above a river with a steep cliff to a low shelf.",
+      "author": "TimChr78",
+      "licence": "self-made",
+      "url": "https://github.com/TimChr78/CastleBuilder",
+      "shipped": true,
+      "ai_generated": false
+    }
+  ]
+}

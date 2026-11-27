@@ -5,12 +5,15 @@ extends Node
 ## files, no external libraries, no paid samples. Two voices cover the M0b
 ## feel pass:
 ##
-##   play_place_thud(pitch_scale)  — resonant low-mid stone thud on snap/place
-##   play_stone_tick(progress)     — crisp chisel/settle click during build
+##   play_place_thud(pitch_scale)  — soft, low stone thud on snap/place
+##   play_stone_tick(progress)     — gentle damped tap during build
 ##
 ## Ticks are gently detuned by construction progress and attenuated by camera
 ## distance (set_camera_distance) so close inspection sounds intimate while a
-## wide panorama keeps the mix calm. In --headless mode every call is a no-op.
+## wide panorama keeps the mix calm. Every transient runs through a two-stage
+## 1-pole low-pass so it stays warm and tactile rather than buzzy. set_muted()
+## silences the mix (and cuts ringing voices) without touching the generators.
+## In --headless mode every call is a no-op.
 ##
 ## Voices are kept in parallel typed arrays (not per-voice Dictionaries) so the
 ## 22 kHz inner synthesis loop stays fast and allocation-free.
@@ -20,14 +23,19 @@ const INV_MIX_RATE := 1.0 / 22050.0
 const MAX_VOICES := 12
 const TICK_MIN_GAP_MS := 55
 
-const THUD_DURATION := 0.62
-const TICK_DURATION := 0.10
+## Short, percussive envelopes: a soft stone tap and a warm settle tick.
+const THUD_DURATION := 0.30
+const TICK_DURATION := 0.045
+## Deliberately gentle levels; the mix should feel tactile, never loud.
+const THUD_GAIN := 0.18
+const TICK_GAIN := 0.10
 
 const VOICE_THUD := 0
 const VOICE_TICK := 1
 
 var _headless := false
 var _headless_checked := false
+var _muted := false
 var _player: AudioStreamPlayer
 var _generator: AudioStreamGenerator
 var _playback: AudioStreamGeneratorPlayback
@@ -41,6 +49,11 @@ var _voice_duration := PackedFloat32Array()
 var _voice_phase_a := PackedFloat32Array()
 var _voice_phase_b := PackedFloat32Array()
 var _voice_noise := PackedInt32Array()
+# Two cascaded 1-pole low-pass stages per voice keep the synthetic transients
+# warm and tactile instead of buzzy (the coefficient is fixed per voice).
+var _voice_lp := PackedFloat32Array()
+var _voice_lp_coeff := PackedFloat32Array()
+var _voice_lp2 := PackedFloat32Array()
 
 var _camera_distance := 90.0
 var _last_tick_ms := -100000
@@ -79,10 +92,10 @@ func is_headless() -> bool:
 ## element size (bigger element → lower, heavier thud).
 func play_place_thud(pitch_scale: float = 1.0) -> void:
 	_ensure_setup()
-	if _headless or not _ensure_playback():
+	if _headless or _muted or not _ensure_playback():
 		return
 	var attenuation := clampf(120.0 / maxf(_camera_distance + 40.0, 1.0), 0.35, 1.0)
-	_add_voice(VOICE_THUD, 0.62 * attenuation, clampf(pitch_scale, 0.5, 2.0))
+	_add_voice(VOICE_THUD, THUD_GAIN * attenuation, clampf(pitch_scale, 0.5, 2.0))
 	# Fill the generator immediately so the attack transient is not lost to an
 	# underrun on the very first mix callback.
 	_pump_audio(4096)
@@ -92,7 +105,7 @@ func play_place_thud(pitch_scale: float = 1.0) -> void:
 ## 0..1 build front; it nudges the pitch upward as the wall extends.
 func play_stone_tick(progress: float) -> void:
 	_ensure_setup()
-	if _headless:
+	if _headless or _muted:
 		return
 	var now := Time.get_ticks_msec()
 	if now - _last_tick_ms < TICK_MIN_GAP_MS:
@@ -104,8 +117,20 @@ func play_stone_tick(progress: float) -> void:
 	var attenuation := clampf(70.0 / maxf(_camera_distance + 25.0, 1.0), 0.12, 1.0)
 	var pitch := 0.86 + clampf(progress, 0.0, 1.0) * 0.55
 	pitch *= randf_range(0.94, 1.07)
-	_add_voice(VOICE_TICK, 0.30 * attenuation, pitch)
+	_add_voice(VOICE_TICK, TICK_GAIN * attenuation, pitch)
 	_pump_audio(4096)
+
+
+## Mute/unmute all construction audio. Muting also cuts any ringing voices so
+## the transition is immediate and clean.
+func set_muted(muted: bool) -> void:
+	_muted = muted
+	if muted:
+		_clear_voices()
+
+
+func is_muted() -> bool:
+	return _muted
 
 
 ## Zoom-reactive mix control, fed from the orbit camera each frame.
@@ -115,6 +140,11 @@ func set_camera_distance(distance: float) -> void:
 
 func active_voice_count() -> int:
 	return _voice_t.size()
+
+
+func _clear_voices() -> void:
+	for index in range(_voice_t.size() - 1, -1, -1):
+		_remove_voice(index)
 
 
 func _ensure_playback() -> bool:
@@ -141,6 +171,12 @@ func _add_voice(kind: int, amplitude: float, pitch: float) -> void:
 	_voice_phase_a.append(0.0)
 	_voice_phase_b.append(0.0)
 	_voice_noise.append(12345 + randi() % 1_000_000)
+	_voice_lp.append(0.0)
+	_voice_lp2.append(0.0)
+	# Warm 2-pole roll-off: ~1.4 kHz for the low thud, ~2.6 kHz for the tap.
+	var cutoff := (1400.0 if kind == VOICE_THUD else 2600.0) * pitch
+	var coeff := 1.0 - exp(-TAU * cutoff * INV_MIX_RATE)
+	_voice_lp_coeff.append(clampf(coeff, 0.001, 1.0))
 
 
 func _remove_voice(index: int) -> void:
@@ -152,6 +188,9 @@ func _remove_voice(index: int) -> void:
 	_voice_phase_a.remove_at(index)
 	_voice_phase_b.remove_at(index)
 	_voice_noise.remove_at(index)
+	_voice_lp.remove_at(index)
+	_voice_lp2.remove_at(index)
+	_voice_lp_coeff.remove_at(index)
 
 
 func _process(_delta: float) -> void:
@@ -159,7 +198,7 @@ func _process(_delta: float) -> void:
 
 
 func _pump_audio(max_frames: int) -> void:
-	if _headless or _playback == null:
+	if _headless or _muted or _playback == null:
 		return
 	var frames := mini(_playback.get_frames_available(), max_frames)
 	if frames <= 0:
@@ -189,34 +228,37 @@ func _sample_voice(index: int) -> float:
 
 	var amp := _voice_amp[index]
 	var pitch := _voice_pitch[index]
-	var out := 0.0
+	var raw := 0.0
+	var env := 0.0
 
 	if _voice_kind[index] == VOICE_THUD:
-		# Body: a low fundamental that drops as it decays, plus an inharmonic
-		# partial and a very short noise transient for the stone-on-stone hit.
-		var env := exp(-t * 7.0) * minf(t * 120.0, 1.0)
-		var freq := (92.0 * pitch) * exp(-t * 6.5) + 40.0
+		# Warm low body plus a very short damped noise contact. The pitch glides
+		# down slightly so it reads as stone settling, not a drum hit.
+		env = exp(-t * 15.0) * minf(t * 500.0, 1.0)
+		var freq := (88.0 * pitch) * exp(-t * 12.0) + 36.0
 		_voice_phase_a[index] += TAU * freq * INV_MIX_RATE
-		_voice_phase_b[index] += TAU * (freq * 1.67) * INV_MIX_RATE
-		var body := sin(_voice_phase_a[index]) * 0.78
-		body += sin(_voice_phase_b[index]) * 0.22
-		var transient := _next_noise(index) * exp(-t * 70.0)
-		out = (body * 0.85 + transient * 0.30) * env * amp
+		_voice_phase_b[index] += TAU * (freq * 1.5) * INV_MIX_RATE
+		var body := sin(_voice_phase_a[index]) * 0.82 + sin(_voice_phase_b[index]) * 0.18
+		var contact := _next_noise(index) * exp(-t * 55.0)
+		raw = (body * 0.80 + contact * 0.32) * env
 	else:
-		# Tick: high, dry, mostly noise with two short ringing partials.
-		var env := exp(-t * 30.0) * minf(t * 400.0, 1.0)
-		var freq := 1450.0 * pitch
+		# Soft stone tap: a short low body with a whisper of filtered noise.
+		env = exp(-t * 70.0) * minf(t * 900.0, 1.0)
+		var freq := 230.0 * pitch
 		_voice_phase_a[index] += TAU * freq * INV_MIX_RATE
-		_voice_phase_b[index] += TAU * (freq * 2.71) * INV_MIX_RATE
-		var noise := _next_noise(index)
-		out = (
-			sin(_voice_phase_a[index]) * 0.40
-			+ sin(_voice_phase_b[index]) * 0.18
-			+ noise * 0.42
-		) * env * amp
+		var noise := _next_noise(index) * exp(-t * 90.0)
+		raw = (sin(_voice_phase_a[index]) * 0.55 + noise * 0.45) * env
+
+	# Cascaded 1-pole low-pass (two stages ≈ 12 dB/oct) removes the harsh
+	# upper harmonics that made the old synth buzzy.
+	var coeff := _voice_lp_coeff[index]
+	var lp1 := _voice_lp[index] + coeff * (raw - _voice_lp[index])
+	var lp2 := _voice_lp2[index] + coeff * (lp1 - _voice_lp2[index])
+	_voice_lp[index] = lp1
+	_voice_lp2[index] = lp2
 
 	_voice_t[index] = t + INV_MIX_RATE
-	return out
+	return lp2 * amp
 
 
 func _next_noise(index: int) -> float:

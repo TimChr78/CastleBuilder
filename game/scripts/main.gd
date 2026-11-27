@@ -34,8 +34,12 @@ const LOD_BEGIN := [0.0, 90.0, 200.0]
 ## 0.0 means "infinite far distance": distant chunks never disappear.
 const LOD_END := [90.0, 200.0, 0.0]
 
-## Seconds for the construction front to sweep 0 → 1 once, then hold.
-const BUILD_PLAY_SECONDS := 27.0
+## Seconds for the construction front to sweep 0 → 1 at 1× speed; the HUD's
+## 4× and 20× presets divide this by the speed multiplier.
+const BASE_BUILD_SECONDS := 30.0
+## Time-lapse replay duration and camera yaw rate (radians/second).
+const TIMELAPSE_SECONDS := 9.0
+const TIMELAPSE_YAW_RATE := 0.28
 
 ## Save slot shared by the HUD Save/Load buttons.
 const SAVE_PATH := "user://castle.keep.json"
@@ -63,6 +67,10 @@ var _chunk_instances: Array[MeshInstance3D] = []
 
 var _build_front := 1.0
 var _playing := false
+var _speed_multiplier := 1.0
+var _timelapse_active := false
+var _timelapse_elapsed := 0.0
+var _render_view_busy := false
 var _tick_timer := 0.0
 var _mode_busy := false
 
@@ -90,10 +98,25 @@ func _process(delta: float) -> void:
 	if _audio != null and _camera != null:
 		_audio.call("set_camera_distance", float(_camera.call("get_view_distance")))
 
-	if _playing:
+	if _timelapse_active:
+		_timelapse_elapsed += delta
+		var progress := clampf(_timelapse_elapsed / TIMELAPSE_SECONDS, 0.0, 1.0)
+		_apply_build_front(progress)
+		if _hud != null:
+			_hud.call("set_build_front", _build_front)
+		if _build_front > 0.01 and _audio != null:
+			_tick_timer -= delta
+			if _tick_timer <= 0.0:
+				_audio.call("play_stone_tick", _build_front)
+				_tick_timer = randf_range(0.08, 0.18)
+		if progress >= 1.0:
+			_stop_timelapse(true)
+	elif _playing:
 		if _build_front < 1.0:
+			# Guard against a zero/huge multiplier; Instant is handled by snapping.
+			var speed := maxf(_speed_multiplier, 0.01)
 			_apply_build_front(
-				minf(_build_front + delta / BUILD_PLAY_SECONDS, 1.0)
+				minf(_build_front + delta * speed / BASE_BUILD_SECONDS, 1.0)
 			)
 			if _hud != null:
 				_hud.call("set_build_front", _build_front)
@@ -312,6 +335,7 @@ func _setup_camera() -> void:
 	_camera.name = "OrbitCamera"
 	add_child(_camera)
 	_camera.current = true
+	_camera.connect("auto_orbit_cancelled", Callable(self, "_on_camera_auto_orbit_cancelled"))
 	_camera.call("focus_on", Vector3(0.0, 8.0, 0.0), 90.0)
 
 
@@ -321,6 +345,9 @@ func _setup_hud() -> void:
 	add_child(_hud)
 	_hud.connect("build_front_changed", Callable(self, "_on_hud_build_front_changed"))
 	_hud.connect("playing_changed", Callable(self, "_on_hud_playing_changed"))
+	_hud.connect("speed_requested", Callable(self, "_on_hud_speed_requested"))
+	_hud.connect("timelapse_requested", Callable(self, "_on_hud_timelapse_requested"))
+	_hud.connect("mute_toggled", Callable(self, "_on_hud_mute_toggled"))
 	_hud.connect("mode_requested", Callable(self, "_on_hud_mode_requested"))
 	_hud.connect("site_requested", Callable(self, "_on_hud_site_requested"))
 	_hud.connect("tool_requested", Callable(self, "_on_hud_tool_requested"))
@@ -447,8 +474,8 @@ func _poll_control() -> void:
 	var state: Dictionary = result
 
 	var render_id := int(state.get("render_view_request_id", -1))
-	if render_id >= 0:
-		_fulfill_render_view(render_id)
+	if render_id >= 0 and not _render_view_busy:
+		_fulfill_render_view(render_id, state)
 
 	if bool(state.get("dirty", false)):
 		var snapshot: Variant = _bridge.call("get_scene_snapshot")
@@ -461,22 +488,102 @@ func _poll_control() -> void:
 		_refresh_ghosts()
 
 
-func _fulfill_render_view(request_id: int) -> void:
+## Capture a clean 3:2 render_view: hide HUD/agent overlays, wait one frame so
+## the capture does not include them, crop before resizing (avoids squashing a
+## 16:9 window) and restore the overlays afterwards.
+func _fulfill_render_view(request_id: int, state: Dictionary) -> void:
 	if _bridge == null or not _bridge.has_method("complete_render_view"):
 		return
+	_render_view_busy = true
+
+	var yaw_deg := _render_view_option(state, "yaw_deg")
+	var pitch_deg := _render_view_option(state, "pitch_deg")
+	var distance_m := _render_view_option(state, "distance_m")
+	var moved_camera := false
+	var prev_yaw_deg := 0.0
+	var prev_pitch_deg := 0.0
+	var prev_distance_m := 0.0
+	if _camera != null and (is_finite(yaw_deg) or is_finite(pitch_deg) or is_finite(distance_m)):
+		prev_yaw_deg = rad_to_deg(float(_camera.get("_yaw")))
+		prev_pitch_deg = rad_to_deg(float(_camera.get("_pitch")))
+		prev_distance_m = float(_camera.get("_distance"))
+		_camera.call("set_orbit_view", yaw_deg, pitch_deg, distance_m)
+		moved_camera = true
+
+	var hud_was_visible := false
+	var panel_was_visible := false
+	if _hud != null:
+		hud_was_visible = _hud.visible
+		_hud.visible = false
+	if _agent_panel != null:
+		panel_was_visible = _agent_panel.visible
+		_agent_panel.visible = false
+
+	# Let the renderer present one frame without the overlays before we read it.
+	await RenderingServer.frame_post_draw
+
 	var viewport := get_viewport()
 	var image: Image = null
 	if viewport != null and viewport.get_texture() != null:
 		image = viewport.get_texture().get_image()
+
+	if moved_camera and _camera != null:
+		_camera.call("set_orbit_view", prev_yaw_deg, prev_pitch_deg, prev_distance_m)
+	if _hud != null:
+		_hud.visible = hud_was_visible
+	if _agent_panel != null:
+		_agent_panel.visible = panel_was_visible
+
 	if image == null or image.is_empty():
+		_render_view_busy = false
 		_bridge.call(
 			"complete_render_view", request_id, "", "viewport capture is unavailable"
 		)
 		return
+
+	image = _crop_to_aspect(image, float(RENDER_VIEW_SIZE.x) / float(RENDER_VIEW_SIZE.y))
 	image.resize(RENDER_VIEW_SIZE.x, RENDER_VIEW_SIZE.y, Image.INTERPOLATE_BILINEAR)
 	var png := image.save_png_to_buffer()
 	var encoded := Marshalls.raw_to_base64(png)
 	_bridge.call("complete_render_view", request_id, encoded, "")
+	_render_view_busy = false
+
+
+## Optional capture parameters may arrive either as flat keys
+## (`render_view_yaw_deg`) or inside a nested `render_view` dictionary.
+func _render_view_option(state: Dictionary, key: String) -> float:
+	var nested: Variant = state.get("render_view", null)
+	if nested is Dictionary and (nested as Dictionary).has(key):
+		var nested_value: Variant = (nested as Dictionary).get(key)
+		if nested_value is float or nested_value is int:
+			return float(nested_value)
+	var flat := "render_view_%s" % key
+	var flat_value: Variant = state.get(flat, null)
+	if flat_value is float or flat_value is int:
+		return float(flat_value)
+	return NAN
+
+
+## Centre-crop to the requested aspect ratio before resizing so wide windows
+## are not stretched into the 3:2 capture.
+func _crop_to_aspect(image: Image, aspect: float) -> Image:
+	var width := image.get_width()
+	var height := image.get_height()
+	if width <= 0 or height <= 0 or aspect <= 0.0:
+		return image
+
+	var target_width := int(round(float(height) * aspect))
+	if target_width <= width:
+		if target_width == width:
+			return image
+		var offset_x := int((width - target_width) * 0.5)
+		return image.get_region(Rect2i(offset_x, 0, target_width, height))
+
+	var target_height := int(round(float(width) / aspect))
+	if target_height >= height:
+		return image
+	var offset_y := int((height - target_height) * 0.5)
+	return image.get_region(Rect2i(0, offset_y, width, target_height))
 
 
 func _refresh_agent_panel() -> void:
@@ -667,6 +774,8 @@ func _rebuild(mode: String) -> void:
 ## edit). `reset_play` restarts the construction front; `reframe` recentres the
 ## orbit camera, which is desirable for a mode switch but not for every edit.
 func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
+	if _timelapse_active:
+		_stop_timelapse(false)
 	_clear_world_meshes()
 	_apply_site_look(str(data.get("site_id", "m0a_promontory")))
 	_spawn_terrain(data.get("terrain"))
@@ -695,6 +804,9 @@ func _apply_scene(data: Dictionary, reset_play: bool, reframe: bool) -> void:
 		_apply_build_front(_build_front)
 
 	var bounds := _compute_masonry_bounds(data)
+	# Anchor the damp/moss course to the foot of this site's masonry.
+	if _masonry_material != null:
+		_masonry_material.set_shader_parameter("wet_base_y", bounds.position.y)
 	if _fx != null:
 		var elements: Variant = data.get("elements", [])
 		if elements is Array and not (elements as Array).is_empty():
@@ -861,10 +973,15 @@ func _frame_camera(data: Dictionary) -> void:
 
 
 func _on_hud_build_front_changed(value: float) -> void:
+	# Scrubbing the slider takes manual control; stop any scripted replay.
+	if _timelapse_active:
+		_stop_timelapse(false)
 	_apply_build_front(value)
 
 
 func _on_hud_playing_changed(playing: bool) -> void:
+	if playing and _timelapse_active:
+		_stop_timelapse(false)
 	_playing = playing
 	_tick_timer = 0.0
 	# Replaying a finished build starts cleanly from bare ground.
@@ -876,12 +993,81 @@ func _on_hud_playing_changed(playing: bool) -> void:
 		_fx.call("set_build_front", _build_front, _playing)
 
 
+## HUD speed preset. 0.0 is "Instant": snap to the completed wall.
+func _on_hud_speed_requested(multiplier: float) -> void:
+	if multiplier <= 0.0:
+		_speed_multiplier = 1.0
+		_playing = false
+		if _timelapse_active:
+			_stop_timelapse(false)
+		if _hud != null:
+			_hud.call("set_playing", false)
+			_hud.call("set_build_front", 1.0)
+			_hud.call("set_speed", 1.0)
+		_apply_build_front(1.0)
+		return
+	_speed_multiplier = maxf(multiplier, 0.01)
+
+
+func _on_hud_timelapse_requested() -> void:
+	if _timelapse_active:
+		_stop_timelapse(false)
+		return
+	_start_timelapse()
+
+
+func _on_hud_mute_toggled(muted: bool) -> void:
+	if _audio != null:
+		_audio.call("set_muted", muted)
+	if _hud != null:
+		_hud.call("set_muted", muted)
+
+
+func _start_timelapse() -> void:
+	_playing = false
+	_timelapse_active = true
+	_timelapse_elapsed = 0.0
+	_tick_timer = 0.0
+	if _hud != null:
+		_hud.call("set_playing", false)
+		_hud.call("set_timelapse", true)
+		_hud.call("set_build_front", 0.0)
+	_apply_build_front(0.0)
+	if _camera != null:
+		_camera.call("start_auto_orbit", TIMELAPSE_YAW_RATE)
+
+
+## Stop the replay. `complete` snaps the wall shut at 1.0 for a clean finish;
+## otherwise the front holds where it was when the user took control.
+func _stop_timelapse(complete: bool) -> void:
+	_timelapse_active = false
+	_timelapse_elapsed = 0.0
+	if _camera != null:
+		_camera.call("stop_auto_orbit")
+	if _hud != null:
+		_hud.call("set_timelapse", false)
+	if complete:
+		if _hud != null:
+			_hud.call("set_build_front", 1.0)
+		_apply_build_front(1.0)
+	else:
+		if _fx != null:
+			_fx.call("set_build_front", _build_front, false)
+
+
+func _on_camera_auto_orbit_cancelled() -> void:
+	if _timelapse_active:
+		_stop_timelapse(false)
+
+
 func _apply_build_front(value: float) -> void:
 	_build_front = clampf(value, 0.0, 1.0)
 	if _masonry_material != null:
 		_masonry_material.set_shader_parameter("build_front", _build_front)
 	if _fx != null:
-		_fx.call("set_build_front", _build_front, _playing)
+		# A time-lapse is a cinematic replay even though Play is not engaged;
+		# scaffolding and dust must climb with the front either way.
+		_fx.call("set_build_front", _build_front, _playing or _timelapse_active)
 
 
 func _on_hud_mode_requested(mode: String) -> void:

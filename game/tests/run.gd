@@ -76,6 +76,13 @@ func _initialize() -> void:
 		quit(1)
 		return
 
+	_check_visual_polish(failures)
+
+	if not failures.is_empty():
+		_for_each_failure(failures)
+		quit(1)
+		return
+
 	print("M0b feel scripts OK")
 	quit(0)
 
@@ -928,6 +935,15 @@ func _check_feel_scripts(failures: Array[String]) -> void:
 			audio.call("set_camera_distance", 60.0)
 			if not bool(audio.call("is_headless")):
 				failures.append("BuildAudio did not detect --headless mode.")
+			for method in ["set_muted", "is_muted"]:
+				if not audio.has_method(method):
+					failures.append("BuildAudio has no %s()." % method)
+			audio.call("set_muted", true)
+			if not bool(audio.call("is_muted")):
+				failures.append("BuildAudio.set_muted(true) did not stick.")
+			audio.call("set_muted", false)
+			if bool(audio.call("is_muted")):
+				failures.append("BuildAudio.set_muted(false) did not clear the mute.")
 			(audio as Node).free()
 
 	var design_script: Variant = load("res://scripts/design_tool.gd")
@@ -959,6 +975,131 @@ func _check_feel_scripts(failures: Array[String]) -> void:
 					failures.append("DesignTool.set_mode(%d) did not stick." % mode)
 			tool.call("set_mode", 0)
 			(tool as Node).free()
+
+
+## M1.4 Wave 2b: LOD0 anti-moiré setup, speed/time-lapse HUD controls, the
+## scriptable orbit and the clean render_view capture helpers.
+func _check_visual_polish(failures: Array[String]) -> void:
+	# 16x anisotropic filtering keeps grazing masonry crisp at distance.
+	var af := int(
+		ProjectSettings.get_setting(
+			"rendering/textures/default_filters/anisotropic_filtering_level", 0
+		)
+	)
+	if af != 4:
+		failures.append(
+			"anisotropic_filtering_level is %d, expected 4 (16x AF)." % af
+		)
+
+	# LOD0 must band-limit its procedural detail with screen-space derivatives
+	# and carry the weathering terms.
+	var shader_file := FileAccess.open("res://shaders/masonry.gdshader", FileAccess.READ)
+	if shader_file == null:
+		failures.append("masonry.gdshader could not be opened for inspection.")
+	else:
+		var source := shader_file.get_as_text()
+		shader_file.close()
+		for token in [
+			"dFdx(uv.x)",
+			"grain_visible",
+			"weathered_stone(",
+			"fresh_lift",
+			"wet_base_y",
+		]:
+			if source.find(token) == -1:
+				failures.append("masonry.gdshader is missing \"%s\"." % token)
+
+	# HUD speed / time-lapse / mute contract.
+	var hud_script: Variant = load("res://scripts/debug_hud.gd")
+	if not (hud_script is GDScript):
+		failures.append("debug_hud.gd did not load as a GDScript.")
+	else:
+		var hud: Variant = (hud_script as GDScript).new()
+		if hud == null or not (hud is CanvasLayer):
+			failures.append("DebugHud is not a CanvasLayer.")
+		else:
+			root.add_child(hud as CanvasLayer)
+			for signal_name in ["speed_requested", "timelapse_requested", "mute_toggled"]:
+				if not hud.has_signal(signal_name):
+					failures.append("DebugHud has no %s signal." % signal_name)
+			for method in [
+				"set_speed",
+				"get_speed_multiplier",
+				"set_timelapse",
+				"is_timelapse_active",
+				"set_muted",
+				"is_muted",
+			]:
+				if not hud.has_method(method):
+					failures.append("DebugHud has no %s()." % method)
+			hud.call("set_speed", 20.0)
+			if not is_equal_approx(float(hud.call("get_speed_multiplier")), 20.0):
+				failures.append("DebugHud.set_speed(20) did not stick.")
+			hud.call("set_timelapse", true)
+			if not bool(hud.call("is_timelapse_active")):
+				failures.append("DebugHud.set_timelapse(true) did not stick.")
+			hud.call("set_timelapse", false)
+			if bool(hud.call("is_timelapse_active")):
+				failures.append("DebugHud.set_timelapse(false) did not clear.")
+			hud.call("set_muted", true)
+			if not bool(hud.call("is_muted")):
+				failures.append("DebugHud.set_muted(true) did not stick.")
+			(hud as Node).free()
+
+	# Orbit camera scripted time-lapse orbit and explicit capture framing.
+	var camera_script: Variant = load("res://scripts/orbit_camera.gd")
+	if not (camera_script is GDScript):
+		failures.append("orbit_camera.gd did not load as a GDScript.")
+	else:
+		var cam: Variant = (camera_script as GDScript).new()
+		if cam == null or not (cam is Camera3D):
+			failures.append("OrbitCamera is not a Camera3D.")
+		else:
+			root.add_child(cam as Camera3D)
+			for method in [
+				"start_auto_orbit",
+				"stop_auto_orbit",
+				"is_auto_orbiting",
+				"set_orbit_view",
+			]:
+				if not cam.has_method(method):
+					failures.append("OrbitCamera has no %s()." % method)
+			if not cam.has_signal("auto_orbit_cancelled"):
+				failures.append("OrbitCamera has no auto_orbit_cancelled signal.")
+			cam.call("start_auto_orbit", 0.28)
+			if not bool(cam.call("is_auto_orbiting")):
+				failures.append("OrbitCamera.start_auto_orbit() did not start.")
+			cam.call("stop_auto_orbit")
+			if bool(cam.call("is_auto_orbiting")):
+				failures.append("OrbitCamera.stop_auto_orbit() did not stop.")
+			cam.call("set_orbit_view", 90.0, 20.0, 50.0)
+			if not is_equal_approx(float(cam.call("get_view_distance")), 50.0):
+				failures.append("OrbitCamera.set_orbit_view() did not apply the distance.")
+			(cam as Node).free()
+
+	# main.gd helpers used by the time-lapse replay and capture crop.
+	var main_script: Variant = load("res://scripts/main.gd")
+	if not (main_script is GDScript):
+		failures.append("main.gd did not load as a GDScript.")
+	else:
+		var main_node: Variant = (main_script as GDScript).new()
+		if main_node == null or not (main_node is Node3D):
+			failures.append("main.gd did not instantiate as a Node3D.")
+		else:
+			for method in [
+				"_on_hud_speed_requested",
+				"_on_hud_timelapse_requested",
+				"_start_timelapse",
+				"_stop_timelapse",
+				"_fulfill_render_view",
+				"_crop_to_aspect",
+			]:
+				if not main_node.has_method(method):
+					failures.append("main.gd has no %s()." % method)
+			(main_node as Node).free()
+
+	if failures.is_empty():
+		print("M1.4 visual polish OK: 16x AF, LOD0 band-limit, speed/time-lapse, mute, clean capture")
 
 
 ## Contract for the construction-FX element footprints emitted by keep-gd.
