@@ -1,0 +1,30 @@
+# Rust
+/core/target/
+**/target/
+**/*.rs.bk
+
+# Godot 4
+game/.godot/
+game/.import/
+*.translation
+export_presets.cfg
+
+# Compiled GDExtension binaries
+game/bin/*.so
+game/bin/*.dll
+game/bin/*.dylib
+game/bin/*.pdb
+game/bin/*.exp
+game/bin/*.lib
+
+# Blender backups
+*.blend1
+*.blend2
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

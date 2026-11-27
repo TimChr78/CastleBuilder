@@ -1,0 +1,7 @@
+# Git LFS tracking for binary source assets
+assets-src/**/*.blend filter=lfs diff=lfs merge=lfs -text
+assets-src/**/*.png filter=lfs diff=lfs merge=lfs -text
+assets-src/**/*.exr filter=lfs diff=lfs merge=lfs -text
+assets-src/**/*.glb filter=lfs diff=lfs merge=lfs -text
+assets-src/**/*.wav filter=lfs diff=lfs merge=lfs -text
+assets-src/**/*.ogg filter=lfs diff=lfs merge=lfs -text
