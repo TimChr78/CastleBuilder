@@ -45,6 +45,18 @@ uniform float weathering_strength : hint_range(0.0, 2.0) = 0.80;
 uniform float sky_fill_strength : hint_range(0.0, 2.0) = 0.60;
 uniform float bounce_strength : hint_range(0.0, 2.0) = 0.45;
 
+// --- LOD shells --------------------------------------------------------
+// LOD1/LOD2 are single quads per element face whose UV spans the whole face,
+// so the per-block UV pipeline above would paint one giant slab with a dark
+// border at every chunk seam. Those LODs instead recompose coursed ashlar in
+// world space, which also keeps courses continuous across chunk boundaries.
+// 0 = LOD0 full blocks (per-face UV), 1 = LOD1 shell, 2 = LOD2 massing proxy.
+instance uniform int lod_level = 0;
+// Defaults match keep-core's document course height (450 mm) and nominal
+// block width (950 mm), so the virtual courses line up with LOD0's real ones.
+uniform float lod_course_height : hint_range(0.10, 1.00) = 0.45;
+uniform float lod_block_width : hint_range(0.20, 2.00) = 0.95;
+
 varying vec3 v_world_pos;
 varying vec3 v_world_normal;
 varying vec4 v_color;
@@ -55,6 +67,13 @@ float hash13(vec3 p3) {
 	p3 = fract(p3 * 0.1031);
 	p3 += dot(p3, p3.yzx + 33.33);
 	return fract((p3.x + p3.y) * p3.z);
+}
+
+// Deterministic per-cell hash used by the LOD shell's virtual stonework.
+float hash21(vec2 p) {
+	p = fract(p * vec2(123.34, 456.21));
+	p += dot(p, p + 45.32);
+	return fract(p.x * p.y);
 }
 
 float value_noise3(vec3 p) {
@@ -113,7 +132,118 @@ void vertex() {
 }
 
 void fragment() {
-	vec2 uv = UV;
+	if (lod_level >= 1) {
+		// --- World-space coursed ashlar for simplified LOD shells ---------
+		vec3 wp = v_world_pos;
+		vec3 wn = normalize(v_world_normal);
+
+		float grain = fbm3(wp * grain_scale);
+		float patches = fbm3(wp * (grain_scale * 0.17) + vec3(7.1, 3.7, 11.3));
+		float streak_field = fbm3(vec3(wp.x * 1.8, wp.y * 0.22, wp.z * 1.8) + 5.0);
+		float age = clamp(v_color.b, 0.0, 1.0);
+		float streaks = smoothstep(0.48, 0.86, streak_field) * (0.35 + age * 0.65);
+
+		// Pick the horizontal running axis per pixel. Both vertical projections
+		// share the same world-Y row phase, so courses stay level across the
+		// blend on oblique tower facets; near-horizontal caps switch to a plan
+		// projection so they read as flagstones rather than stripes.
+		float along_x = step(abs(wn.z), abs(wn.x));
+		float horiz = smoothstep(0.55, 0.95, abs(wn.y));
+		float u_m = mix(mix(wp.x, wp.z, along_x), wp.x, horiz);
+		float v_m = mix(wp.y, wp.z, horiz);
+
+		// Running bond: alternating courses shift by half a block.
+		float row_f = v_m / lod_course_height;
+		float row = floor(row_f);
+		float col_f = u_m / lod_block_width + mod(row, 2.0) * 0.5;
+		float col = floor(col_f);
+		vec2 cfrac = vec2(fract(col_f), fract(row_f));
+		vec2 cell = vec2(col, row);
+
+		float edge_m = min(
+			min(cfrac.x, 1.0 - cfrac.x) * lod_block_width,
+			min(cfrac.y, 1.0 - cfrac.y) * lod_course_height
+		);
+
+		// Metres covered by one pixel along the coursing axes. Everything below
+		// fades detail once joints/bevels fall below a pixel, so far LOD2 shells
+		// soften into warm limestone instead of moiré-shimmering.
+		float aa_m = max(
+			fwidth(col_f) * lod_block_width, fwidth(row_f) * lod_course_height
+		);
+		aa_m = max(aa_m, 1e-4);
+
+		float joint_visible = 1.0 - smoothstep(1.0, 3.0, aa_m / max(mortar_width, 1e-5));
+		float mortar = 1.0 - smoothstep(
+			mortar_width * 0.5, mortar_width * 0.5 + aa_m * 0.75, edge_m
+		);
+		mortar *= joint_visible;
+
+		float bevel_visible = 1.0 - smoothstep(0.5, 1.5, aa_m / max(bevel_width, 1e-5));
+		float bevel = 1.0 - smoothstep(0.0, max(bevel_width, aa_m), edge_m);
+		bevel *= bevel_visible;
+
+		// Bevel tangent frame follows the same projection as the coursing.
+		vec3 axis_u = mix(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0), along_x);
+		axis_u = mix(axis_u, vec3(1.0, 0.0, 0.0), horiz);
+		vec3 axis_v = mix(vec3(0.0, 0.0, 1.0), vec3(0.0, 1.0, 0.0), along_x);
+		axis_v = mix(axis_v, vec3(0.0, 0.0, 1.0), horiz);
+		vec2 bdir = cfrac * 2.0 - 1.0;
+		vec3 bevel_world = axis_u * bdir.x + axis_v * bdir.y;
+		// NORMAL is view space in the fragment stage; rotate the world-space
+		// bevel direction into it. LOD0's derivative tangent frame does the
+		// same job implicitly, but shells have no per-block UVs to derive from.
+		vec3 bevel_view = (VIEW_MATRIX * vec4(bevel_world, 0.0)).xyz;
+		NORMAL = normalize(NORMAL + bevel_view * bevel * bevel_strength);
+
+		// Per-virtual-stone warm/cool tint and brightness, matching LOD0's
+		// 0.15..0.90 tint palette and 0.12 seed brightness variation. Tint
+		// cells are block-sized, so they stay meaningful much further out than
+		// mortar or grain; only soften once a block is a few pixels across.
+		float h_tint = hash21(cell);
+		float h_bright = hash21(cell + vec2(31.7, 7.3));
+		float far_soft = smoothstep(0.12, 0.50, aa_m);
+		float cell_tint = mix(mix(0.15, 0.90, h_tint), 0.52, far_soft);
+		float cell_bright = mix(1.0 + (h_bright - 0.5) * 0.12, 1.0, far_soft);
+
+		// Sub-pixel grain would alias on distant shells; fade it to its mean.
+		float grain_mix = mix(0.5, grain, 1.0 - smoothstep(0.05, 0.18, aa_m));
+
+		vec3 stone = mix(stone_cool.rgb, stone_warm.rgb, smoothstep(0.12, 0.92, cell_tint));
+		stone = mix(stone_light.rgb, stone, 0.55);
+		stone *= cell_bright;
+		stone *= mix(1.0, 0.78 + 0.42 * grain_mix, grain_strength);
+		stone *= mix(vec3(1.0), vec3(0.86, 0.90, 0.80), age * 0.55);
+		stone *= 1.0 - streaks * 0.32 * weathering_strength;
+
+		vec3 joint = mortar_color.rgb * (0.85 + 0.30 * patches);
+		vec3 albedo = mix(stone, joint, mortar * 0.92);
+
+		ALBEDO = albedo;
+		ROUGHNESS = clamp(
+			0.58 + 0.16 * grain_mix + 0.18 * mortar + 0.12 * age
+			- streaks * 0.10 * weathering_strength,
+			0.0, 1.0
+		);
+		SPECULAR = 0.32;
+		METALLIC = 0.0;
+
+		float baked_ao = clamp(v_color.r, 0.0, 1.0);
+		AO = clamp(baked_ao * (1.0 - 0.45 * mortar), 0.0, 1.0);
+		AO_LIGHT_AFFECT = 0.35;
+
+		float up = clamp(wn.y * 0.5 + 0.5, 0.0, 1.0);
+		float sky_vis = mix(0.35, 1.0, up);
+		float sun_facing = clamp(dot(wn, normalize(sun_bounce_dir)), 0.0, 1.0);
+		float ground_facing = clamp(-wn.y, 0.0, 1.0);
+
+		vec3 fill = sky_fill_color.rgb * (sky_fill_strength * sky_vis);
+		vec3 bounce = bounce_color.rgb
+			* (bounce_strength * (sun_facing * 0.35 + ground_facing * 0.65));
+		EMISSION = albedo * (fill + bounce);
+	} else {
+		// --- LOD0: per-block UV bevel/mortar pipeline (unchanged) ----------
+		vec2 uv = UV;
 	vec4 custom = v_custom;
 
 	// Blocks may be different sizes, so convert UV distance to metres using the
@@ -198,4 +328,5 @@ void fragment() {
 	vec3 fill = sky_fill_color.rgb * (sky_fill_strength * sky_vis);
 	vec3 bounce = bounce_color.rgb * (bounce_strength * (sun_facing * 0.35 + ground_facing * 0.65));
 	EMISSION = albedo * (fill + bounce);
+	}
 }

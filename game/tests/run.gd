@@ -400,9 +400,17 @@ func _check_lod_chunks(data: Dictionary, failures: Array[String]) -> void:
 					"Chunk %s %s has non-zero visibility fade margins." % [chunk_key, lod.name]
 				)
 				break
+			# The shader keys LOD0's per-block UV path against the LOD1/LOD2
+			# world-space coursed-ashlar path on this instance uniform.
+			var expected_lod := int(str(lod.name).split("_LOD")[1])
+			if int(lod.get_instance_shader_parameter("lod_level")) != expected_lod:
+				failures.append(
+					"Chunk %s %s has wrong lod_level." % [chunk_key, lod.name]
+				)
+				break
 
 	if failures.is_empty():
-		print("LOD culling OK: %d chunks share one AABB and zero fade margins" % groups.size())
+		print("LOD culling OK: %d chunks share one AABB, zero fade margins and per-LOD lod_level" % groups.size())
 	host_node.free()
 
 

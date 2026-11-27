@@ -389,6 +389,10 @@ func _spawn_chunks(chunks: Variant) -> void:
 			instance.name = "Chunk%d_LOD%d" % [chunk_index, lod]
 			instance.mesh = mesh as ArrayMesh
 			instance.material_override = _masonry_material
+			# LOD1/LOD2 shells are single quads per element face whose UV spans
+			# the whole face, so the shader recomposes coursed masonry in world
+			# space for them. Tell it which pipeline this instance needs.
+			instance.set_instance_shader_parameter(&"lod_level", lod)
 			# keep-core already emits world-space vertices; leave the node at the
 			# identity transform so its AABB matches the real world position.
 			instance.position = Vector3.ZERO
